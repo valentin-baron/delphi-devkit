@@ -18,13 +18,50 @@
       {
         "command": "delphi-utils.swapToDfmPas",
         "title": "Delphi Utils: Swap .DFM/.PAS"
+      },
+      {
+        "command": "delphi-utils.refreshDprExplorer",
+        "title": "Refresh",
+        "icon": "$(refresh)"
       }
     ],
+    "views": {
+      "delphi-explorer": [
+        {
+          "id": "dprExplorer",
+          "name": "DPR Files",
+          "when": "workbenchState != empty",
+          "icon": "$(file-code)"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "delphi-explorer",
+          "title": "Delphi Utils",
+          "icon": "$(symbol-variable)"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "delphi-utils.refreshDprExplorer",
+          "when": "view == dprExplorer",
+          "group": "navigation"
+        }
+      ]
+    },
     "languages": [
       {
         "id": "delphi-dfm",
-        "extensions": [".dfm"],
-        "aliases": ["Delphi DFM"]
+        "extensions": [
+          ".dfm"
+        ],
+        "aliases": [
+          "Delphi DFM"
+        ]
       }
     ]
   },
@@ -47,16 +84,37 @@
     "test": "vscode-test"
   },
   "devDependencies": {
-    "@types/vscode": "^1.101.0",
+    "@types/minimatch": "^5.1.2",
     "@types/mocha": "^10.0.10",
     "@types/node": "20.x",
+    "@types/vscode": "^1.101.0",
     "@typescript-eslint/eslint-plugin": "^8.31.1",
     "@typescript-eslint/parser": "^8.31.1",
-    "eslint": "^9.25.1",
-    "esbuild": "^0.25.3",
-    "npm-run-all": "^4.1.5",
-    "typescript": "^5.8.3",
     "@vscode/test-cli": "^0.0.10",
-    "@vscode/test-electron": "^2.5.2"
+    "@vscode/test-electron": "^2.5.2",
+    "esbuild": "^0.25.3",
+    "eslint": "^9.25.1",
+    "npm-run-all": "^4.1.5",
+    "typescript": "^5.8.3"
+  },
+  "configuration": {
+    "title": "Delphi Utils",
+    "properties": {
+      "delphi-utils.dprExplorer.excludePatterns": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "default": [
+          "**/__history/**",
+          "**/.history/**"
+        ],
+        "description": "Glob patterns for paths to exclude from the DPR file explorer. Use standard glob patterns like '**/folder/**' to exclude entire directories.",
+        "scope": "resource"
+      }
+    }
+  },
+  "dependencies": {
+    "minimatch": "^10.0.3"
   }
 }
