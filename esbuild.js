@@ -13,7 +13,7 @@ const copyAssetsPlugin = {
 	setup(build) {
 		build.onEnd(() => {
 			// Copy PowerShell script to dist folder
-			const sourceScript = path.join(__dirname, 'src', 'dprExplorer', 'contextMenu', 'compile.ps1');
+			const sourceScript = path.join(__dirname, 'src', 'delphiProjects', 'contextMenu', 'compile.ps1');
 			const destScript = path.join(__dirname, 'dist', 'compile.ps1');
 
 			try {

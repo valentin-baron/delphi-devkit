@@ -20,7 +20,7 @@
         "title": "Delphi Utils: Swap .DFM/.PAS"
       },
       {
-        "command": "delphi-utils.refreshDprExplorer",
+        "command": "delphi-utils.refreshDelphiProjects",
         "title": "Refresh",
         "icon": "$(refresh)"
       },
@@ -49,6 +49,10 @@
         "title": "Run"
       },
       {
+        "command": "delphi-utils.configureCreateIni",
+        "title": "Configure/Create .ini"
+      },
+      {
         "command": "delphi-utils.selectCompilerConfiguration",
         "title": "Select Delphi Compiler",
         "icon": "$(tools)"
@@ -61,8 +65,8 @@
     "views": {
       "delphi-explorer": [
         {
-          "id": "dprExplorer",
-          "name": "DPR Files",
+          "id": "delphiProjects",
+          "name": "Delphi Projects",
           "when": "workbenchState != empty",
           "icon": "$(file-code)"
         }
@@ -80,41 +84,46 @@
     "menus": {
       "view/title": [
         {
-          "command": "delphi-utils.refreshDprExplorer",
-          "when": "view == dprExplorer",
+          "command": "delphi-utils.refreshDelphiProjects",
+          "when": "view == delphiProjects",
           "group": "navigation"
         },
         {
           "command": "delphi-utils.selectCompilerConfiguration",
-          "when": "view == dprExplorer",
+          "when": "view == delphiProjects",
           "group": "navigation"
         }
       ],
       "view/item/context": [
         {
           "command": "delphi-utils.compileDpr",
-          "when": "view == dprExplorer",
+          "when": "view == delphiProjects",
           "group": "1_build@1"
         },
         {
           "command": "delphi-utils.recreateDpr",
-          "when": "view == dprExplorer",
+          "when": "view == delphiProjects",
           "group": "1_build@2"
         },
         {
           "command": "delphi-utils.showInExplorer",
-          "when": "view == dprExplorer",
+          "when": "view == delphiProjects",
           "group": "2_files@1"
         },
         {
           "command": "delphi-utils.openInFileExplorer",
-          "when": "view == dprExplorer",
+          "when": "view == delphiProjects",
           "group": "2_files@2"
         },
         {
           "command": "delphi-utils.runExecutable",
-          "when": "view == dprExplorer",
+          "when": "view == delphiProjects",
           "group": "3_run@1"
+        },
+        {
+          "command": "delphi-utils.configureCreateIni",
+          "when": "view == delphiProjects",
+          "group": "3_run@2"
         }
       ]
     },
@@ -131,6 +140,12 @@
     ],
     "keybindings": [
       {
+        "command": "delphi-utils.swapToDfmPas",
+        "key": "alt+f12",
+        "mac": "alt+f12",
+        "when": "editorTextFocus && (resourceExtname == '.pas' || resourceExtname == '.dfm')"
+      },
+      {
         "command": "delphi-utils.showCompilerDropdown",
         "key": "ctrl+shift+d c",
         "mac": "cmd+shift+d c",
@@ -140,7 +155,18 @@
     "configuration": {
       "title": "Delphi Utils",
       "properties": {
-        "delphi-utils.dprExplorer.excludePatterns": {
+        "delphi-utils.delphiProjects.projectPaths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "**"
+          ],
+          "description": "Glob patterns specifying where to search for Delphi projects. Use patterns like 'src/**' to search only in specific directories, or '**' to search everywhere.",
+          "scope": "resource"
+        },
+        "delphi-utils.delphiProjects.excludePatterns": {
           "type": "array",
           "items": {
             "type": "string"
@@ -149,7 +175,7 @@
             "**/__history/**",
             "**/.history/**"
           ],
-          "description": "Glob patterns for paths to exclude from the DPR file explorer. Use standard glob patterns like '**/folder/**' to exclude entire directories.",
+          "description": "Glob patterns for paths to exclude from the Delphi Projects explorer. Use standard glob patterns like '**/folder/**' to exclude entire directories.",
           "scope": "resource"
         },
         "delphi-utils.compiler.configurations": {
@@ -177,26 +203,46 @@
                 "description": "Default build arguments for this Delphi version"
               }
             },
-            "required": ["name", "rsVarsPath", "msBuildPath", "buildArguments"]
+            "required": [
+              "name",
+              "rsVarsPath",
+              "msBuildPath",
+              "buildArguments"
+            ]
           },
           "default": [
             {
               "name": "Delphi 12",
               "rsVarsPath": "C:\\Program Files (x86)\\Embarcadero\\Studio\\23.0\\bin\\rsvars.bat",
               "msBuildPath": "C:\\Windows\\Microsoft.NET\\Framework\\v4.0.30319\\MSBuild.exe",
-              "buildArguments": ["/verbosity:minimal", "/p:DCC_DebugInformation=1", "/p:RuntimeIdentifiers=3.5", "/p:Configuration=Debug"]
+              "buildArguments": [
+                "/verbosity:minimal",
+                "/p:DCC_DebugInformation=1",
+                "/p:RuntimeIdentifiers=3.5",
+                "/p:Configuration=Debug"
+              ]
             },
             {
               "name": "Delphi 11",
               "rsVarsPath": "C:\\Program Files (x86)\\Embarcadero\\Studio\\22.0\\bin\\rsvars.bat",
               "msBuildPath": "C:\\Windows\\Microsoft.NET\\Framework\\v4.0.30319\\MSBuild.exe",
-              "buildArguments": ["/verbosity:minimal", "/p:DCC_DebugInformation=1", "/p:RuntimeIdentifiers=3.5", "/p:Configuration=Debug"]
+              "buildArguments": [
+                "/verbosity:minimal",
+                "/p:DCC_DebugInformation=1",
+                "/p:RuntimeIdentifiers=3.5",
+                "/p:Configuration=Debug"
+              ]
             },
             {
               "name": "Delphi 2007",
               "rsVarsPath": "C:\\Program Files (x86)\\CodeGear\\RAD Studio\\5.0\\bin\\rsvars.bat",
               "msBuildPath": "C:\\Windows\\Microsoft.NET\\Framework\\v4.0.30319\\MSBuild.exe",
-              "buildArguments": ["/verbosity:minimal", "/p:DCC_DebugInformation=True", "/p:RuntimeIdentifiers=3.5", "/p:Configuration=Debug"]
+              "buildArguments": [
+                "/verbosity:minimal",
+                "/p:DCC_DebugInformation=True",
+                "/p:RuntimeIdentifiers=3.5",
+                "/p:Configuration=Debug"
+              ]
             }
           ],
           "description": "Delphi compiler configurations with paths and build arguments",
@@ -230,7 +276,6 @@
     "test": "vscode-test"
   },
   "devDependencies": {
-    "@types/minimatch": "^5.1.2",
     "@types/mocha": "^10.0.10",
     "@types/node": "20.x",
     "@types/vscode": "^1.101.0",
@@ -245,7 +290,6 @@
     "typescript": "^5.8.3"
   },
   "dependencies": {
-    "@xmldom/xmldom": "^0.9.8",
-    "minimatch": "^10.0.3"
+    "@xmldom/xmldom": "^0.9.8"
   }
 }

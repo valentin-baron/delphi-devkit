@@ -1,7 +1,7 @@
 import { TreeItem, TreeItemCollapsibleState, Uri } from 'vscode';
 import { dirname } from 'path';
 
-export abstract class DprTreeItem extends TreeItem {
+export abstract class DelphiProjectTreeItem extends TreeItem {
   constructor(
     public readonly label: string,
     public readonly resourceUri: Uri,

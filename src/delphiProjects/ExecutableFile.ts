@@ -1,12 +1,15 @@
 import { TreeItemCollapsibleState, ThemeIcon, Uri } from 'vscode';
-import { DprTreeItem } from './DprTreeItem';
+import { DelphiProjectTreeItem } from './DelphiProjectTreeItem';
 
-export class ExecutableFile extends DprTreeItem {
+export class ExecutableFile extends DelphiProjectTreeItem {
+  public ini?: Uri;
+
   constructor(
     label: string,
-    resourceUri: Uri
+    resourceUri: Uri,
+    collapsibleState: TreeItemCollapsibleState = TreeItemCollapsibleState.None
   ) {
-    super(label, resourceUri, TreeItemCollapsibleState.None);
+    super(label, resourceUri, collapsibleState);
     this.command = {
       command: 'delphi-utils.launchExecutable',
       title: 'Launch Application',

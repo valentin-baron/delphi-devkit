@@ -1,9 +1,11 @@
 import { TreeItemCollapsibleState, ThemeIcon, Uri } from 'vscode';
-import { DprTreeItem } from './DprTreeItem';
+import { DelphiProjectTreeItem } from './DelphiProjectTreeItem';
 
-export class DprFile extends DprTreeItem {
-  public dproj?: Uri;
+export class DprojFile extends DelphiProjectTreeItem {
+  public dpr?: Uri;
+  public dpk?: Uri;
   public executable?: Uri;
+  public ini?: Uri;
 
   constructor(
     label: string,
@@ -13,10 +15,10 @@ export class DprFile extends DprTreeItem {
     super(label, resourceUri, collapsibleState);
     this.command = {
       command: 'vscode.open',
-      title: 'Open DPR File',
+      title: 'Open DPROJ File',
       arguments: [this.resourceUri]
     };
-    this.iconPath = new ThemeIcon('file-code');
-    this.contextValue = 'dprFile';
+    this.iconPath = new ThemeIcon('gear');
+    this.contextValue = 'dprojFile';
   }
 }

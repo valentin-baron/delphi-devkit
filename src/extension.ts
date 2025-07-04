@@ -1,21 +1,21 @@
 import { ExtensionContext, commands, languages, window, Uri, env } from 'vscode';
 import { dfmSwap } from './dfmSwap/command';
 import { DfmLanguageProvider } from './dfmLanguageSupport/provider';
-import { DprExplorerProvider, DprContextMenuCommands, CompilerStatusBar, Compiler } from './dprExplorer';
+import { DelphiProjectsProvider, DelphiProjectContextMenuCommands, CompilerStatusBar, Compiler } from './delphiProjects';
 
 export function activate(context: ExtensionContext): void {
   const swapCommand = commands.registerCommand('delphi-utils.swapToDfmPas', dfmSwap);
   const definitionProvider = languages.registerDefinitionProvider(
     { language: 'delphi-dfm', scheme: 'file' }, new DfmLanguageProvider());
 
-  // Register DPR Explorer
-  const dprExplorerProvider = new DprExplorerProvider();
-  const dprTreeView = window.createTreeView('dprExplorer', {
-    treeDataProvider: dprExplorerProvider
+  // Register Delphi Projects Explorer
+  const delphiProjectsProvider = new DelphiProjectsProvider();
+  const dprTreeView = window.createTreeView('delphiProjects', {
+    treeDataProvider: delphiProjectsProvider
   });
 
-  const refreshDprCommand = commands.registerCommand('delphi-utils.refreshDprExplorer', () => {
-    dprExplorerProvider.refresh();
+  const refreshDprCommand = commands.registerCommand('delphi-utils.refreshDelphiProjects', () => {
+    delphiProjectsProvider.refresh();
   });
 
   const launchExecutableCommand = commands.registerCommand('delphi-utils.launchExecutable', async (uri: Uri) => {
@@ -27,8 +27,8 @@ export function activate(context: ExtensionContext): void {
     }
   });
 
-  // Register DPR Explorer context menu commands
-  const contextMenuCommands = DprContextMenuCommands.registerCommands();
+  // Register Delphi Projects context menu commands
+  const contextMenuCommands = DelphiProjectContextMenuCommands.registerCommands();
 
   // Initialize compiler status bar
   const compilerStatusBar = CompilerStatusBar.initialize();

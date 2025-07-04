@@ -4,16 +4,30 @@ import { promises as fs } from 'fs';
 import { DOMParser } from '@xmldom/xmldom';
 
 /**
- * Utility functions for DPR Explorer operations
+ * Utility functions for Delphi Projects operations
  */
-export class DprUtils {
+export class DelphiProjectUtils {
+
+  /**
+   * Remove BOM (Byte Order Mark) from file content if present
+   * This is necessary for proper XML parsing of DPROJ files created by Windows tools
+   */
+  private static removeBOM(content: string): string {
+    if (content.charCodeAt(0) === 0xFEFF) {
+      return content.substring(1);
+    }
+    return content;
+  }
 
   /**
    * Find the executable path from a DPROJ file by parsing its XML content
    */
   static async findExecutableFromDproj(dprojUri: Uri): Promise<Uri | null> {
     try {
-      const dprojContent = await fs.readFile(dprojUri.fsPath, 'utf8');
+      let dprojContent = await fs.readFile(dprojUri.fsPath, 'utf8');
+
+      dprojContent = this.removeBOM(dprojContent);
+
       const parser = new DOMParser();
       const xmlDoc = parser.parseFromString(dprojContent, 'text/xml');
 
@@ -148,6 +162,37 @@ export class DprUtils {
     } catch (error) {
       console.error('Failed to find project from executable:', error);
       return {};
+    }
+  }
+
+  /**
+   * Find the associated DPROJ file for a given DPK file
+   */
+  static async findDprojFromDpk(dpkUri: Uri): Promise<Uri | null> {
+    try {
+      const dpkDir = dirname(dpkUri.fsPath);
+      const dpkName = basename(dpkUri.fsPath).replace(/\.[^/.]+$/, "");
+
+      // Look for a DPROJ file with the same name in the same directory
+      const dprojPath = join(dpkDir, `${dpkName}.dproj`);
+
+      try {
+        await workspace.fs.stat(Uri.file(dprojPath));
+        return Uri.file(dprojPath);
+      } catch {
+        // Try case variations
+        const dprojPathUpper = join(dpkDir, `${dpkName}.DPROJ`);
+        try {
+          await workspace.fs.stat(Uri.file(dprojPathUpper));
+          return Uri.file(dprojPathUpper);
+        } catch {
+          // DPROJ not found in same directory with same name
+          return null;
+        }
+      }
+    } catch (error) {
+      console.error('Failed to find DPROJ from DPK:', error);
+      return null;
     }
   }
 }
