@@ -178,6 +178,11 @@
           "description": "Glob patterns for paths to exclude from the Delphi Projects explorer. Use standard glob patterns like '**/folder/**' to exclude entire directories.",
           "scope": "resource"
         },
+        "delphi-utils.delphiProjects.sortProjects": {
+          "type": "boolean",
+          "default": false,
+          "description": "Sort Delphi projects alphabetically in the explorer. If false, preserves original order."
+        },
         "delphi-utils.compiler.configurations": {
           "type": "array",
           "items": {
@@ -290,6 +295,7 @@
     "typescript": "^5.8.3"
   },
   "dependencies": {
-    "@xmldom/xmldom": "^0.9.8"
+    "@xmldom/xmldom": "^0.9.8",
+    "minimatch": "^10.0.3"
   }
 }

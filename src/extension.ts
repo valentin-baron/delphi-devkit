@@ -15,7 +15,7 @@ export function activate(context: ExtensionContext): void {
   });
 
   const refreshDprCommand = commands.registerCommand('delphi-utils.refreshDelphiProjects', () => {
-    delphiProjectsProvider.refresh();
+    delphiProjectsProvider.refresh(true); // Force cache refresh
   });
 
   const launchExecutableCommand = commands.registerCommand('delphi-utils.launchExecutable', async (uri: Uri) => {

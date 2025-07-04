@@ -20,14 +20,40 @@ export class DelphiProjectUtils {
   }
 
   /**
-   * Find the executable path from a DPROJ file by parsing its XML content
+   * Find the executable path from a DPROJ file by parsing its XML content (optimized version)
    */
   static async findExecutableFromDproj(dprojUri: Uri): Promise<Uri | null> {
     try {
       let dprojContent = await fs.readFile(dprojUri.fsPath, 'utf8');
-
       dprojContent = this.removeBOM(dprojContent);
 
+      // Use faster regex-based parsing instead of full XML parsing for this specific case
+      // Look for DCC_DependencyCheckOutputName in PropertyGroup elements
+      const outputNameMatch = dprojContent.match(/<DCC_DependencyCheckOutputName[^>]*>([^<]+)<\/DCC_DependencyCheckOutputName>/i);
+
+      if (outputNameMatch && outputNameMatch[1]) {
+        const outputPath = outputNameMatch[1].trim();
+        if (outputPath) {
+          // The path might be relative to the DPROJ location
+          const dprojDir = dirname(dprojUri.fsPath);
+          const executablePath = join(dprojDir, outputPath);
+          return Uri.file(executablePath);
+        }
+      }
+
+      // Fallback to full XML parsing if regex approach didn't work
+      return await this.findExecutableFromDprojFallback(dprojUri, dprojContent);
+    } catch (error) {
+      console.error('Failed to parse DPROJ file:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Fallback method using full XML parsing when regex approach fails
+   */
+  private static async findExecutableFromDprojFallback(dprojUri: Uri, dprojContent: string): Promise<Uri | null> {
+    try {
       const parser = new DOMParser();
       const xmlDoc = parser.parseFromString(dprojContent, 'text/xml');
 
@@ -51,7 +77,7 @@ export class DelphiProjectUtils {
 
       return null;
     } catch (error) {
-      console.error('Failed to parse DPROJ file:', error);
+      console.error('Failed to parse DPROJ file with XML fallback:', error);
       return null;
     }
   }
