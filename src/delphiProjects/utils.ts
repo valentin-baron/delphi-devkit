@@ -221,4 +221,34 @@ export class DelphiProjectUtils {
       return null;
     }
   }
+
+  /**
+   * Find the associated DPK file for a given DPROJ file
+   */
+  static async findDpkFromDproj(dprojUri: Uri): Promise<Uri | null> {
+    try {
+      const dprojDir = dirname(dprojUri.fsPath);
+      const dprojName = basename(dprojUri.fsPath).replace(/\.[^/.]+$/, "");
+
+      // Look for a DPK file with the same base name in the same directory
+      const dpkPath = join(dprojDir, `${dprojName}.dpk`);
+
+      try {
+        await workspace.fs.stat(Uri.file(dpkPath));
+        return Uri.file(dpkPath);
+      } catch {
+        // Try case variations
+        const dpkPathUpper = join(dprojDir, `${dprojName}.DPK`);
+        try {
+          await workspace.fs.stat(Uri.file(dpkPathUpper));
+          return Uri.file(dpkPathUpper);
+        } catch {
+          return null;
+        }
+      }
+    } catch (error) {
+      console.error('Failed to find DPK from DPROJ:', error);
+      return null;
+    }
+  }
 }

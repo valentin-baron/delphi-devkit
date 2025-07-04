@@ -91,9 +91,8 @@ export class DelphiProjectsProvider implements TreeDataProvider<DelphiProjectTre
           hasIni: !!project.ini,
           iniPath: project.ini ? workspace.asRelativePath(project.ini) : undefined,
           iniAbsolutePath: project.ini?.fsPath
-        })),
-        // Future: groupProjects will be added here for .groupproj file support
-        groupProjects: []
+        }))
+        // groupProjects removed
       };
 
       await this.cacheManager.saveCacheData(configData);
@@ -127,66 +126,77 @@ export class DelphiProjectsProvider implements TreeDataProvider<DelphiProjectTre
         console.log('DelphiProjectsProvider: Loading root projects...');
         let configData: ProjectCacheData | null = null;
         let projects: DelphiProject[] | null = null;
-        if (this.forceRefreshCache) {
-          // Always rebuild cache if forced
-          projects = await ProjectDiscovery.getAllProjects();
-          await this.saveProjectsToConfig();
-          this.forceRefreshCache = false;
+        configData = await this.cacheManager.loadCacheData();
+        // If a group project is loaded, show only its projects
+        if (configData && configData.currentGroupProject) {
+          // Convert ProjectData[] to DelphiProject[]
+          projects = await ProjectLoader.loadProjectsFromConfig({ defaultProjects: configData.currentGroupProject.projects });
         } else {
-          configData = await this.cacheManager.loadCacheData();
-          projects = await ProjectLoader.loadProjectsFromConfig(configData);
-          if (!projects || projects.length === 0) {
-            console.log('DelphiProjectsProvider: No cached projects found, searching file system...');
-            try {
-              projects = await window.withProgress({
-                location: ProgressLocation.Notification,
-                title: "Searching for Delphi projects...",
-                cancellable: false
-              }, async (progress) => {
-                progress.report({ message: "Scanning workspace folders..." });
-                const result = await Promise.race([
-                  ProjectDiscovery.getAllProjects(),
-                  new Promise<DelphiProject[]>((_, reject) =>
-                    setTimeout(() => reject(new Error('Project search timed out after 30 seconds')), 30000)
-                  )
-                ]);
-                progress.report({ message: `Found ${result.length} projects` });
-                return result;
-              });
-            } catch (error) {
-              console.error('DelphiProjectsProvider: Project search failed or timed out:', error);
-              window.showWarningMessage('Delphi project search failed or timed out. Please check your workspace and configuration.');
-              projects = [];
-            }
-            console.log(`DelphiProjectsProvider: Found ${projects.length} projects`);
+          if (this.forceRefreshCache) {
+            // Always rebuild cache if forced
+            projects = await ProjectDiscovery.getAllProjects();
             await this.saveProjectsToConfig();
+            this.forceRefreshCache = false;
           } else {
-            console.log(`DelphiProjectsProvider: Loaded ${projects.length} projects from cache`);
+            projects = await ProjectLoader.loadProjectsFromConfig(configData);
+            if (!projects || projects.length === 0) {
+              console.log('DelphiProjectsProvider: No cached projects found, searching file system...');
+              try {
+                projects = await window.withProgress({
+                  location: ProgressLocation.Notification,
+                  title: "Searching for Delphi projects...",
+                  cancellable: false
+                }, async (progress) => {
+                  progress.report({ message: "Scanning workspace folders..." });
+                  const result = await Promise.race([
+                    ProjectDiscovery.getAllProjects(),
+                    new Promise<DelphiProject[]>((_, reject) =>
+                      setTimeout(() => reject(new Error('Project search timed out after 30 seconds')), 30000)
+                    )
+                  ]);
+                  progress.report({ message: `Found ${result.length} projects` });
+                  return result;
+                });
+              } catch (error) {
+                console.error('DelphiProjectsProvider: Project search failed or timed out:', error);
+                window.showWarningMessage('Delphi project search failed or timed out. Please check your workspace and configuration.');
+                projects = [];
+              }
+              console.log(`DelphiProjectsProvider: Found ${projects.length} projects`);
+              await this.saveProjectsToConfig();
+            } else {
+              console.log(`DelphiProjectsProvider: Loaded ${projects.length} projects from cache`);
+            }
           }
         }
-        // Only sort if setting is enabled
-        const sortProjects = workspace.getConfiguration('delphi-utils').get<boolean>('delphiProjects.sortProjects', false);
-        // Level 1: always sort by projectPaths glob order
-        const config = workspace.getConfiguration('delphi-utils.delphiProjects');
-        const projectPaths: string[] = config.get('projectPaths', ['**']);
-        let orderedProjects: DelphiProject[] = [];
-        const used = new Set<DelphiProject>();
-        for (const glob of projectPaths) {
-          // Find projects whose dpr/dproj/dpk path matches this glob using minimatch
-          let group = projects.filter(p => {
-            const absPath = p.dpr?.fsPath || p.dproj?.fsPath || p.dpk?.fsPath || '';
-            const relPath = absPath ? workspace.asRelativePath(absPath).replace(/\\/g, '/') : '';
-            // Use minimatch for proper glob matching
-            return minimatch(relPath, glob.replace(/\\/g, '/'));
-          }).filter(p => !used.has(p));
-          // Level 2: sort within group if enabled
-          if (sortProjects) {
-            group = group.slice().sort((a, b) => a.label.localeCompare(b.label));
+        if (!projects) { return []; }
+        // Only sort if setting is enabled and not a group project
+        const isGroupProject = !!(configData && configData.currentGroupProject);
+        if (!isGroupProject) {
+          const sortProjects = workspace.getConfiguration('delphi-utils').get<boolean>('delphiProjects.sortProjects', false);
+          // Level 1: always sort by projectPaths glob order
+          const config = workspace.getConfiguration('delphi-utils.delphiProjects');
+          const projectPaths: string[] = config.get('projectPaths', ['**']);
+          let orderedProjects: DelphiProject[] = [];
+          const used = new Set<DelphiProject>();
+          for (const glob of projectPaths) {
+            // Find projects whose dpr/dproj/dpk path matches this glob using minimatch
+            let group = projects.filter(p => {
+              const absPath = p.dpr?.fsPath || p.dproj?.fsPath || p.dpk?.fsPath || '';
+              const relPath = absPath ? workspace.asRelativePath(absPath).replace(/\\/g, '/') : '';
+              // Use minimatch for proper glob matching
+              return minimatch(relPath, glob.replace(/\\/g, '/'));
+            }).filter(p => !used.has(p));
+            // Level 2: sort within group if enabled
+            if (sortProjects) {
+              group = group.slice().sort((a, b) => a.label.localeCompare(b.label));
+            }
+            group.forEach(p => used.add(p));
+            orderedProjects = orderedProjects.concat(group);
           }
-          group.forEach(p => used.add(p));
-          orderedProjects = orderedProjects.concat(group);
+          return orderedProjects;
         }
-        return orderedProjects;
+        return projects;
       } else if (element instanceof DelphiProject) {
         // Delphi project - return constituent files as children
         const children: DelphiProjectTreeItem[] = [];

@@ -58,7 +58,7 @@ export class ProjectLoader {
 
         // Restore file references if they exist using cached checks
         await this.restoreFileReferencesBatch(project, projectData, fileChecks);
-
+        project.setIcon();
         project.updateCollapsibleState();
         projects.push(project);
       } catch {

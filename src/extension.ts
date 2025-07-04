@@ -1,7 +1,8 @@
-import { ExtensionContext, commands, languages, window, Uri, env } from 'vscode';
+import { ExtensionContext, commands, languages, window, Uri, env, workspace, ProgressLocation } from 'vscode';
 import { dfmSwap } from './dfmSwap/command';
 import { DfmLanguageProvider } from './dfmLanguageSupport/provider';
 import { DelphiProjectsProvider, DelphiProjectContextMenuCommands, CompilerStatusBar, Compiler } from './delphiProjects';
+import { GroupProjectService } from './delphiProjects/groupProject/GroupProjectService';
 
 export function activate(context: ExtensionContext): void {
   const swapCommand = commands.registerCommand('delphi-utils.swapToDfmPas', dfmSwap);
@@ -34,6 +35,14 @@ export function activate(context: ExtensionContext): void {
   const compilerStatusBar = CompilerStatusBar.initialize();
   const compilerStatusBarCommands = CompilerStatusBar.registerCommands();
 
+  const pickGroupProjectCommand = commands.registerCommand('delphi-utils.pickGroupProject', async () => {
+    await GroupProjectService.pickGroupProject(delphiProjectsProvider);
+  });
+
+  const unloadGroupProjectCommand = commands.registerCommand('delphi-utils.unloadGroupProject', async () => {
+    await GroupProjectService.unloadGroupProject(delphiProjectsProvider);
+  });
+
   context.subscriptions.push(
     swapCommand,
     definitionProvider,
@@ -42,7 +51,9 @@ export function activate(context: ExtensionContext): void {
     launchExecutableCommand,
     ...contextMenuCommands,
     ...compilerStatusBarCommands,
-    compilerStatusBar
+    compilerStatusBar,
+    pickGroupProjectCommand,
+    unloadGroupProjectCommand
   );
 }
 

@@ -24,19 +24,20 @@ export class DelphiProject extends DelphiProjectTreeItem {
     super(label, Uri.parse('delphi-project:' + label), collapsibleState);
     this.projectType = projectType;
     this.contextValue = 'delphiProject';
+    // Icon will be set after file members are assigned
+    this.setIcon();
+  }
 
-    // Set icon based on project type
-    switch (projectType) {
-      case ProjectType.Package:
-        this.iconPath = new ThemeIcon('package');
-        break;
-      case ProjectType.Library:
-        this.iconPath = new ThemeIcon('library');
-        break;
-      case ProjectType.Application:
-      default:
-        this.iconPath = new ThemeIcon('symbol-class');
-        break;
+  // Set icon based on actual project members (DPK > DPR > Library > fallback)
+  setIcon(): void {
+    if (this.dpk) {
+      this.iconPath = new ThemeIcon('package');
+    } else if (this.dpr) {
+      this.iconPath = new ThemeIcon('run');
+    } else if (this.projectType === ProjectType.Library) {
+      this.iconPath = new ThemeIcon('library');
+    } else {
+      this.iconPath = new ThemeIcon('symbol-class');
     }
   }
 

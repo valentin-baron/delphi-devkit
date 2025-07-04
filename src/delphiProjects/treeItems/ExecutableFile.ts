@@ -15,7 +15,7 @@ export class ExecutableFile extends DelphiProjectTreeItem {
       title: 'Launch Application',
       arguments: [this.resourceUri]
     };
-    this.iconPath = new ThemeIcon('play-circle');
+    this.iconPath = new ThemeIcon('run');
     this.contextValue = 'executableFile';
   }
 }

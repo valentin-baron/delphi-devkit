@@ -60,6 +60,17 @@
       {
         "command": "delphi-utils.showCompilerDropdown",
         "title": "Show Delphi Compiler Dropdown"
+      },
+      {
+        "command": "delphi-utils.pickGroupProject",
+        "title": "Pick Group Project",
+        "icon": "$(file-submodule)"
+      },
+      {
+        "command": "delphi-utils.unloadGroupProject",
+        "title": "Unload Group Project",
+        "icon": "$(close)",
+        "when": "view == delphiProjects && delphiUtils:groupProjectLoaded == true"
       }
     ],
     "views": {
@@ -92,6 +103,16 @@
           "command": "delphi-utils.selectCompilerConfiguration",
           "when": "view == delphiProjects",
           "group": "navigation"
+        },
+        {
+          "command": "delphi-utils.pickGroupProject",
+          "when": "view == delphiProjects",
+          "group": "navigation@2"
+        },
+        {
+          "command": "delphi-utils.unloadGroupProject",
+          "when": "view == delphiProjects && delphiUtils:groupProjectLoaded == true",
+          "group": "navigation@3"
         }
       ],
       "view/item/context": [

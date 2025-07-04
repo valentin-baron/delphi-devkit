@@ -10,7 +10,15 @@ export interface ProjectCacheData {
   lastUpdated: string;
   version: string;
   defaultProjects: ProjectData[];
-  groupProjects?: GroupProjectData[];
+  /**
+   * Stores the currently picked group project (if any)
+   */
+  currentGroupProject?: {
+    groupProjPath: string;
+    groupProjAbsolutePath: string;
+    name: string;
+    projects: ProjectData[];
+  };
 }
 
 /**
