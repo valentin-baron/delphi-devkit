@@ -282,6 +282,7 @@
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",
+    "@types/mock-fs": "^4.13.4",
     "@types/node": "20.x",
     "@types/vscode": "^1.101.0",
     "@types/xmldom": "^0.1.34",
@@ -291,6 +292,7 @@
     "@vscode/test-electron": "^2.5.2",
     "esbuild": "^0.25.3",
     "eslint": "^9.25.1",
+    "mock-fs": "^5.5.0",
     "npm-run-all": "^4.1.5",
     "typescript": "^5.8.3"
   },
