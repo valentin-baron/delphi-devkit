@@ -1,0 +1,40 @@
+name: Publish VS Code Extension
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: "Release type"
+        required: true
+        default: "pre-release"
+        type: choice
+        options:
+          - "pre-release"
+          - "release"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+      - name: Install dependencies
+        run: npm ci
+      - name: Compile extension
+        run: npm run compile
+      - name: Install vsce
+        run: npm install -g @vscode/vsce
+      - name: Publish extension
+        run: |
+          if [ "${{ github.event.inputs.release_type }}" = "pre-release" ]; then
+            vsce publish --pre-release
+          else
+            vsce publish
+          fi
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
