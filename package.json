@@ -77,7 +77,7 @@
       }
     ],
     "views": {
-      "delphi-explorer": [
+      "delphi-projects": [
         {
           "id": "delphiProjects",
           "name": "Projects",
@@ -90,8 +90,8 @@
     "viewsContainers": {
       "activitybar": [
         {
-          "id": "delphi-explorer",
-          "title": "delphi utils",
+          "id": "delphi-projects",
+          "title": "Delphi Projects",
           "icon": "assets/DelphiHelmetLine.svg"
         }
       ]

@@ -19,6 +19,7 @@ import { FindOneOptions } from "typeorm";
 import { Coroutine } from "../../typings";
 import { PROBLEMMATCHER_REGEX } from ".";
 import { CompilerOutputLinkProvider } from "./compilerOutputLinkProvider";
+import { Projects } from "../../constants";
 
 export interface CompilerConfiguration {
   name: string;
@@ -104,13 +105,13 @@ export class Compiler extends Restorable<WorkspaceEntity> {
   }
 
   public get availableConfigurations(): CompilerConfiguration[] {
-    const config = workspace.getConfiguration("delphi-devkit.compiler");
-    return config.get<CompilerConfiguration[]>("configurations", []);
+    const config = workspace.getConfiguration(Projects.Config.Key);
+    return config.get<CompilerConfiguration[]>(Projects.Config.Compiler.Configurations, []);
   }
 
   public set configuration(configurationName: string | undefined) {
     if (!configurationName) { return; }
-    const config = workspace.getConfiguration("delphi-devkit.compiler");
+    const config = workspace.getConfiguration(Projects.Config.Key);
     config.update("currentConfiguration", configurationName, false);
     Runtime.db.modify(async (ws) => ws.compiler = configurationName);
     window.showInformationMessage(
@@ -119,14 +120,14 @@ export class Compiler extends Restorable<WorkspaceEntity> {
   }
 
   public get configuration(): CompilerConfiguration {
-    const config = workspace.getConfiguration("delphi-devkit.compiler");
+    const config = workspace.getConfiguration(Projects.Config.Key);
     const configurations: CompilerConfiguration[] = config.get(
-      "configurations",
+      Projects.Config.Compiler.Configurations,
       []
     );
     const currentConfigName: string = config.get(
-      "currentConfiguration",
-      "Delphi 12"
+      Projects.Config.Compiler.CurrentConfiguration,
+      Projects.Config.Compiler.Value_DefaultConfiguration
     );
     const currentConfig = configurations.find(
       (cfg) => cfg.name === currentConfigName

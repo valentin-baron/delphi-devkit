@@ -4,6 +4,7 @@ import { DelphiProject } from "../treeItems/delphiProject";
 import { basename, dirname, join } from "path";
 import { promises as fs } from "fs";
 import { Runtime } from "../../runtime";
+import { Projects } from "../../constants";
 
 /**
  * Context menu commands for Delphi Projects tree items
@@ -15,27 +16,27 @@ export class DelphiProjectContextMenuCommands {
   static registerCommands() {
     return [
       commands.registerCommand(
-        "delphi-devkit.projects.compile",
+        Projects.Command.Compile,
         DelphiProjectContextMenuCommands.compile
       ),
       commands.registerCommand(
-        "delphi-devkit.projects.recreate",
+        Projects.Command.Recreate,
         DelphiProjectContextMenuCommands.recreate
       ),
       commands.registerCommand(
-        "delphi-devkit.projects.showInExplorer",
+        Projects.Command.ShowInExplorer,
         DelphiProjectContextMenuCommands.showInExplorer
       ),
       commands.registerCommand(
-        "delphi-devkit.projects.openInFileExplorer",
+        Projects.Command.OpenInFileExplorer,
         DelphiProjectContextMenuCommands.openInFileExplorer
       ),
       commands.registerCommand(
-        "delphi-devkit.projects.runExecutable",
+        Projects.Command.RunExecutable,
         DelphiProjectContextMenuCommands.runExecutable
       ),
       commands.registerCommand(
-        "delphi-devkit.projects.configureOrCreateIni",
+        Projects.Command.ConfigureOrCreateIni,
         DelphiProjectContextMenuCommands.configureOrCreateIni
       ),
     ];

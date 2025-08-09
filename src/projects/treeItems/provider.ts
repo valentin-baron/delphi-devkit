@@ -18,6 +18,7 @@ import { GroupProjectPicker } from "../pickers/groupProjPicker";
 import { Runtime, RuntimeProperty } from "../../runtime";
 import { basename } from "path";
 import { AppDataSource } from "../../db/datasource";
+import { Projects } from "../../constants";
 
 type NullableTreeItem = DelphiProjectTreeItem | undefined | null | void;
 
@@ -34,8 +35,8 @@ export class DelphiProjectsProvider
   private createWatchers(): void {
     if (
       !workspace
-        .getConfiguration("delphi-devkit")
-        .get<boolean>("projects.useFileSystemWatchers")
+        .getConfiguration(Projects.Config.Key)
+        .get<boolean>(Projects.Config.Discovery.UseFileSystemWatchers, false)
     ) {
       return;
     }
@@ -55,7 +56,7 @@ export class DelphiProjectsProvider
       });
     });
     Runtime.extension.subscriptions.push(...watchers);
-    const gitCheckoutDelay = workspace.getConfiguration("delphi-devkit").get<number>("projects.gitCheckoutDelay", 30000);
+    const gitCheckoutDelay = workspace.getConfiguration(Projects.Config.Key).get<number>(Projects.Config.GitCheckoutDelay, 30000);
     let updateRequest: NodeJS.Timeout | undefined = undefined;
     Runtime.subscribe(
       (prop, val: any) => {
@@ -82,8 +83,8 @@ export class DelphiProjectsProvider
   private createConfigurationWatcher() {
     workspace.onDidChangeConfiguration((event: ConfigurationChangeEvent) => {
       if (
-        event.affectsConfiguration("delphi-devkit.delphiProjects.excludePatterns") ||
-        event.affectsConfiguration("delphi-devkit.delphiProjects.projectPaths")
+        event.affectsConfiguration(Projects.Config.full(Projects.Config.Discovery.ProjectPaths)) ||
+        event.affectsConfiguration(Projects.Config.full(Projects.Config.Discovery.ExcludePatterns))
       ) {
         this.refreshTreeView();
       }
@@ -91,7 +92,7 @@ export class DelphiProjectsProvider
   }
 
   private createCommands() {
-    const refreshDelphiProjects = commands.registerCommand('delphi-devkit.projects.refresh', async () => {
+    const refreshDelphiProjects = commands.registerCommand(Projects.Command.Refresh, async () => {
       if (!await Runtime.assertWorkspaceAvailable()) { 
         window.showWarningMessage('No workspace available. Please open a workspace to refresh Delphi projects.');
         return; 
@@ -99,7 +100,7 @@ export class DelphiProjectsProvider
       await this.refreshTreeView(true);
     });
 
-    const pickGroupProjectCommand = commands.registerCommand('delphi-devkit.projects.pickGroupProject', async () => {
+    const pickGroupProjectCommand = commands.registerCommand(Projects.Command.PickGroupProject, async () => {
       const uri = await this.groupProjPicker.pickGroupProject();
       if (!uri) { return; }
       const ws = await Runtime.db.modify(async (ws) => {
@@ -122,7 +123,7 @@ export class DelphiProjectsProvider
       window.showInformationMessage(`Loaded group project: ${ws?.currentGroupProject?.name}`);
     });
 
-    const unloadGroupProjectCommand = commands.registerCommand('delphi-devkit.projects.unloadGroupProject', async () => {
+    const unloadGroupProjectCommand = commands.registerCommand(Projects.Command.UnloadGroupProject, async () => {
       await Runtime.db.modify(async (ws) => {
         if (ws.viewMode === WorkspaceViewMode.GroupProject) {
           ws.currentGroupProject = null;
@@ -209,11 +210,11 @@ export class DelphiProjectsProvider
     const modifiedWorkspace = await Runtime.db.modify(async (ws) => {
       commands.executeCommand( // for VS code items to be visible/invisible
         "setContext",
-        "delphiDevkit:isGroupProjectView",
+        Projects.Context.IsGroupProjectView,
         ws.viewMode === WorkspaceViewMode.GroupProject
       );
       await Runtime.extension.workspaceState.update(
-        "projects.isGroupProjectView", 
+        Projects.Variables.IsGroupProjectView, 
         ws.viewMode === WorkspaceViewMode.GroupProject
       );
       switch (ws.viewMode) {
@@ -223,8 +224,8 @@ export class DelphiProjectsProvider
           }
           break;
         case WorkspaceViewMode.Empty:
-          const config = workspace.getConfiguration('delphi-devkit.projects');
-          if (config && !config.get<boolean>('discovery.enable', true)) {
+          const config = workspace.getConfiguration(Projects.Config.Key);
+          if (config && !config.get<boolean>(Projects.Config.Discovery.Enable, true)) {
             break;
           }
         case WorkspaceViewMode.Discovery: 

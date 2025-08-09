@@ -7,6 +7,7 @@ import { DprojParser } from "./dprojParser";
 import { GroupProjParser } from "./groupProjParser";
 import { Runtime } from "../../runtime";
 import { LexoSorter } from "../../utils/lexoSorter";
+import { Projects } from "../../constants";
 
 interface FileGroup {
   baseName: string;
@@ -24,9 +25,9 @@ export class ProjectDiscovery {
     }
 
     let projects: Array<ProjectEntity> = [];
-    const config = workspace.getConfiguration("delphi-devkit.projects");
-    const projectPaths: string[] = config.get("projectPaths", ["**"]);
-    const excludePatterns: string[] = config.get("excludePatterns", []);
+    const config = workspace.getConfiguration(Projects.Config.Key);
+    const projectPaths: string[] = config.get(Projects.Config.Discovery.ProjectPaths, ["**"]);
+    const excludePatterns: string[] = config.get(Projects.Config.Discovery.ExcludePatterns, []);
 
     await Promise.allSettled(
       workspace.workspaceFolders.map(async (folder) => {

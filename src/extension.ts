@@ -3,20 +3,21 @@ import { dfmSwap } from './dfmSwap/command';
 import { DfmLanguageProvider } from './dfmLanguageSupport/provider';
 import { Runtime } from './runtime';
 import { DelphiProjectContextMenuCommands } from './projects/contextMenu/commands';
+import { DFM, Projects } from './constants';
 
 export async function activate(context: ExtensionContext): Promise<void> {
   await Runtime.initialize(context);
-  const swapCommand = commands.registerCommand('delphi-devkit.swapToDfmPas', dfmSwap);
+  const swapCommand = commands.registerCommand(DFM.Commands.SwapToDfmPas, dfmSwap);
   const definitionProvider = languages.registerDefinitionProvider(
     { language: 'delphi-devkit.dfm', scheme: 'file' }, new DfmLanguageProvider());
 
   // Register Delphi Projects Explorer
-  const projectsTreeView = window.createTreeView('delphiProjects', {
+  const projectsTreeView = window.createTreeView(Projects.View.Main, {
     treeDataProvider: Runtime.projectsProvider,
     dragAndDropController: Runtime.projectsProvider.dragAndDropController
   });
 
-  const launchExecutableCommand = commands.registerCommand('delphi-devkit.projects.launchExecutable', async (uri: Uri) => {
+  const launchExecutableCommand = commands.registerCommand(Projects.Command.LaunchExecutable, async (uri: Uri) => {
     try {
       // Use the system's default application handler to launch the executable
       await env.openExternal(uri);

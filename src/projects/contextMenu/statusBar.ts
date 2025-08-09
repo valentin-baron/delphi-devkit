@@ -1,5 +1,6 @@
 import { window, StatusBarAlignment, StatusBarItem, workspace } from 'vscode';
 import { Runtime } from '../../runtime';
+import { Projects } from '../../constants';
 
 export class CompilerPicker {
   private statusBarItem: StatusBarItem;
@@ -38,8 +39,11 @@ export class CompilerPicker {
 
   private async updateDisplay(): Promise<void> {
     try {
-      const config = workspace.getConfiguration('delphi-devkit.compiler');
-      const currentConfigName: string = config.get('currentConfiguration', 'Delphi 12');
+      const config = workspace.getConfiguration(Projects.Config.Key);
+      const currentConfigName: string = config.get(
+        Projects.Config.Compiler.CurrentConfiguration, 
+        Projects.Config.Compiler.Value_DefaultConfiguration
+      );
 
       // Set the text with an icon similar to Run and Debug
       this.statusBarItem.text = `$(tools) ${currentConfigName}`;

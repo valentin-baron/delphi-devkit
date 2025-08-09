@@ -8,6 +8,7 @@ import { DelphiProjectTreeItem } from "./delphiProjectTreeItem";
 import { Runtime } from "../../runtime";
 import { LexoSorter } from "../../utils/lexoSorter";
 import { DelphiProject } from "./delphiProject";
+import { Projects } from "../../constants";
 
 export class DelphiProjectsDragAndDropController
   implements TreeDragAndDropController<DelphiProjectTreeItem>
@@ -20,7 +21,7 @@ export class DelphiProjectsDragAndDropController
     source: DelphiProjectTreeItem[],
     dataTransfer: DataTransfer
   ): Promise<void> {
-    if (Runtime.extension.workspaceState.get("projects.isGroupProjectView")) { 
+    if (Runtime.extension.workspaceState.get(Projects.Variables.IsGroupProjectView)) {
       window.showErrorMessage("Drag and drop is not supported in group project view.");
       return; 
     }
