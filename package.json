@@ -1,9 +1,10 @@
 {
   "name": "delphi-devkit",
-  "displayName": "Delphi Development Kit (DDK)",
+  "displayName": "DDK - Delphi Development Kit",
   "description": "Utilities for developing in Delphi using VS Code",
   "version": "0.1.0",
   "publisher": "Snowcaloid",
+  "license": "SEE LICENSE IN LICENSE",
   "homepage": "https://www.github.com/Snowcaloid",
   "icon": "assets/DelphiHelmet.png",
   "engines": {

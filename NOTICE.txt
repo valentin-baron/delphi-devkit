@@ -1,0 +1,12 @@
+DDK - Delphi Development Kit for Visual Studio Code
+Copyright © 2025 Snowcaloid. All rights reserved.
+
+Version 1.0
+Date: 10.08.2025 (August 10)
+
+This product is not affiliated with, endorsed by, or sponsored by Embarcadero
+Technologies, Inc. Delphi® and related logos are registered trademarks of
+Embarcadero Technologies, Inc. in the United States and other countries.
+
+All other trademarks, service marks, and product names used in this project
+are the property of their respective owners.

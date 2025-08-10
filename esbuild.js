@@ -28,6 +28,12 @@ const copyAssetsPlugin = {
 
 			const sourceWasm = path.join(__dirname, 'node_modules', 'sql.js', 'dist', 'sql-wasm.wasm');
 			copyAsset(sourceWasm);
+
+			const sourceLicense = path.join(__dirname, 'LICENSE');
+			copyAsset(sourceLicense);
+
+			const sourceNotice = path.join(__dirname, 'NOTICE.txt');
+			copyAsset(sourceNotice);
 		});
 	},
 };
