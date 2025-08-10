@@ -34,6 +34,9 @@ const copyAssetsPlugin = {
 
 			const sourceNotice = path.join(__dirname, 'NOTICE.txt');
 			copyAsset(sourceNotice);
+
+			const readmeFile = path.join(__dirname, 'README.md');
+			copyAsset(readmeFile);
 		});
 	},
 };
