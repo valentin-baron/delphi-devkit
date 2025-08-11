@@ -158,19 +158,19 @@ export class Compiler extends Restorable<WorkspaceEntity> {
         ...this.configuration.buildArguments,
       ];
       // Use extension path to find the script
-      const scriptPath = Runtime.extension.asAbsolutePath(join("src", "projects", "compiler", "compile.ps1"));
+      const scriptPath = Runtime.extension.asAbsolutePath(join("dist", "compile.ps1"));
       const buildArgumentsString = buildArguments.join(" ");
       let psArgs = [
         "-ExecutionPolicy", "Bypass",
-        "-File", `"${scriptPath}"`,
-        "-ProjectPath", `"${file.fsPath}"`,
-        "-RSVarsPath", `"${this.configuration.rsVarsPath}"`,
-        "-MSBuildPath", `"${this.configuration.msBuildPath}"`,
-        "-FileName", `"${fileName}"`,
-        "-ActionDescription", `"${actionDescription}"`,
-        "-PathDescription", `"${pathDescription}"`,
-        "-BuildArguments", `"${buildArgumentsString}"`,
-        "-CompilerName", `"${this.configuration.name}"`,
+        "-File", scriptPath,
+        "-ProjectPath", file.fsPath,
+        "-RSVarsPath", this.configuration.rsVarsPath,
+        "-MSBuildPath", this.configuration.msBuildPath,
+        "-FileName", fileName,
+        "-ActionDescription", actionDescription,
+        "-PathDescription", pathDescription,
+        "-BuildArguments", buildArgumentsString,
+        "-CompilerName", this.configuration.name,
       ];
       if (this.configuration.usePrettyFormat) {
         psArgs.push("-UsePrettyFormat");
