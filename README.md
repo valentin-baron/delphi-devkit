@@ -1,6 +1,10 @@
 # Delphi DevKit README
 
-Utilities for developing in Delphi using VS Code
+Utilities for developing in Delphi using VS Code.
+
+This project is not affiliated, associated, authorized, endorsed by, or in any way officially connected with Embarcadero Technologies, or any of its subsidiaries or its affiliates. The official Embarcadero Technologies website can be found at [https://www.embarcadero.com/](https://www.embarcadero.com/).
+
+This extension does not include any proprietary Embarcadero code, libraries or binaries. To build Delphi projects, you must have a valid Delphi installation and the necessary environment variables set up.
 
 ## Features
 
