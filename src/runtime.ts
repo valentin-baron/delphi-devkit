@@ -35,7 +35,7 @@ export enum RuntimeProperty {
 /**
  * Wrapper for all Statusbar components
  */
-class StatusBar { 
+class StatusBar {
   constructor(public compilerPicker: CompilerPicker) {}
 }
 
@@ -195,9 +195,14 @@ export abstract class Runtime {
   private static async acquireLock(name: string): Promise<string> {
     const lockHash = Runtime.workspaceHash;
     let lockInfo = this.getFlag<LockInfo>(name, lockHash);
+    const start = Date.now();
     // The lock is by this window => no need to wait
     // The lock is by another window and the counter is 0 => we can take the lock
     while (lockInfo?.windowID !== this.windowID && (lockInfo?.counter || 0) > 0) {
+      if (lockInfo && Date.now() - start > 5000) {
+        lockInfo.counter = 0;
+        break; // Avoid infinite waiting. The lock can't be closed for so long.
+      }
       await new Promise(resolve => setTimeout(resolve, 100));
       lockInfo = this.getFlag<LockInfo>(name, lockHash);
     }
