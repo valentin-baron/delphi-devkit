@@ -19,31 +19,31 @@ export class DelphiProjectContextMenuCommands {
     return [
       commands.registerCommand(
         Projects.Command.Compile,
-        DelphiProjectContextMenuCommands.compile
+        DelphiProjectContextMenuCommands.compile.bind(this)
       ),
       commands.registerCommand(
         Projects.Command.Recreate,
-        DelphiProjectContextMenuCommands.recreate
+        DelphiProjectContextMenuCommands.recreate.bind(this)
       ),
       commands.registerCommand(
         Projects.Command.ShowInExplorer,
-        DelphiProjectContextMenuCommands.showInExplorer
+        DelphiProjectContextMenuCommands.showInExplorer.bind(this)
       ),
       commands.registerCommand(
         Projects.Command.OpenInFileExplorer,
-        DelphiProjectContextMenuCommands.openInFileExplorer
+        DelphiProjectContextMenuCommands.openInFileExplorer.bind(this)
       ),
       commands.registerCommand(
         Projects.Command.RunExecutable,
-        DelphiProjectContextMenuCommands.runExecutable
+        DelphiProjectContextMenuCommands.runExecutable.bind(this)
       ),
       commands.registerCommand(
         Projects.Command.ConfigureOrCreateIni,
-        DelphiProjectContextMenuCommands.configureOrCreateIni
+        DelphiProjectContextMenuCommands.configureOrCreateIni.bind(this)
       ),
       commands.registerCommand(
         Projects.Command.SelectProject,
-        DelphiProjectContextMenuCommands.selectProject
+        DelphiProjectContextMenuCommands.selectProject.bind(this)
       )
     ];
   }
