@@ -1,6 +1,6 @@
 import { TreeItemCollapsibleState, ThemeIcon, Uri, commands } from "vscode";
 import { DelphiProjectMainTreeItem, DelphiProjectTreeItem } from "./delphiProjectTreeItem";
-import { DelphiProjectTreeItemType } from "../types";
+import { DelphiProjectTreeItemType } from "../../types";
 import { DprojFile } from "./dprojFile";
 import { DprFile } from "./dprFile";
 import { IniFile } from "./iniFile";
@@ -158,35 +158,35 @@ export class DelphiProject extends DelphiProjectTreeItem implements DelphiProjec
   async setDproj(value: Uri, save: boolean = false): Promise<void> {
     this.dproj = value;
     if (save) {
-      await Runtime.projectsTreeView.save();
+      await Runtime.projects.treeView.save();
     }
   }
 
   async setDpr(value: Uri, save: boolean = false): Promise<void> {
     this.dpr = value;
     if (save) {
-      await Runtime.projectsTreeView.save();
+      await Runtime.projects.treeView.save();
     }
   }
 
   async setDpk(value: Uri, save: boolean = false): Promise<void> {
     this.dpk = value;
     if (save) {
-      await Runtime.projectsTreeView.save();
+      await Runtime.projects.treeView.save();
     }
   }
 
   async setExecutable(value: Uri, save: boolean = false): Promise<void> {
     this.exe = value;
     if (save) {
-      await Runtime.projectsTreeView.save();
+      await Runtime.projects.treeView.save();
     }
   }
 
   async setIni(value: Uri, save: boolean = false): Promise<void> {
     this.ini = value;
     if (save) {
-      await Runtime.projectsTreeView.save();
+      await Runtime.projects.treeView.save();
     }
   }
 

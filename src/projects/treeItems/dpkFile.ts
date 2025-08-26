@@ -1,6 +1,6 @@
 import { ThemeIcon, Uri } from 'vscode';
 import { DelphiProjectTreeItem } from './delphiProjectTreeItem';
-import { DelphiProjectTreeItemType } from '../types';
+import { DelphiProjectTreeItemType } from '../../types';
 import { ProjectType } from './delphiProject';
 
 export class DpkFile extends DelphiProjectTreeItem {

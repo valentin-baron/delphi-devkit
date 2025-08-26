@@ -41,7 +41,7 @@ export class DelphiProjectsDragAndDropController
     if (!Array.isArray(draggedKeys) || !draggedKeys.length) {
       return;
     }
-    let treeItems = (await Runtime.projectsTreeView.getChildren()).filter((item): item is DelphiProject => item instanceof DelphiProject);
+    let treeItems = (await Runtime.projects.treeView.getChildren()).filter((item): item is DelphiProject => item instanceof DelphiProject);
     let sorter = new LexoSorter<DelphiProject>(treeItems);
     let dragItem = treeItems.find((item) => item.projectUri.fsPath === draggedKeys[0]);
     if (!dragItem) { return; }
@@ -55,7 +55,7 @@ export class DelphiProjectsDragAndDropController
     }
 
     const newOrder = sorter.reorder(dragItem, beforeItem);
-    await Runtime.projectsTreeView.save(newOrder);
-    Runtime.projectsTreeView.refreshTreeView();
+    await Runtime.projects.treeView.save(newOrder);
+    Runtime.projects.treeView.refreshTreeView();
   }
 }

@@ -5,13 +5,13 @@ import { Runtime } from "../runtime";
 import { Projects } from "../constants";
 import { Coroutine } from "../typings";
 import { GroupProjectEntity, ProjectEntity } from "../db/entities";
-import { WorkspaceViewMode } from "./types";
+import { WorkspaceViewMode } from "../types";
 import { DelphiProjectTreeItem } from "./treeItems/delphiProjectTreeItem";
 import { DelphiProject } from "./treeItems/delphiProject";
 import { ProjectDiscovery } from "./data/projectDiscovery";
 
 
-export namespace Commands {
+export namespace ProjectsCommands {
   export function register() {
     Runtime.extension.subscriptions.push(...[
       ...SelectedProject.registers,
@@ -38,7 +38,7 @@ export namespace Commands {
       await this.selectedProjectAction(async (project) => {
         const path = project.dprojPath || project.dprPath || project.dpkPath;
         if (!path) { return; }
-        Runtime.compiler.compile(Uri.file(path), false);
+        Runtime.projects.compiler.compile(Uri.file(path), false);
       });
     }
 
@@ -46,7 +46,7 @@ export namespace Commands {
       await this.selectedProjectAction(async (project) => {
         const path = project.dprojPath || project.dprPath || project.dpkPath;
         if (!path) { return; }
-        Runtime.compiler.compile(Uri.file(path), true);
+        Runtime.projects.compiler.compile(Uri.file(path), true);
       });
     }
 
@@ -78,14 +78,14 @@ export namespace Commands {
     private static async compile(item: DelphiProjectTreeItem): Promise<void> {
       let file = item.projectDproj || item.projectDpr || item.projectDpk;
       if (file) {
-        await Runtime.compiler.compile(file, false);
+        await Runtime.projects.compiler.compile(file, false);
       }
     }
 
     private static async recreate(item: DelphiProjectTreeItem): Promise<void> {
       let file = item.projectDproj || item.projectDpr || item.projectDpk;
       if (file) {
-        await Runtime.compiler.compile(file, true);
+        await Runtime.projects.compiler.compile(file, true);
       }
     }
 
@@ -201,7 +201,7 @@ export namespace Commands {
         }
         return ws;
       });
-      await Runtime.projectsTreeView.refreshTreeView();
+      await Runtime.projects.treeView.refreshTreeView();
     }
   }
 
@@ -216,7 +216,7 @@ export namespace Commands {
     }
 
     public static async selectCompilerConfiguration(): Promise<void> {
-      const configurations = Runtime.compiler.availableConfigurations;
+      const configurations = Runtime.projects.compiler.availableConfigurations;
 
       if (!configurations.length) {
         window.showErrorMessage(
@@ -237,7 +237,7 @@ export namespace Commands {
         matchOnDetail: true,
       });
 
-      Runtime.compiler.configuration = selected?.label;
+      Runtime.projects.compiler.configuration = selected?.label;
     }
   }
 
@@ -256,11 +256,11 @@ export namespace Commands {
         window.showWarningMessage('No workspace available. Please open a workspace to refresh Delphi projects.');
         return;
       }
-      await Runtime.projectsTreeView.refreshTreeView(true);
+      await Runtime.projects.treeView.refreshTreeView(true);
     }
 
     private static async pickGroupProject(): Promise<void> {
-      const uri = await Runtime.projectsTreeView.groupProjPicker.pickGroupProject();
+      const uri = await Runtime.projects.treeView.groupProjPicker.pickGroupProject();
       if (!uri) { return; }
       let needToFindProjects = false;
 
@@ -283,7 +283,7 @@ export namespace Commands {
           return ws;
         });
       }
-      await Runtime.projectsTreeView.refreshTreeView();
+      await Runtime.projects.treeView.refreshTreeView();
       window.showInformationMessage(`Loaded group project: ${ws?.currentGroupProject?.name}`);
     }
 
@@ -295,7 +295,7 @@ export namespace Commands {
         }
         return ws;
       });
-      await Runtime.projectsTreeView.refreshTreeView();
+      await Runtime.projects.treeView.refreshTreeView();
       window.showInformationMessage('Unloaded group project. Showing default projects (if discovery is enabled).');
     }
 

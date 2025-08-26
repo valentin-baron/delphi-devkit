@@ -12,3 +12,7 @@ export enum WorkspaceViewMode {
   Discovery,
   Empty
 }
+
+export interface Feature {
+  initialize(): Promise<void>;
+}

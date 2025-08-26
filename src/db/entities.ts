@@ -1,6 +1,6 @@
 import "reflect-metadata";
 import { Column, Entity, JoinColumn, ManyToOne, OneToMany, OneToOne, PrimaryColumn, PrimaryGeneratedColumn } from "typeorm";
-import { WorkspaceViewMode } from "../projects/types";
+import { WorkspaceViewMode } from "../types";
 import { ProjectType } from "../projects/treeItems/delphiProject";
 import { SortedItem } from "../utils/lexoSorter";
 
@@ -31,11 +31,11 @@ export class WorkspaceEntity {
   currentProject?: ProjectEntity;
 
   public get viewMode(): WorkspaceViewMode {
-    return !!this.currentGroupProject ? 
-      WorkspaceViewMode.GroupProject : 
+    return !!this.currentGroupProject ?
+      WorkspaceViewMode.GroupProject :
       (
         !!this.discoveredProjects ?
-        WorkspaceViewMode.Discovery : 
+        WorkspaceViewMode.Discovery :
         WorkspaceViewMode.Empty
       );
   }

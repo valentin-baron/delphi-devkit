@@ -72,7 +72,7 @@ export class Compiler extends Restorable<WorkspaceEntity> {
     const config = workspace.getConfiguration(Projects.Config.Key);
     config.update(Projects.Config.Compiler.CurrentConfiguration, configurationName, false);
     Runtime.db.modify(async (ws) => ws.compiler = configurationName).then(() => {
-      Runtime.statusBar.compilerPicker.updateDisplay();
+      Runtime.projects.compilerStatusBarItem.updateDisplay();
     });
     window.showInformationMessage(
       `Compiler configuration set to: ${configurationName}`

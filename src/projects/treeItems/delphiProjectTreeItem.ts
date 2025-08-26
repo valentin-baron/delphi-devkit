@@ -1,5 +1,5 @@
 import { TreeItem, TreeItemCollapsibleState, Uri } from 'vscode';
-import { DelphiProjectTreeItemType } from '../types';
+import { DelphiProjectTreeItemType } from '../../types';
 import { ProjectType } from './delphiProject';
 
 export interface DelphiProjectMainTreeItem {
@@ -25,7 +25,7 @@ export abstract class DelphiProjectTreeItem extends TreeItem {
     super(label, itemType === DelphiProjectTreeItemType.Project ? TreeItemCollapsibleState.Collapsed : TreeItemCollapsibleState.None);
     this.tooltip = this.resourceUri.fsPath;
   }
-  
+
   public get projectUri(): Uri {
     return this.project.resourceUri;
   }
@@ -54,4 +54,3 @@ export abstract class DelphiProjectTreeItem extends TreeItem {
     return this.project.ini;
   }
 }
- 

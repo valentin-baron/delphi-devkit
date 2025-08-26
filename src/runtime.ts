@@ -1,12 +1,11 @@
 import { ExtensionContext, extensions, window, workspace } from "vscode";
-import { DelphiProjectsTreeView } from "./projects/treeItems/treeView";
-import { Compiler } from "./projects/compiler/compiler";
-import { CompilerPicker } from "./projects/compiler/statusBar";
 import { DatabaseController } from "./db/databaseController";
 import { API, GitExtension } from "./typings/git";
 import { createHash } from "crypto";
 import { DynamicObject } from "./typings";
 import { AppDataSource } from "./db/datasource";
+import { ProjectsFeature } from "./projects/feature";
+import { DfmFeature } from "./dfm/feature";
 
 namespace WorkspaceKeys {
   const WORKSPACE_KEY = "projects<%ws>";
@@ -23,13 +22,6 @@ namespace WorkspaceKeys {
 export enum RuntimeProperty {
   Workspace,
   WorkspaceAvailable,
-}
-
-/**
- * Wrapper for all Statusbar components
- */
-class StatusBar {
-  constructor(public compilerPicker: CompilerPicker) {}
 }
 
 type RuntimePropertyChangeListener = ((
@@ -50,13 +42,14 @@ export abstract class Runtime {
   private static gitAPI?: API;
   private static gitMap: Map<string, string> = new Map();
   public static _workspaceHash: string;
-  public static projectsTreeView: DelphiProjectsTreeView;
+  public static projects: ProjectsFeature;
+  public static dfm: DfmFeature;
   public static db: DatabaseController;
-  public static compiler: Compiler;
-  public static statusBar: StatusBar;
   public static extension: ExtensionContext;
 
   static async initialize(context: ExtensionContext) {
+    await AppDataSource.initialize();
+    this.db = new DatabaseController();
     this.extension = context;
     this.gitAPI = await this.createGitAPI();
     context.subscriptions.push(
@@ -67,11 +60,10 @@ export abstract class Runtime {
     );
     this.workspaceHash = this.generateWorkspaceHash();
     this.workspaceAvailable = !!workspace.workspaceFolders?.length;
-    this.projectsTreeView = new DelphiProjectsTreeView();
-    await AppDataSource.initialize();
-    this.db = new DatabaseController();
-    this.compiler = new Compiler();
-    this.statusBar = new StatusBar(new CompilerPicker());
+    this.projects = new ProjectsFeature();
+    await this.projects.initialize();
+    this.dfm = new DfmFeature();
+    await this.dfm.initialize();
     this.watchGitState();
   }
 

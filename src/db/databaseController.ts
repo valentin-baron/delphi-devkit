@@ -7,7 +7,7 @@ import {
 } from "./entities";
 import { fileExists } from "../utils";
 import { Runtime } from "../runtime";
-import { WorkspaceViewMode } from "../projects/types";
+import { WorkspaceViewMode } from "../types";
 
 export class DatabaseController {
   public async getWorkspace(): Promise<WorkspaceEntity | null> {
@@ -50,7 +50,7 @@ export class DatabaseController {
 
   public async initializeWorkspace(): Promise<WorkspaceEntity> {
     const workspace = new WorkspaceEntity();
-    workspace.compiler = (await Runtime.compiler.getConfiguration(false)).name;
+    workspace.compiler = (await Runtime.projects.compiler.getConfiguration(false)).name;
     workspace.hash = Runtime.workspaceHashHumanReadable;
     workspace.lastUpdated = new Date();
     return workspace;

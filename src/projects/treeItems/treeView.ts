@@ -9,7 +9,7 @@ import {
   TreeDataProvider,
 } from "vscode";
 import { DelphiProjectTreeItem } from "./delphiProjectTreeItem";
-import { DelphiProjectTreeItemType, WorkspaceViewMode } from "../types";
+import { DelphiProjectTreeItemType, WorkspaceViewMode } from "../../types";
 import { DelphiProject } from "./delphiProject";
 import { ProjectDiscovery } from "../data/projectDiscovery";
 import { DelphiProjectsDragAndDropController } from "./DragAndDropController";
