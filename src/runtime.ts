@@ -8,15 +8,11 @@ import { ProjectsFeature } from "./projects/feature";
 import { DfmFeature } from "./dfm/feature";
 
 namespace WorkspaceKeys {
-  const WORKSPACE_KEY = "projects<%ws>";
+  const WORKSPACE_KEY = "workspace[%ws]";
 
   export function get(name: string): string {
     return `${WORKSPACE_KEY}.${name}`;
   }
-
-  export const WATCH_KEYS: string[] = [
-    `${WORKSPACE_KEY}.dbChanged`,
-  ];
 }
 
 export enum RuntimeProperty {
@@ -174,11 +170,6 @@ export abstract class Runtime {
 
   private static generateWorkspaceHash(): string {
     return createHash("md5").update(this.workspaceHashHumanReadable).digest("hex");
-  }
-
-  private static get workspaceWatchKeys(): string[] {
-    const hash = this.generateWorkspaceHash();
-    return WorkspaceKeys.WATCH_KEYS.map((key) => key.replace("%ws", hash));
   }
 
   private static async createGitAPI(): Promise<API | undefined> {
