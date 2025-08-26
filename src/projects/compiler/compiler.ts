@@ -17,7 +17,6 @@ import { Restorable } from "../../db/restorable";
 import { FindOneOptions } from "typeorm";
 import { Coroutine } from "../../typings";
 import { PROBLEMMATCHER_REGEX } from ".";
-import { CompilerOutputLinkProvider } from "./compilerOutputLinkProvider";
 import { Projects } from "../../constants";
 
 export interface CompilerConfiguration {
@@ -41,15 +40,9 @@ const DIAGNOSTIC_SEVERITY = {
 export class Compiler extends Restorable<WorkspaceEntity> {
   private outputChannel: OutputChannel = window.createOutputChannel("Delphi Compiler", "delphi-devkit.compilerOutput");
   private diagnosticCollection: DiagnosticCollection = languages.createDiagnosticCollection("delphi-devkit.compiler");
-  private linkProvider: CompilerOutputLinkProvider;
 
   constructor() {
     super(WorkspaceEntity);
-    this.linkProvider = new CompilerOutputLinkProvider();
-    languages.registerDocumentLinkProvider(
-      { language: "delphi-devkit.compilerOutput" },
-      this.linkProvider
-    );
     Runtime.extension.subscriptions.push(...[
       this.outputChannel, this.diagnosticCollection
     ]);

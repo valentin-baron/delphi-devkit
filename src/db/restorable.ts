@@ -15,18 +15,16 @@ export abstract class Restorable<T extends DynamicObject> {
   }
 
   public static async restore(): Promise<void> {
-    await AppDataSource.withLock(async () => {
-      await Promise.all(
-        Array.from(this.items.values()).map(
-          async (restorables) => {
-            await Promise.all(Array.from(restorables).map(async r => {
-              const entity = await AppDataSource.load(r.entityClass, r.loadOptions(), r.createCallback());
-              await r.restore(entity);
-            }));
-          }
-        )
-      );
-    });
+    await Promise.all(
+      Array.from(this.items.values()).map(
+        async (restorables) => {
+          await Promise.all(Array.from(restorables).map(async r => {
+            const entity = await AppDataSource.load(r.entityClass, r.loadOptions(), r.createCallback());
+            await r.restore(entity);
+          }));
+        }
+      )
+    );
   }
 
   private static register<T extends DynamicObject>(classType: Class<T>, item: Restorable<T>): void {

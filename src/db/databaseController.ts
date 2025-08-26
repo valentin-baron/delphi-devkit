@@ -10,8 +10,6 @@ import { Runtime } from "../runtime";
 import { WorkspaceViewMode } from "../projects/types";
 
 export class DatabaseController {
-
-
   public async getWorkspace(): Promise<WorkspaceEntity | null> {
     if (!Runtime.assertWorkspaceAvailable()) {
       return null;
@@ -47,9 +45,7 @@ export class DatabaseController {
 
   public async reset(): Promise<void> {
     if (!Runtime.assertWorkspaceAvailable()) { return; }
-    await AppDataSource.withLock(async () => {
-      await AppDataSource.reset();
-    });
+    await AppDataSource.reset();
   }
 
   public async initializeWorkspace(): Promise<WorkspaceEntity> {

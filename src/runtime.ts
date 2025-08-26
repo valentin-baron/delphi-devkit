@@ -5,8 +5,7 @@ import { CompilerPicker } from "./projects/compiler/statusBar";
 import { DatabaseController } from "./db/databaseController";
 import { API, GitExtension } from "./typings/git";
 import { createHash } from "crypto";
-import { v4 as uuid } from "uuid";
-import { DynamicObject, LockInfo } from "./typings";
+import { DynamicObject } from "./typings";
 import { AppDataSource } from "./db/datasource";
 
 namespace WorkspaceKeys {
@@ -21,15 +20,9 @@ namespace WorkspaceKeys {
   ];
 }
 
-export interface GlobalStateChangeObject {
-  key: string;
-  windowID: string; // windowID
-}
-
 export enum RuntimeProperty {
   Workspace,
   WorkspaceAvailable,
-  GlobalState,
 }
 
 /**
@@ -53,7 +46,6 @@ type RuntimePropertyChangeListener = ((
 export abstract class Runtime {
   private static _listeners: RuntimePropertyChangeListener[] = [];
 
-  private static locks: string[] = [];
   private static _workspaceAvailable: boolean = false;
   private static gitAPI?: API;
   private static gitMap: Map<string, string> = new Map();
@@ -63,7 +55,6 @@ export abstract class Runtime {
   public static compiler: Compiler;
   public static statusBar: StatusBar;
   public static extension: ExtensionContext;
-  public static readonly windowID: string = uuid();
 
   static async initialize(context: ExtensionContext) {
     this.extension = context;
@@ -81,13 +72,7 @@ export abstract class Runtime {
     this.db = new DatabaseController();
     this.compiler = new Compiler();
     this.statusBar = new StatusBar(new CompilerPicker());
-    this.watchGlobalState();
     this.watchGitState();
-  }
-
-  public static async finalize() {
-    await Promise.all(this.locks.map(async (l) => await this.extension.globalState.update(l, undefined)));
-    this.locks = [];
   }
 
   public static subscribe<T>(
@@ -135,21 +120,6 @@ export abstract class Runtime {
   }
 
   /**
-   * Executes a callback with a global lock.
-   * @param name The name of the lock to acquire.
-   * @param callback The callback to execute with the lock.
-   * @returns The result of the callback.
-   */
-  public static async withLock<T>(name: string, callback: () => Promise<T | null>): Promise<T | null> {
-    const lock = await this.acquireLock(name);
-    try {
-      return await callback();
-    } finally {
-      await this.releaseLock(name, lock);
-    }
-  }
-
-  /**
    * Sets an application-specific flag in the global state.
    * @param name The name of the flag to set.
    * @param value The value to set for the flag.
@@ -158,7 +128,6 @@ export abstract class Runtime {
   public static async setFlag(name: string, value?: DynamicObject, hash?: string): Promise<Thenable<void>> {
     const key = this.getKey(name, hash);
     if (value) {
-      value.windowID = this.windowID;
       return await this.extension.globalState.update(key, JSON.stringify(value));
     } else {
       return await this.extension.globalState.update(key, undefined);
@@ -185,45 +154,6 @@ export abstract class Runtime {
       }
     }
     return undefined;
-  }
-
-  /**
-   * Acquires a lock for the specified workspace.
-   * @param name The name of the key a lock for.
-   * @returns The workspace hash for the locked state.
-   */
-  private static async acquireLock(name: string): Promise<string> {
-    const lockHash = Runtime.workspaceHash;
-    let lockInfo = this.getFlag<LockInfo>(name, lockHash);
-    const start = Date.now();
-    // The lock is by this window => no need to wait
-    // The lock is by another window and the counter is 0 => we can take the lock
-    while (lockInfo?.windowID !== this.windowID && (lockInfo?.counter || 0) > 0) {
-      if (lockInfo && Date.now() - start > 5000) {
-        lockInfo.counter = 0;
-        break; // Avoid infinite waiting. The lock can't be closed for so long.
-      }
-      await new Promise(resolve => setTimeout(resolve, 100));
-      lockInfo = this.getFlag<LockInfo>(name, lockHash);
-    }
-    await this.setFlag(name, { counter: (lockInfo?.counter || 0) + 1 }, lockHash);
-    this.locks.push(name);
-    return lockHash;
-  }
-
-  /**
-   * Releases the lock for the specified workspace.
-   * @param name The name of the key to release the lock for.
-   * @param lockHash The hash of the workspace.
-   */
-  private static async releaseLock(name: string, lockHash: string): Promise<void> {
-    let lockInfo = this.getFlag<LockInfo>(name, lockHash);
-    if (!!lockInfo && lockInfo.counter > 1) {
-      await this.setFlag(name, { counter: lockInfo.counter - 1 }, lockHash);
-    } else {
-      this.locks = this.locks.filter((l) => l !== name);
-      await this.setFlag(name, undefined, lockHash);
-    }
   }
 
   private static set workspaceHash(value: string) {
@@ -257,40 +187,6 @@ export abstract class Runtime {
   private static get workspaceWatchKeys(): string[] {
     const hash = this.generateWorkspaceHash();
     return WorkspaceKeys.WATCH_KEYS.map((key) => key.replace("%ws", hash));
-  }
-
-  /**
-   * Periodically checks keys within extension.globalState for changes.
-   */
-  private static watchGlobalState(): void {
-    let previousValues: string[] = this.workspaceWatchKeys.map((key) =>
-      this.extension.globalState.get<string>(key, "")
-    );
-    const iv = setInterval(() => {
-      const keys = this.workspaceWatchKeys;
-      const currentValues: string[] = keys.map((key) => this.extension.globalState.get<string>(key, ""));
-      currentValues.forEach((value, index) => {
-        if (value !== previousValues[index]) {
-          this._listeners.forEach((listener) =>
-            listener(
-              RuntimeProperty.GlobalState,
-              {
-                key: keys[index],
-                windowID: value,
-              } as GlobalStateChangeObject,
-              {
-                key: keys[index],
-                windowID: previousValues[index],
-              } as GlobalStateChangeObject
-            )
-          );
-        }
-      });
-    }, 2000);
-
-    this.extension.subscriptions.push({
-      dispose: () => clearInterval(iv),
-    });
   }
 
   private static async createGitAPI(): Promise<API | undefined> {

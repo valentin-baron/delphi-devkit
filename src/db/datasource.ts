@@ -6,8 +6,6 @@ import { WorkspaceEntity, GroupProjectEntity, ProjectEntity } from "./entities";
 import { Runtime } from "../runtime";
 import { Class, DynamicObject } from "../typings";
 
-const DB_LOCK = "dbLock";
-
 export class AppDataSource extends DataSource {
   private static sqljs: any;
 
@@ -46,53 +44,35 @@ export class AppDataSource extends DataSource {
     modifyCallback: (ent: T) => Promise<T | unknown>,
     createCallback?: () => Promise<T>
   ): Promise<T | null> {
-    return await this.withLock<T | null>(async () => {
-      const dataSource = new this(await this.getReadBuffer());
-      await dataSource.initialize();
-      let entity = await dataSource.getRepository(entityClass).findOne(opt);
-      if (!entity) {
-        if (createCallback) {
-          const newEntity = await createCallback() as T;
-          entity = await dataSource
-            .getRepository(entityClass)
-            .save(newEntity, { transaction: true });
-        } else {
-          return null;
-        }
+    const dataSource = new this(await this.getReadBuffer());
+    await dataSource.initialize();
+    let entity = await dataSource.getRepository(entityClass).findOne(opt);
+    if (!entity) {
+      if (createCallback) {
+        const newEntity = await createCallback() as T;
+        entity = await dataSource
+          .getRepository(entityClass)
+          .save(newEntity, { transaction: true });
+      } else {
+        return null;
       }
-      let modifiedEntity = await modifyCallback(entity);
-      if (!(modifiedEntity instanceof entityClass)) {
-        modifiedEntity = entity; // so we can just modify without returning a new instance
-      }
-      await dataSource
-        .getRepository(entityClass)
-        .save(modifiedEntity as T, { transaction: true });
-      await dataSource.saveToFile();
-      await Runtime.setFlag("dbChanged", { changeType: "update" });
-      return modifiedEntity as T;
-    });
+    }
+    let modifiedEntity = await modifyCallback(entity);
+    if (!(modifiedEntity instanceof entityClass)) {
+      modifiedEntity = entity; // so we can just modify without returning a new instance
+    }
+    await dataSource
+      .getRepository(entityClass)
+      .save(modifiedEntity as T, { transaction: true });
+    await dataSource.saveToFile();
+    await Runtime.setFlag("dbChanged", { changeType: "update" });
+    return modifiedEntity as T;
   }
 
   public static async reset(): Promise<void> {
-    this.withLock<void>(async () => {
-      const dataSource = new this(new Uint8Array());
-      await dataSource.saveToFile(true);
-      await Runtime.setFlag("dbChanged", { changeType: "drop" });
-    });
-  }
-
-  /**
-   * Executes a callback with a global lock.
-   * This is for database operations where we are reading and writing at the same time.
-   * @param callback The callback to execute with the lock.
-   * @returns The result of the callback.
-   */
-  public static async withLock<T>(
-    callback: () => Promise<T>
-  ): Promise<T | null> {
-    return await Runtime.withLock<T | null>(DB_LOCK, async () => {
-      return await callback();
-    });
+    const dataSource = new this(new Uint8Array());
+    await dataSource.saveToFile(true);
+    await Runtime.setFlag("dbChanged", { changeType: "drop" });
   }
 
   private constructor(dbBuffer?: any) {
@@ -122,21 +102,17 @@ export class AppDataSource extends DataSource {
   }
 
   private static async getReadBuffer(): Promise<any | undefined> {
-    return await Runtime.withLock<any | undefined>(DB_LOCK, async () => {
-      try {
-        return new Uint8Array(readFileSync(this.cacheDBFilePath));
-      } catch {
-        return undefined; // New DB if file doesn't exist
-      }
-    });
+    try {
+      return new Uint8Array(readFileSync(this.cacheDBFilePath));
+    } catch {
+      return undefined; // New DB if file doesn't exist
+    }
   }
 
   private async saveToFile(reset: boolean = false): Promise<any> {
-    return Runtime.withLock<void>(DB_LOCK, async () => {
-      const buffer: Uint8Array = reset ? new Uint8Array() : this.sqljsManager.exportDatabase();
-      const filePath = AppDataSource.cacheDBFilePath;
-      mkdirSync(Runtime.extension.globalStorageUri.fsPath, { recursive: true });
-      writeFileSync(filePath, buffer);
-    });
+    const buffer: Uint8Array = reset ? new Uint8Array() : this.sqljsManager.exportDatabase();
+    const filePath = AppDataSource.cacheDBFilePath;
+    mkdirSync(Runtime.extension.globalStorageUri.fsPath, { recursive: true });
+    writeFileSync(filePath, buffer);
   }
 }

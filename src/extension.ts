@@ -26,6 +26,4 @@ export async function activate(context: ExtensionContext): Promise<void> {
   );
 }
 
-export async function deactivate(): Promise<void> {
-  await Runtime.finalize();
-}
+export async function deactivate(): Promise<void> { }
