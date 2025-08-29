@@ -201,6 +201,11 @@
     "menus": {
       "view/title": [
         {
+          "command": "ddk.projects.addWorkspace",
+          "when": "view == ddk.view.projects.workspaces",
+          "group": "navigation"
+        },
+        {
           "command": "ddk.projects.selectCompilerConfiguration",
           "when": "view == ddk.view.projects.groupProject",
           "group": "navigation"
@@ -253,14 +258,9 @@
           "group": "exe_actions@2"
         },
         {
-          "command": "ddk.projects.addWorkspace",
-          "when": "view == ddk.view.projects.workspaces",
-          "group": "workspace@1"
-        },
-        {
           "command": "ddk.projects.renameWorkspace",
           "when": "view == ddk.view.projects.workspaces && viewItem == ddk.context.projects.workspace",
-          "group": "workspace@3"
+          "group": "workspace@1"
         },
         {
           "command": "ddk.projects.removeWorkspace",

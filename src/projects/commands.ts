@@ -19,6 +19,7 @@ export namespace ProjectsCommands {
     Runtime.extension.subscriptions.push(...[
       ...SelectedProject.registers,
       ...ContextMenu.registers,
+      ...Compiler.registers,
       ...ProjectsTreeView.registers,
       ...Configuration.registers,
     ]);
