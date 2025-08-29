@@ -5,7 +5,7 @@ import { DFM } from '../constants';
 export class DfmCommands {
   public static get registers(): Disposable[] {
     return [
-      commands.registerCommand(DFM.Commands.SwapToDfmPas, this.dfmSwap.bind(this))
+      commands.registerCommand(DFM.Commands.SWAP_DFM_PAS, this.dfmSwap.bind(this))
     ];
   }
   private static async dfmSwap(): Promise<void> {

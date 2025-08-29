@@ -10,7 +10,7 @@ export class DfmFeature implements Feature {
     Runtime.extension.subscriptions.push(
       ...DfmCommands.registers,
       languages.registerDefinitionProvider(
-        { language: 'delphi-devkit.dfm', scheme: 'file' },
+        { language: 'ddk.dfm', scheme: 'file' },
         new DfmLanguageProvider()
       ),
     );

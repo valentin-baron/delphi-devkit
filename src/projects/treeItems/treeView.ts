@@ -4,142 +4,86 @@ import {
   Event,
   workspace,
   ConfigurationChangeEvent,
-  commands,
-  window,
   TreeDataProvider,
+  window,
+  Uri,
 } from "vscode";
 import { DelphiProjectTreeItem } from "./delphiProjectTreeItem";
-import { DelphiProjectTreeItemType, WorkspaceViewMode } from "../../types";
+import { DelphiProjectTreeItemType } from "../../types";
 import { DelphiProject } from "./delphiProject";
-import { ProjectDiscovery } from "../data/projectDiscovery";
-import { DelphiProjectsDragAndDropController } from "./DragAndDropController";
-import { ProjectEntity } from "../../db/entities";
-import { GroupProjectPicker } from "../pickers/groupProjPicker";
-import { Runtime, RuntimeProperty } from "../../runtime";
-import { AppDataSource } from "../../db/datasource";
-import { Projects } from "../../constants";
-import { SelectedItemDecorator } from "./selectedItemDecorator";
+// import { DelphiProjectsDragAndDropController } from "./DragAndDropController";
+import { Runtime } from "../../runtime";
+import { PROJECTS } from "../../constants";
+import { TreeItemDecorator } from "./treeItemDecorator";
+import { WorkspaceItem } from "./workspaceItem";
 
 type NullableTreeItem = DelphiProjectTreeItem | undefined | null | void;
 
-export class DelphiProjectsTreeView
-  implements TreeDataProvider<DelphiProjectTreeItem>
+export abstract class DelphiProjectsTreeView
+  implements TreeDataProvider<TreeItem>
 {
-  private _onDidChangeTreeData: EventEmitter<NullableTreeItem> =
-    new EventEmitter<NullableTreeItem>();
-  private clearCache: boolean = false;
-  public readonly onDidChangeTreeData: Event<NullableTreeItem> =
-    this._onDidChangeTreeData.event;
-  public readonly dragAndDropController: DelphiProjectsDragAndDropController;
-  public readonly selectedItemDecorator: SelectedItemDecorator;
+  private changeEventEmitter: EventEmitter<NullableTreeItem> = new EventEmitter<NullableTreeItem>();
+    public readonly onDidChangeTreeData: Event<NullableTreeItem> = this.changeEventEmitter.event;
+  public items: DelphiProject[] = [];
 
   private createWatchers(): void {
-    if (
-      !workspace
-        .getConfiguration(Projects.Config.Key)
-        .get<boolean>(Projects.Config.Discovery.UseFileSystemWatchers, false)
-    ) {
-      return;
-    }
     const dprojWatcher = workspace.createFileSystemWatcher("**/*.[Dd][Pp][Rr][Oo][Jj]", false, true);
     const dprWatcher = workspace.createFileSystemWatcher("**/*.[Dd][Pp][Rr]", false, true);
     const dpkWatcher = workspace.createFileSystemWatcher("**/*.[Dd][Pp][Kk]", false, true);
-    const iniWatcher = workspace.createFileSystemWatcher("**/*.[Ii][Nn][Ii]", false, true);
     const exeWatcher = workspace.createFileSystemWatcher("**/*.[Ee][Xx][Ee]", false, true);
+    const iniWatcher = workspace.createFileSystemWatcher("**/*.[Ii][Nn][Ii]", false, true);
     const watchers = [dprojWatcher, dprWatcher, dpkWatcher, iniWatcher, exeWatcher];
 
     watchers.forEach((watcher) => {
-      watcher.onDidCreate(() => {
-        this.refreshTreeView();
+      watcher.onDidCreate((file: Uri) => {
+        this.onWatcherEvent(file);
       });
-      watcher.onDidDelete(() => {
-        this.refreshTreeView();
+      watcher.onDidDelete((file: Uri) => {
+        this.onWatcherEvent(file);
       });
     });
     Runtime.extension.subscriptions.push(...watchers);
-    const gitCheckoutDelay = workspace.getConfiguration(Projects.Config.Key).get<number>(Projects.Config.GitCheckoutDelay, 30000);
-    let updateRequest: NodeJS.Timeout | undefined = undefined;
-    Runtime.subscribe(
-      (prop, val: any) => {
-        switch (prop) {
-          case RuntimeProperty.WorkspaceAvailable:
-            watchers.forEach((watcher) => watcher.dispose());
-            clearTimeout(updateRequest);
-            if (val) {
-              this.createWatchers();
-            }
-            break;
-          case RuntimeProperty.Workspace:
-            watchers.forEach((watcher) => watcher.dispose());
-            clearTimeout(updateRequest);
-            updateRequest = setTimeout(() => {
-              this.createWatchers();
-            }, gitCheckoutDelay);
-            break;
-        }
+  }
+
+  private isRelevantFile(file: Uri): boolean {
+    for (const item of this.items) {
+      if (
+        item.entity.path === file.fsPath ||
+        item.projectDproj?.fsPath === file.fsPath ||
+        item.projectDpr?.fsPath === file.fsPath ||
+        item.projectDpk?.fsPath === file.fsPath ||
+        item.projectExe?.fsPath === file.fsPath ||
+        item.projectIni?.fsPath === file.fsPath
+      ) {
+        return true;
       }
-    );
+    }
+    return false;
+  }
+
+  private onWatcherEvent(file: Uri): void {
+    if (this.isRelevantFile(file)) {
+      this.refreshTreeView();
+    }
   }
 
   private createConfigurationWatcher() {
     workspace.onDidChangeConfiguration((event: ConfigurationChangeEvent) => {
       if (
-        event.affectsConfiguration(Projects.Config.full(Projects.Config.Discovery.ProjectPaths)) ||
-        event.affectsConfiguration(Projects.Config.full(Projects.Config.Discovery.ExcludePatterns))
+        event.affectsConfiguration(PROJECTS.CONFIG.full(PROJECTS.CONFIG.DISCOVERY.PROJECT_PATHS)) ||
+        event.affectsConfiguration(PROJECTS.CONFIG.full(PROJECTS.CONFIG.DISCOVERY.EXCLUDE_PATTERNS))
       ) {
         this.refreshTreeView();
       }
     });
   }
 
-  constructor(
-    public readonly groupProjPicker: GroupProjectPicker = new GroupProjectPicker()
-  ) {
+  constructor() {
     this.createWatchers();
     this.createConfigurationWatcher();
-    this.dragAndDropController = new DelphiProjectsDragAndDropController();
-    this.selectedItemDecorator = new SelectedItemDecorator();
-    Runtime.extension.subscriptions.push(
-      window.registerFileDecorationProvider(this.selectedItemDecorator)
-    );
-    Runtime.subscribe((property, newValue, oldValue) => {
-      switch (property) {
-        case RuntimeProperty.Workspace:
-          this.refreshTreeView();
-          break;
-      }
-    });
   }
 
-  private async marshalAll(items?: DelphiProjectTreeItem[]): Promise<ProjectEntity[]> {
-    const projects = items || await this.getChildren();
-    return Promise.all(
-      projects
-        .filter((project) => project instanceof DelphiProject)
-        .map((project) => project.entity)
-    );
-  }
-
-  public async save(items?: DelphiProjectTreeItem[]): Promise<void> {
-    await Runtime.db.modify(async (ws) => {
-      ws.lastUpdated = new Date();
-      switch (ws.viewMode) {
-        case WorkspaceViewMode.GroupProject: {
-          if (ws.currentGroupProject) {
-            ws.currentGroupProject.projects = await this.marshalAll(items);
-          }
-          break;
-        }
-        case WorkspaceViewMode.Discovery: {
-          ws.discoveredProjects = await this.marshalAll(items);
-          break;
-        }
-      }
-      return ws;
-    });
-  }
-
-  getTreeItem(element: DelphiProjectTreeItem): TreeItem {
+  getTreeItem(element: TreeItem): TreeItem {
     return element;
   }
 
@@ -155,86 +99,61 @@ export class DelphiProjectsTreeView
     return children;
   }
 
-  private async createTreeItems(): Promise<DelphiProjectTreeItem[]> {
-    if (this.clearCache) {
-      this.clearCache = false;
-      await AppDataSource.reset();
-    }
-    const modifiedWorkspace = await Runtime.db.modify(async (ws) => {
-      commands.executeCommand( // for VS code items to be visible/invisible
-        "setContext",
-        Projects.Context.IsGroupProjectView,
-        ws.viewMode === WorkspaceViewMode.GroupProject
-      );
-      commands.executeCommand(
-        "setContext",
-        Projects.Context.IsProjectSelected,
-        false,
-      );
-      commands.executeCommand(
-        "setContext",
-        Projects.Context.DoesSelectedProjectHaveExe,
-        false
-      );
-      await Runtime.extension.workspaceState.update(
-        Projects.Variables.IsGroupProjectView,
-        ws.viewMode === WorkspaceViewMode.GroupProject
-      );
-      switch (ws.viewMode) {
-        case WorkspaceViewMode.GroupProject:
-          if (ws.currentGroupProject) {
-            ws.currentGroupProject.projects = await Runtime.db.removeNonExistentFiles(ws.currentGroupProject.projects);
-          }
-          break;
-        case WorkspaceViewMode.Empty:
-          const config = workspace.getConfiguration(Projects.Config.Key);
-          if (config && !config.get<boolean>(Projects.Config.Discovery.Enable, true)) {
-            break;
-          }
-        case WorkspaceViewMode.Discovery:
-          ws.discoveredProjects = await Runtime.db.removeNonExistentFiles(ws.discoveredProjects);
-          if (!ws.discoveredProjects || ws.discoveredProjects.length === 0) {
-            ws.discoveredProjects = await new ProjectDiscovery().findAllProjects();
-          }
-          break;
-      }
-      return ws;
-    });
-    switch (modifiedWorkspace?.viewMode) {
-      case WorkspaceViewMode.Discovery:
-        return (await Promise.all(
-          modifiedWorkspace.discoveredProjects.map(async (project) => {
-            return DelphiProject.fromData(modifiedWorkspace, project);
-          })
-        )).sort((a, b) => a.sortValue.localeCompare(b.sortValue));
-      case WorkspaceViewMode.GroupProject:
-        if (modifiedWorkspace.currentGroupProject) {
-          return (await Promise.all(
-            modifiedWorkspace.currentGroupProject.projects.map(async (project) => {
-              return DelphiProject.fromData(modifiedWorkspace, project);
-            })
-          )).sort((a, b) => a.sortValue.localeCompare(b.sortValue));
-        } else {
-          return [];
-        }
-      default:
-        return [];
-    }
-  }
+  protected abstract loadTreeItemsFromDatabase(): Promise<TreeItem[]>;
 
   async getChildren(
-    element?: DelphiProjectTreeItem
-  ): Promise<DelphiProjectTreeItem[]> {
-    if (!element || this.clearCache) {
-      return this.createTreeItems();
+    element?: TreeItem
+  ): Promise<TreeItem[]> {
+    if (!element) {
+      return this.loadTreeItemsFromDatabase();
     } else if (element instanceof DelphiProject) {
       return this.createChildrenForProject(element);
+    } else if (element instanceof WorkspaceItem) {
+      return element.projects;
     }
     return [];
   }
 
-  public async refreshTreeView(clearCache: boolean = false): Promise<void> {
-    this.clearCache = clearCache;
-    this._onDidChangeTreeData.fire(undefined);
+  public async refreshTreeView(): Promise<void> {
+    this.changeEventEmitter.fire(undefined);
+  }
+}
+
+export class WorkspacesTreeView extends DelphiProjectsTreeView {
+  public workspaceItems: WorkspaceItem[] = [];
+
+  constructor(
+    // public readonly dragAndDropController = new DelphiProjectsDragAndDropController(),
+    public readonly treeItemDecorator = new TreeItemDecorator()
+  ) {
+    super();
+    Runtime.extension.subscriptions.push(
+      window.registerFileDecorationProvider(this.treeItemDecorator)
+    );
+  }
+
+  public async loadTreeItemsFromDatabase(): Promise<TreeItem[]>  {
+    const config = await Runtime.db.getConfiguration();
+    Runtime.setContext(PROJECTS.CONTEXT.IS_PROJECT_SELECTED, !!config.selectedProject);
+    Runtime.setContext(PROJECTS.CONTEXT.DOES_SELECTED_PROJECT_HAVE_EXE, !!config.selectedProject?.exe);
+    this.workspaceItems = config?.workspaces.map(ws => new WorkspaceItem(ws)) || [];
+    return this.workspaceItems;
+  }
+}
+
+export class GroupProjectTreeView extends DelphiProjectsTreeView {
+  protected async loadTreeItemsFromDatabase(): Promise<TreeItem[]> {
+    const groupProject = (await Runtime.db.getConfiguration()).selectedGroupProject;
+    Runtime.setContext(PROJECTS.CONTEXT.IS_GROUP_PROJECT_OPENED, !!groupProject);
+    const result: DelphiProject[] = [];
+    if (groupProject) {
+      for (const link of groupProject.projects) {
+        if (link.project) {
+          const item = DelphiProject.fromData(link);
+          result.push(item);
+        }
+      }
+    }
+    return result;
   }
 }

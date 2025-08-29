@@ -20,101 +20,179 @@
   "contributes": {
     "commands": [
       {
-        "command": "delphi-devkit.projects.refresh",
-        "title": "DDK: Refresh",
-        "icon": "$(refresh)"
+        "command": "ddk.projects.refresh",
+        "title": "Refresh File Status",
+        "icon": "$(refresh)",
+        "category": "DDK TreeView Context Menu",
+        "when": "false"
       },
       {
-        "command": "delphi-devkit.projects.compile",
-        "title": "DDK: Compile"
+        "command": "ddk.projects.addProject",
+        "title": "Add Project",
+        "icon": "$(add)",
+        "category": "DDK TreeView Context Menu",
+        "when": "false"
       },
       {
-        "command": "delphi-devkit.projects.recreate",
-        "title": "DDK: Recreate"
+        "command": "ddk.projects.removeProject",
+        "title": "Remove Project",
+        "icon": "$(remove)",
+        "category": "DDK TreeView Context Menu",
+        "when": "false"
       },
       {
-        "command": "delphi-devkit.projects.showInExplorer",
-        "title": "DDK: Show in Explorer"
+        "command": "ddk.projects.importConfiguration",
+        "title": "Import Projects Configuration",
+        "icon": "$(cloud-download)",
+        "category": "DDK TreeView Context Menu",
+        "when": "false"
       },
       {
-        "command": "delphi-devkit.projects.openInFileExplorer",
-        "title": "DDK: Open in File Explorer"
+        "command": "ddk.projects.exportConfiguration",
+        "title": "Export Projects Configuration",
+        "icon": "$(cloud-upload)",
+        "category": "DDK TreeView Context Menu",
+        "when": "false"
       },
       {
-        "command": "delphi-devkit.projects.runExecutable",
-        "title": "DDK: Run"
+        "command": "ddk.projects.addWorkspace",
+        "title": "Add Workspace",
+        "icon": "$(add)",
+        "category": "DDK TreeView Context Menu",
+        "when": "false"
       },
       {
-        "command": "delphi-devkit.projects.editDefaultIni",
-        "title": "DDK: Edit Default .ini",
-        "icon": "$(pencil)"
+        "command": "ddk.projects.renameWorkspace",
+        "title": "Rename Workspace",
+        "icon": "$(edit)",
+        "category": "DDK TreeView Context Menu",
+        "when": "false"
       },
       {
-        "command": "delphi-devkit.projects.configureOrCreateIni",
-        "title": "DDK: Configure/Create .ini"
+        "command": "ddk.projects.removeWorkspace",
+        "title": "Remove Workspace",
+        "icon": "$(remove)",
+        "category": "DDK TreeView Context Menu",
+        "when": "false"
       },
       {
-        "command": "delphi-devkit.projects.selectCompilerConfiguration",
-        "title": "DDK: Select Delphi Compiler",
-        "icon": "$(tools)"
+        "command": "ddk.projects.selectProject",
+        "title": "Select Project",
+        "icon": "$(check)",
+        "category": "DDK TreeView Context Menu",
+        "when": "false"
       },
       {
-        "command": "delphi-devkit.projects.showCompilerDropdown",
-        "title": "DDK: Show Delphi Compiler Dropdown"
+        "command": "ddk.projects.compile",
+        "title": "Compile",
+        "icon": "$(sync-ignored)",
+        "category": "DDK TreeView Context Menu",
+        "when": "false"
       },
       {
-        "command": "delphi-devkit.projects.pickGroupProject",
-        "title": "DDK: Pick Group Project",
-        "icon": "$(file-submodule)"
+        "command": "ddk.projects.recreate",
+        "title": "Recreate",
+        "icon": "$(sync)",
+        "category": "DDK TreeView Context Menu",
+        "when": "false"
       },
       {
-        "command": "delphi-devkit.projects.unloadGroupProject",
-        "title": "DDK: Unload Group Project",
+        "command": "ddk.projects.showInExplorer",
+        "title": "Show in Explorer",
+        "icon": "$(folder)",
+        "category": "DDK TreeView Context Menu",
+        "when": "false"
+      },
+      {
+        "command": "ddk.projects.openInFileExplorer",
+        "title": "Open in File Explorer",
+        "icon": "$(folder-opened)",
+        "category": "DDK TreeView Context Menu",
+        "when": "false"
+      },
+      {
+        "command": "ddk.projects.runExecutable",
+        "title": "Run",
+        "icon": "$(play)",
+        "category": "DDK TreeView Context Menu",
+        "when": "false"
+      },
+      {
+        "command": "ddk.projects.configureOrCreateIni",
+        "title": "Configure/Create .ini",
+        "icon": "$(settings-gear)",
+        "category": "DDK TreeView Context Menu",
+        "when": "false"
+      },
+      {
+        "command": "ddk.projects.editDefaultIni",
+        "title": "Edit Default .ini",
+        "icon": "$(pencil)",
+        "category": "DDK"
+      },
+      {
+        "command": "ddk.projects.selectCompilerConfiguration",
+        "title": "Select Delphi Compiler for Group Projects",
+        "icon": "$(tools)",
+        "category": "DDK"
+      },
+      {
+        "command": "ddk.projects.pickGroupProject",
+        "title": "Pick Group Project",
+        "icon": "$(file-submodule)",
+        "category": "DDK"
+      },
+      {
+        "command": "ddk.projects.unloadGroupProject",
+        "title": "Unload Group Project",
         "icon": "$(close)",
-        "when": "view == delphiProjects && delphiDevkit:isGroupProjectView == true"
+        "when": "ddk:isGroupProjectOpened == true",
+        "category": "DDK"
       },
       {
-        "command": "delphi-devkit.projects.selectProject",
-        "title": "DDK: Select Project",
-        "icon": "$(arrow-right)",
-        "when": "view == delphiProjects"
+        "command": "ddk.projects.compileSelectedProject",
+        "title": "Compile Selected Project",
+        "when": "ddk:isProjectSelected == true",
+        "category": "DDK"
       },
       {
-        "command": "delphi-devkit.projects.compileSelectedProject",
-        "title": "DDK: Compile Selected Project",
-        "when": "view == delphiProjects && delphiDevKit:isProjectSelected == true"
+        "command": "ddk.projects.recreateSelectedProject",
+        "title": "Recreate Selected Project",
+        "when": "ddk:isProjectSelected == true",
+        "category": "DDK"
       },
       {
-        "command": "delphi-devkit.projects.recreateSelectedProject",
-        "title": "DDK: Recreate Selected Project",
-        "when": "view == delphiProjects && delphiDevKit:isProjectSelected == true"
+        "command": "ddk.projects.runSelectedProject",
+        "title": "Run Selected Project",
+        "when": "ddk:isProjectSelected == true && ddk:doesSelectedProjectHaveExe == true",
+        "category": "DDK"
       },
       {
-        "command": "delphi-devkit.projects.runSelectedProject",
-        "title": "DDK: Run Selected Project",
-        "when": "view == delphiProjects && delphiDevKit:isProjectSelected == true && delphiDevKit:doesSelectedProjectHaveExe == true"
-      },
-      {
-        "command": "delphi-devkit.dfm.swapToDfmPas",
-        "title": "DDK: Swap .DFM/.PAS",
-        "when": "editorTextFocus && (resourceExtname == '.pas' || resourceExtname == '.dfm')"
+        "command": "ddk.dfm.swapToDfmPas",
+        "title": "Swap .DFM/.PAS",
+        "when": "editorTextFocus && (resourceExtname == '.pas' || resourceExtname == '.dfm')",
+        "category": "DDK"
       }
     ],
     "views": {
-      "delphi-projects": [
+      "ddk-projects": [
         {
-          "id": "delphiProjects",
-          "name": "Projects",
-          "when": "workbenchState != empty",
+          "id": "ddk.view.projects.workspaces",
+          "name": "Self-Defined Workspaces",
           "icon": "assets/DelphiHelmetLine.svg",
           "canDragAndDrop": true
+        },
+        {
+          "id": "ddk.view.projects.groupProject",
+          "name": "Loaded Group Project",
+          "icon": "assets/DelphiHelmetLine.svg"
         }
       ]
     },
     "viewsContainers": {
       "activitybar": [
         {
-          "id": "delphi-projects",
+          "id": "ddk-projects",
           "title": "Delphi Projects",
           "icon": "assets/DelphiHelmetLine.svg"
         }
@@ -123,67 +201,87 @@
     "menus": {
       "view/title": [
         {
-          "command": "delphi-devkit.projects.refresh",
-          "when": "view == delphiProjects",
+          "command": "ddk.projects.selectCompilerConfiguration",
+          "when": "view == ddk.view.projects.groupProject",
           "group": "navigation"
         },
         {
-          "command": "delphi-devkit.projects.selectCompilerConfiguration",
-          "when": "view == delphiProjects",
-          "group": "navigation"
-        },
-        {
-          "command": "delphi-devkit.projects.pickGroupProject",
-          "when": "view == delphiProjects",
+          "command": "ddk.projects.pickGroupProject",
+          "when": "view == ddk.view.projects.groupProject",
           "group": "navigation@2"
         },
         {
-          "command": "delphi-devkit.projects.unloadGroupProject",
-          "when": "view == delphiProjects && delphiDevkit:isGroupProjectView == true",
+          "command": "ddk.projects.unloadGroupProject",
+          "when": "view == ddk.view.projects.groupProject && ddk:isGroupProjectOpened == true",
           "group": "navigation@3"
         }
       ],
       "view/item/context": [
         {
-          "command": "delphi-devkit.projects.selectProject",
-          "when": "view == delphiProjects",
-          "group": "navigation@1"
+          "command": "ddk.projects.selectProject",
+          "when": "view == ddk.view.projects.workspaces && (viewItem == ddk.context.projects.project || viewItem == ddk.context.projects.projectFile)",
+          "group": "select@1"
         },
         {
-          "command": "delphi-devkit.projects.compile",
-          "when": "view == delphiProjects",
-          "group": "1_build@1"
+          "command": "ddk.projects.compile",
+          "when": "view =~ /^ddk\\.view\\.projects.*/ && (viewItem == ddk.context.projects.project || viewItem == ddk.context.projects.projectFile)",
+          "group": "compiler@1"
         },
         {
-          "command": "delphi-devkit.projects.recreate",
-          "when": "view == delphiProjects",
-          "group": "1_build@2"
+          "command": "ddk.projects.recreate",
+          "when": "view =~ /^ddk\\.view\\.projects.*/ && (viewItem == ddk.context.projects.project || viewItem == ddk.context.projects.projectFile)",
+          "group": "compiler@2"
         },
         {
-          "command": "delphi-devkit.projects.showInExplorer",
-          "when": "view == delphiProjects",
-          "group": "2_files@1"
+          "command": "ddk.projects.showInExplorer",
+          "when": "view =~ /^ddk\\.view\\.projects.*/ && (viewItem == ddk.context.projects.projectFile)",
+          "group": "file_actions@1"
         },
         {
-          "command": "delphi-devkit.projects.openInFileExplorer",
-          "when": "view == delphiProjects",
-          "group": "2_files@2"
+          "command": "ddk.projects.openInFileExplorer",
+          "when": "view =~ /^ddk\\.view\\.projects.*/ && (viewItem == ddk.context.projects.projectFile)",
+          "group": "file_actions@2"
         },
         {
-          "command": "delphi-devkit.projects.runExecutable",
-          "when": "view == delphiProjects",
-          "group": "3_run@1"
+          "command": "ddk.projects.runExecutable",
+          "when": "view =~ /^ddk\\.view\\.projects.*/ && (viewItem == ddk.context.projects.project || viewItem == ddk.context.projects.projectFile)",
+          "group": "exe_actions@1"
         },
         {
-          "command": "delphi-devkit.projects.configureOrCreateIni",
-          "when": "view == delphiProjects",
-          "group": "3_run@2"
+          "command": "ddk.projects.configureOrCreateIni",
+          "when": "view =~ /^ddk\\.view\\.projects.*/ && (viewItem == ddk.context.projects.project || viewItem == ddk.context.projects.projectFile)",
+          "group": "exe_actions@2"
+        },
+        {
+          "command": "ddk.projects.addWorkspace",
+          "when": "view == ddk.view.projects.workspaces",
+          "group": "workspace@1"
+        },
+        {
+          "command": "ddk.projects.renameWorkspace",
+          "when": "view == ddk.view.projects.workspaces && viewItem == ddk.context.projects.workspace",
+          "group": "workspace@3"
+        },
+        {
+          "command": "ddk.projects.removeWorkspace",
+          "when": "view == ddk.view.projects.workspaces && viewItem == ddk.context.projects.workspace",
+          "group": "workspace@2"
+        },
+        {
+          "command": "ddk.projects.addProject",
+          "when": "view == ddk.view.projects.workspaces && viewItem",
+          "group": "project@1"
+        },
+        {
+          "command": "ddk.projects.removeProject",
+          "when": "view == ddk.view.projects.workspaces && (viewItem == ddk.context.projects.project || viewItem == ddk.context.projects.projectFile)",
+          "group": "project@2"
         }
       ]
     },
     "languages": [
       {
-        "id": "delphi-devkit.dfm",
+        "id": "ddk.dfm",
         "extensions": [
           ".dfm"
         ],
@@ -193,90 +291,45 @@
         ]
       },
       {
-        "id": "delphi-devkit.compilerOutput",
+        "id": "ddk.compilerOutput",
         "aliases": ["Delphi Compiler Output"],
         "extensions": []
       }
     ],
     "grammars": [
       {
-        "language": "delphi-devkit.compilerOutput",
+        "language": "ddk.compilerOutput",
         "scopeName": "text.output.delphi-compiler",
         "path": "./config/languages/grammar/compiler-output.json"
       }
     ],
     "keybindings": [
       {
-        "command": "delphi-devkit.dfm.swapToDfmPas",
+        "command": "ddk.dfm.swapToDfmPas",
         "key": "alt+f12",
         "mac": "alt+f12",
         "when": "editorTextFocus && (resourceExtname == '.pas' || resourceExtname == '.dfm')"
       },
       {
-        "command": "delphi-devkit.projects.compileSelectedProject",
+        "command": "ddk.projects.compileSelectedProject",
         "key": "ctrl+f9",
-        "when": "delphiDevKit:isProjectSelected == true"
+        "when": "ddk:isProjectSelected == true"
       },
       {
-        "command": "delphi-devkit.projects.recreateSelectedProject",
+        "command": "ddk.projects.recreateSelectedProject",
         "key": "shift+f9",
-        "when": "delphiDevKit:isProjectSelected == true"
+        "when": "ddk:isProjectSelected == true"
       },
       {
-        "command": "delphi-devkit.projects.runSelectedProject",
+        "command": "ddk.projects.runSelectedProject",
         "key": "f9",
-        "when": "delphiDevKit:doesSelectedProjectHaveExe == true"
+        "when": "ddk:doesSelectedProjectHaveExe == true"
       }
     ],
     "configuration": {
       "title": "Delphi Development Kit",
       "properties": {
-        "delphi-devkit.projects.discovery.enable": {
-          "type": "boolean",
-          "default": true,
-          "description": "Allow automatic discovery of Delphi projects in the workspace."
-        },
-        "delphi-devkit.projects.discovery.useFileSystemWatchers": {
-          "type": "boolean",
-          "default": false,
-          "description": "Use file system watchers to detect changes in Delphi project files. If false, requires manual refresh. When enabled with git, checkouts can be problematic.",
-          "scope": "resource"
-        },
-        "delphi-devkit.projects.gitCheckoutDelay": {
-          "type": "number",
-          "default": 30000,
-          "description": "Delay in milliseconds before reloading project watchers after a git checkout. This helps avoid issues with rapid git operations.",
-          "scope": "resource"
-        },
-        "delphi-devkit.projects.discovery.projectPaths": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "default": [
-            "**"
-          ],
-          "description": "Glob patterns specifying where to search for Delphi projects. Use patterns like 'src/**' to search only in specific directories, or '**' to search everywhere.",
-          "scope": "resource"
-        },
-        "delphi-devkit.projects.discovery.excludePatterns": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "default": [
-            "**/__history/**",
-            "**/.history/**"
-          ],
-          "description": "Glob patterns for paths to exclude from the Delphi Projects explorer. Use standard glob patterns like '**/folder/**' to exclude entire directories.",
-          "scope": "resource"
-        },
-        "delphi-devkit.projects.sortProjects": {
-          "type": "boolean",
-          "default": false,
-          "description": "Sort Delphi projects alphabetically in the explorer. If false, preserves original order."
-        },
-        "delphi-devkit.projects.compiler.configurations": {
+        "ddk.projects.compiler.configurations": {
           "type": "array",
           "items": {
             "type": "object",
@@ -349,12 +402,6 @@
             }
           ],
           "description": "Delphi compiler configurations with paths and build arguments",
-          "scope": "resource"
-        },
-        "delphi-devkit.projects.compiler.currentConfiguration": {
-          "type": "string",
-          "default": "Delphi 12",
-          "description": "Currently selected Delphi compiler configuration",
           "scope": "resource"
         }
       }

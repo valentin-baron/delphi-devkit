@@ -1,15 +1,13 @@
 import { ThemeIcon, Uri } from 'vscode';
 import { DelphiProjectTreeItem } from './delphiProjectTreeItem';
 import { DelphiProjectTreeItemType } from '../../types';
-import { ProjectType } from './delphiProject';
 
 export class DprojFile extends DelphiProjectTreeItem {
   constructor(
     label: string,
-    resourceUri: Uri,
-    projectType: ProjectType,
+    resourceUri: Uri
   ) {
-    super(DelphiProjectTreeItemType.DprojFile, label, resourceUri, projectType);
+    super(DelphiProjectTreeItemType.DprojFile, label, resourceUri);
     this.command = {
       command: 'vscode.open',
       title: 'Open DPROJ File',

@@ -12,12 +12,11 @@ import {
 import { basename, dirname, join } from "path";
 import { spawn } from "child_process";
 import { Runtime } from "../../runtime";
-import { WorkspaceEntity } from "../../db/entities";
-import { Restorable } from "../../db/restorable";
-import { FindOneOptions } from "typeorm";
-import { Coroutine } from "../../typings";
+import { Entities } from "../../db/entities";
 import { PROBLEMMATCHER_REGEX } from ".";
-import { Projects } from "../../constants";
+import { PROJECTS } from "../../constants";
+import { DelphiProject } from "../treeItems/delphiProject";
+import { fileExists } from "../../utils";
 
 export interface CompilerConfiguration {
   name: string;
@@ -37,76 +36,67 @@ const DIAGNOSTIC_SEVERITY = {
   f: DiagnosticSeverity.Error,
 };
 
-export class Compiler extends Restorable<WorkspaceEntity> {
-  private outputChannel: OutputChannel = window.createOutputChannel("Delphi Compiler", "delphi-devkit.compilerOutput");
-  private diagnosticCollection: DiagnosticCollection = languages.createDiagnosticCollection("delphi-devkit.compiler");
+export class Compiler {
+  private outputChannel: OutputChannel = window.createOutputChannel("Delphi Compiler", "ddk.compilerOutput");
+  private diagnosticCollection: DiagnosticCollection = languages.createDiagnosticCollection("ddk.compiler");
 
   constructor() {
-    super(WorkspaceEntity);
     Runtime.extension.subscriptions.push(...[
       this.outputChannel, this.diagnosticCollection
     ]);
   }
 
-  public loadOptions(): FindOneOptions<WorkspaceEntity> {
-    return {
-      where: { hash: Runtime.workspaceHash}
-    };
-  };
-
-  public createCallback(): Coroutine<WorkspaceEntity> | undefined {
-    return async () => Runtime.db.initializeWorkspace();
-  }
-
-  public async restore(entity: WorkspaceEntity): Promise<void> {
-    this.configuration = entity.compiler;
-  }
-
   public get availableConfigurations(): CompilerConfiguration[] {
-    const config = workspace.getConfiguration(Projects.Config.Key);
-    return config.get<CompilerConfiguration[]>(Projects.Config.Compiler.Configurations, []);
+    const config = workspace.getConfiguration(PROJECTS.CONFIG.KEY);
+    return config.get<CompilerConfiguration[]>(PROJECTS.CONFIG.COMPILER.CONFIGURATIONS, []);
   }
 
-  public set configuration(configurationName: string | undefined) {
-    if (!configurationName) { return; }
-    const config = workspace.getConfiguration(Projects.Config.Key);
-    config.update(Projects.Config.Compiler.CurrentConfiguration, configurationName, false);
-    Runtime.db.modify(async (ws) => ws.compiler = configurationName).then(() => {
-      Runtime.projects.compilerStatusBarItem.updateDisplay();
-    });
-    window.showInformationMessage(
-      `Compiler configuration set to: ${configurationName}`
-    );
+  public async compileWorkspaceItem(project: DelphiProject, recreate: boolean = false): Promise<void> {
+    const path = project.entity.dproj || project.entity.dpr || project.entity.dpk;
+    if (!path) {
+      window.showErrorMessage("No suitable project file (DPROJ, DPR, DPK) found to compile.");
+      return;
+    }
+    const fileUri = Uri.file(path);
+    if (!(project.link.owner instanceof Entities.Workspace)) {
+      window.showErrorMessage("Project does not belong to a workspace.");
+      return;
+    }
+    await this.compile(fileUri, project.link.owner.compiler, recreate);
   }
 
-  public async getConfiguration(canUseCache: boolean = true): Promise<CompilerConfiguration> {
-    let currentConfigName: string | undefined = undefined;
-    if (canUseCache) {
-      const ws = await Runtime.db.getWorkspace();
-      currentConfigName = ws?.compiler;
+  public async compileGroupProjectItem(project: DelphiProject, recreate: boolean = false): Promise<void> {
+    const path = project.entity.dproj || project.entity.dpr || project.entity.dpk;
+    if (!path) {
+      window.showErrorMessage("No suitable project file (DPROJ, DPR, DPK) found to compile.");
+      return;
     }
-    if (!currentConfigName) {
-      const config = workspace.getConfiguration(Projects.Config.Key);
-      currentConfigName = config.get(
-        Projects.Config.Compiler.CurrentConfiguration,
-        Projects.Config.Compiler.Value_DefaultConfiguration
-      );
+    if (!(project.link.owner instanceof Entities.GroupProject)) {
+      window.showErrorMessage("Project does not belong to a group project.");
+      return;
     }
-    const currentConfig = this.availableConfigurations.find(
-      (cfg) => cfg.name === currentConfigName
-    );
-    if (!currentConfig) {
-      throw new Error(
-        `Compiler configuration '${currentConfigName}' not found.`
-      );
+    const fileUri = Uri.file(path);
+    const config = await Runtime.db.getConfiguration();
+    if (!config.groupProjectsCompiler) {
+      window.showErrorMessage("No compiler configuration set for group projects. Please select one.");
+      return;
     }
-    currentConfig.usePrettyFormat = currentConfig.usePrettyFormat ?? true;
-    return currentConfig;
+    await this.compile(fileUri, config.groupProjectsCompiler, recreate);
   }
 
-  public async compile(file: Uri, recreate: boolean = false): Promise<void> {
+  private async compile(file: Uri, configName: string, recreate: boolean = false): Promise<void> {
     // Use OutputChannel and diagnostics
     try {
+      if (!fileExists(file)) {
+        window.showErrorMessage(`Project file not found: ${file.fsPath}`);
+        return;
+      }
+      const cfg = this.availableConfigurations.find((cfg) => cfg.name === configName);
+      if (cfg === undefined) {
+        window.showErrorMessage(`Compiler configuration not found: ${configName}`);
+        return;
+      }
+      const config: CompilerConfiguration = cfg!;
       const fileName = basename(file.fsPath);
       const projectDir = dirname(file.fsPath);
       const relativePath = workspace.asRelativePath(projectDir);
@@ -116,7 +106,6 @@ export class Compiler extends Restorable<WorkspaceEntity> {
         ? "recreate (clean + build)"
         : "compile (clean + make)";
       const buildTarget = recreate ? "Build" : "Make";
-      const config = await this.getConfiguration();
       const buildArguments = [
         `/t:Clean,${buildTarget}`,
         ...config.buildArguments,

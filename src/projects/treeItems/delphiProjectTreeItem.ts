@@ -1,10 +1,11 @@
 import { TreeItem, TreeItemCollapsibleState, Uri } from 'vscode';
-import { DelphiProjectTreeItemType } from '../../types';
-import { ProjectType } from './delphiProject';
-import { ProjectEntity } from '../../db/entities';
+import { DelphiProjectTreeItemType, ProjectType } from '../../types';
+import { Entities } from '../../db/entities';
+import { PROJECTS } from '../../constants';
 
 export interface DelphiProjectMainTreeItem {
-  entity: ProjectEntity;
+  entity: Entities.Project;
+  link: Entities.ProjectLink;
   resourceUri: Uri;
 }
 
@@ -14,10 +15,10 @@ export abstract class DelphiProjectTreeItem extends TreeItem {
   constructor(
     public readonly itemType: DelphiProjectTreeItemType,
     public readonly label: string,
-    public readonly resourceUri: Uri,
-    public readonly projectType: ProjectType
+    public resourceUri: Uri
   ) {
     super(label, itemType === DelphiProjectTreeItemType.Project ? TreeItemCollapsibleState.Collapsed : TreeItemCollapsibleState.None);
+    this.contextValue = PROJECTS.CONTEXT.PROJECT_FILE;
     this.tooltip = this.resourceUri.fsPath;
   }
 
@@ -26,36 +27,43 @@ export abstract class DelphiProjectTreeItem extends TreeItem {
   }
 
   public get projectSortValue(): string {
-    return this.project.entity.sortValue;
+    return this.project.link.sortValue;
   }
 
   public get projectDproj(): Uri | undefined {
-    if (this.project.entity.dprojPath) {
-      return Uri.file(this.project.entity.dprojPath);
+    if (this.project.entity.dproj) {
+      return Uri.file(this.project.entity.dproj);
     }
   }
 
   public get projectDpr(): Uri | undefined {
-    if (this.project.entity.dprPath) {
-      return Uri.file(this.project.entity.dprPath);
+    if (this.project.entity.dpr) {
+      return Uri.file(this.project.entity.dpr);
     }
   }
 
   public get projectDpk(): Uri | undefined {
-    if (this.project.entity.dpkPath) {
-      return Uri.file(this.project.entity.dpkPath);
+    if (this.project.entity.dpk) {
+      return Uri.file(this.project.entity.dpk);
     }
   }
 
   public get projectExe(): Uri | undefined {
-    if (this.project.entity.exePath) {
-      return Uri.file(this.project.entity.exePath);
+    if (this.project.entity.exe) {
+      return Uri.file(this.project.entity.exe);
     }
   }
 
   public get projectIni(): Uri | undefined {
-    if (this.project.entity.iniPath) {
-      return Uri.file(this.project.entity.iniPath);
+    if (this.project.entity.ini) {
+      return Uri.file(this.project.entity.ini);
     }
+  }
+
+  public get projectType(): ProjectType {
+    if (this.projectDpk) {
+      return ProjectType.Package;
+    }
+    return ProjectType.Application;
   }
 }

@@ -26,35 +26,9 @@ This extension does not include any proprietary Embarcadero code, libraries or b
 
 ## Extension Settings
 
-### Project Discovery
-
-* `delphi-devkit.projects.discovery.enable`: Enable automatic discovery of Delphi projects
-  * Default: `true`
-
-* `delphi-devkit.projects.discovery.useFileSystemWatchers`: Use file system watchers for live updates
-  * Default: `false`
-  * Note: Can be problematic with git checkouts when enabled
-
-* `delphi-devkit.projects.gitCheckoutDelay`: Delay before reloading after git checkout
-  * Default: `30000` (30 seconds)
-
-### Project Paths
-
-* `delphi-devkit.projects.discovery.projectPaths`: Glob patterns for project search locations
-  * Default: `["**"]` (searches everywhere)
-  * Example: `["src/**", "projects/**"]` (searches only in specific directories)
-
-* `delphi-devkit.projects.discovery.excludePatterns`: Glob patterns for paths to exclude
-  * Default: `["**/__history/**", "**/.history/**"]`
-  * Example: `["**/temp/**", "**/backup/**", "**/bin/**"]`
-
-* `delphi-devkit.projects.sortProjects`: Sort projects alphabetically in explorer
-  * Default: `false`
-
 ### Compiler Configurations
 
-* `delphi-devkit.compiler.configurations`: Array of Delphi compiler configurations
-* `delphi-devkit.compiler.currentConfiguration`: Currently selected compiler configuration
+* `ddk.compiler.configurations`: Array of Delphi compiler configurations
 
 Each compiler configuration includes:
 
@@ -68,10 +42,7 @@ Each compiler configuration includes:
 
 ```json
 {
-  "delphi-devkit.projects.discovery.projectPaths": ["src/**", "projects/**"],
-  "delphi-devkit.projects.discovery.excludePatterns": ["**/temp/**", "**/__history/**", "**/backup/**"],
-  "delphi-devkit.projects.sortProjects": true,
-  "delphi-devkit.compiler.configurations": [
+  "ddk.compiler.configurations": [
     {
       "name": "Delphi 12",
       "rsVarsPath": "C:\\Program Files (x86)\\Embarcadero\\Studio\\23.0\\bin\\rsvars.bat",
@@ -83,8 +54,7 @@ Each compiler configuration includes:
       ],
       "usePrettyFormat": true
     }
-  ],
-  "delphi-devkit.compiler.currentConfiguration": "Delphi 12"
+  ]
 }
 ```
 

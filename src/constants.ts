@@ -1,67 +1,75 @@
 
-  export namespace Projects {
-    export namespace Config {
-      export const Key = 'delphi-devkit.projects';
-      export function full(element: string): string {
-        return `${Key}.${element}`;
-      }
-      export namespace Discovery {
-        const NS = 'discovery';
-        export const Enable                = `${NS}.enable`;
-        export const UseFileSystemWatchers = `${NS}.useFileSystemWatchers`;
-        export const ProjectPaths          = `${NS}.projectPaths`;
-        export const ExcludePatterns       = `${NS}.excludePatterns`;
-      }
-      export const GitCheckoutDelay = 'gitCheckoutDelay';
-      export const SortProjects     = 'sortProjects';
-      export namespace Compiler {
-        export const NS                   = 'compiler';
-        export const Configurations       = `${NS}.configurations`;
-        export const CurrentConfiguration = `${NS}.currentConfiguration`;
-
-        export const Value_DefaultConfiguration = 'Delphi 12';
-      }
+export namespace PROJECTS {
+  export namespace CONFIG {
+    export const KEY = 'ddk.projects';
+    export function full(element: string): string {
+      return `${KEY}.${element}`;
     }
-    export namespace Command {
-      export const Refresh                     = `${Projects.Config.Key}.refresh`;
-      export const Compile                     = `${Projects.Config.Key}.compile`;
-      export const Recreate                    = `${Projects.Config.Key}.recreate`;
-      export const ShowInExplorer              = `${Projects.Config.Key}.showInExplorer`;
-      export const OpenInFileExplorer          = `${Projects.Config.Key}.openInFileExplorer`;
-      export const RunExecutable               = `${Projects.Config.Key}.runExecutable`;
-      export const ConfigureOrCreateIni        = `${Projects.Config.Key}.configureOrCreateIni`;
-      export const PickGroupProject            = `${Projects.Config.Key}.pickGroupProject`;
-      export const UnloadGroupProject          = `${Projects.Config.Key}.unloadGroupProject`;
-      export const SelectCompilerConfiguration = `${Projects.Config.Key}.selectCompilerConfiguration`;
-      export const SelectProject               = `${Projects.Config.Key}.selectProject`;
-      export const CompileSelectedProject      = `${Projects.Config.Key}.compileSelectedProject`;
-      export const RecreateSelectedProject     = `${Projects.Config.Key}.recreateSelectedProject`;
-      export const RunSelectedProject          = `${Projects.Config.Key}.runSelectedProject`;
-      export const EditDefaultIni              = `${Projects.Config.Key}.editDefaultIni`;
+    export namespace DISCOVERY {
+      const NS = 'discovery';
+      export const ENABLE           = `${NS}.enable`;
+      export const PROJECT_PATHS    = `${NS}.projectPaths`;
+      export const EXCLUDE_PATTERNS = `${NS}.excludePatterns`;
     }
-
-  export namespace Variables {
-    export const IsGroupProjectView = 'projects.isGroupProjectView';
+    export const SortProjects     = 'sortProjects';
+    export namespace COMPILER {
+      export const NS             = 'compiler';
+      export const CONFIGURATIONS = `${NS}.configurations`;
+    }
+  }
+  export namespace COMMAND {
+    export const REFRESH                   = `${PROJECTS.CONFIG.KEY}.refresh`;
+    export const ADD_WORKSPACE             = `${PROJECTS.CONFIG.KEY}.addWorkspace`;
+    export const RENAME_WORKSPACE          = `${PROJECTS.CONFIG.KEY}.renameWorkspace`;
+    export const REMOVE_WORKSPACE          = `${PROJECTS.CONFIG.KEY}.removeWorkspace`;
+    export const ADD_PROJECT               = `${PROJECTS.CONFIG.KEY}.addProject`;
+    export const REMOVE_PROJECT            = `${PROJECTS.CONFIG.KEY}.removeProject`;
+    export const IMPORT_CONFIGURATION      = `${PROJECTS.CONFIG.KEY}.importConfiguration`;
+    export const EXPORT_CONFIGURATION      = `${PROJECTS.CONFIG.KEY}.exportConfiguration`;
+    export const COMPILE                   = `${PROJECTS.CONFIG.KEY}.compile`;
+    export const RECREATE                  = `${PROJECTS.CONFIG.KEY}.recreate`;
+    export const SHOW_IN_EXPLORER          = `${PROJECTS.CONFIG.KEY}.showInExplorer`;
+    export const OPEN_IN_FILE_EXPLORER     = `${PROJECTS.CONFIG.KEY}.openInFileExplorer`;
+    export const RUN_EXECUTABLE            = `${PROJECTS.CONFIG.KEY}.runExecutable`;
+    export const CONFIGURE_OR_CREATE_INI   = `${PROJECTS.CONFIG.KEY}.configureOrCreateIni`;
+    export const SELECT_GROUP_PROJECT      = `${PROJECTS.CONFIG.KEY}.pickGroupProject`;
+    export const UNLOAD_GROUP_PROJECT      = `${PROJECTS.CONFIG.KEY}.unloadGroupProject`;
+    export const SELECT_COMPILER           = `${PROJECTS.CONFIG.KEY}.selectCompilerConfiguration`;
+    export const SELECT_PROJECT            = `${PROJECTS.CONFIG.KEY}.selectProject`;
+    export const COMPILE_SELECTED_PROJECT  = `${PROJECTS.CONFIG.KEY}.compileSelectedProject`;
+    export const RECREATE_SELECTED_PROJECT = `${PROJECTS.CONFIG.KEY}.recreateSelectedProject`;
+    export const RUN_SELECTED_PROJECT      = `${PROJECTS.CONFIG.KEY}.runSelectedProject`;
+    export const EDIT_DEFAULT_INI          = `${PROJECTS.CONFIG.KEY}.editDefaultIni`;
   }
 
-  export namespace Context {
-    export const IsGroupProjectView         = 'delphiDevkit:isGroupProjectView';
-    export const IsProjectSelected          = 'delphiDevKit:isProjectSelected';
-    export const DoesSelectedProjectHaveExe = 'delphiDevKit:doesSelectedProjectHaveExe';
+  export namespace CONTEXT {
+    export const IS_GROUP_PROJECT_OPENED        = 'ddk:isGroupProjectOpened';
+    export const IS_PROJECT_SELECTED            = 'ddk:isProjectSelected';
+    export const DOES_SELECTED_PROJECT_HAVE_EXE = 'ddk:doesSelectedProjectHaveExe';
+
+    export const WORKSPACE    = 'ddk.context.projects.workspace';
+    export const PROJECT      = 'ddk.context.projects.project';
+    export const PROJECT_FILE = 'ddk.context.projects.projectFile';
+
   }
 
-  export namespace View {
-    export const Main = 'delphiProjects';
+  export namespace VIEW {
+    export const WORKSPACES    = 'ddk.view.projects.workspaces';
+    export const GROUP_PROJECT = 'ddk.view.projects.groupProject';
   }
 
-  export namespace Scheme {
-    export const Default  = 'delphi-devkit';
-    export const Selected = `${Default}.selected`;
+  export namespace STATUS_BAR {
+    export const COMPILER = 'ddk.statusBar.projects.compiler';
+  }
+
+  export namespace SCHEME {
+    export const DEFAULT  = 'ddk';
+    export const SELECTED = `${DEFAULT}.selected`;
   }
 }
 
 export namespace DFM {
   export enum Commands {
-    SwapToDfmPas = 'delphi-devkit.dfm.swapToDfmPas'
+    SWAP_DFM_PAS = 'ddk.dfm.swapToDfmPas'
   }
 }

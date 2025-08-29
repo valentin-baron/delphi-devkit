@@ -1,104 +1,167 @@
 import "reflect-metadata";
-import { Column, Entity, JoinColumn, ManyToOne, OneToMany, OneToOne, PrimaryColumn, PrimaryGeneratedColumn } from "typeorm";
-import { WorkspaceViewMode } from "../types";
-import { ProjectType } from "../projects/treeItems/delphiProject";
+import { Column, Entity, JoinColumn, ManyToOne, OneToMany, OneToOne, PrimaryGeneratedColumn } from "typeorm";
 import { SortedItem } from "../utils/lexoSorter";
 
+export namespace Entities {
+  @Entity()
+  export class Configuration {
+    @Column({primary: true, type: "int", default: 0})
+    id: number;
 
-@Entity()
-export class WorkspaceEntity {
-  @PrimaryColumn({ type: "text" })
-  hash: string;
+    @OneToMany(() => Workspace, (workspace) => workspace.configuration, { cascade: true, eager: true })
+    workspaces: Workspace[];
 
-  @Column({ type: "varchar", length: 50 })
-  compiler: string;
+    @Column({ type: "varchar", length: 50, nullable: true })
+    groupProjectsCompiler?: string | null;
 
-  @Column({ type: "datetime" })
-  lastUpdated: Date;
+    // Remove cascade here - you want to manually create these references
+    @OneToOne(() => Project, { nullable: true, eager: true })
+    @JoinColumn()
+    selectedProject?: Project | null;
 
-  @Column({ type: "text", nullable: true })
-  paths?: string;
-
-  @OneToMany(() => ProjectEntity, (project) => project.workspace, { cascade: true, eager: true })
-  discoveredProjects: ProjectEntity[];
-
-  @OneToOne(() => GroupProjectEntity, { nullable: true, eager: true, cascade: true })
-  @JoinColumn()
-  currentGroupProject?: GroupProjectEntity | null;
-
-  @OneToOne(() => ProjectEntity, { nullable: true, eager: true, cascade: true })
-  @JoinColumn()
-  currentProject?: ProjectEntity;
-
-  public get viewMode(): WorkspaceViewMode {
-    return !!this.currentGroupProject ?
-      WorkspaceViewMode.GroupProject :
-      (
-        !!this.discoveredProjects ?
-        WorkspaceViewMode.Discovery :
-        WorkspaceViewMode.Empty
-      );
+    @OneToOne(() => GroupProject, { nullable: true, eager: true })
+    @JoinColumn()
+    selectedGroupProject?: GroupProject | null;
   }
-}
 
-@Entity()
-export class GroupProjectEntity {
-  @PrimaryGeneratedColumn()
-  id: number;
+  export interface ProjectOwner {
+    id: number;
+    name: string;
+    projects: ProjectLink[];
+    selectedProject?: Project;
+  }
 
-  @Column({ type: "varchar", length: 50 })
-  name: string;
+  @Entity()
+  export class Workspace implements ProjectOwner, SortedItem {
+    @PrimaryGeneratedColumn()
+    id: number;
 
-  @Column({ type: "varchar", length: 255 })
-  path: string;
+    @ManyToOne(() => Configuration, (configuration) => configuration.workspaces)
+    configuration: Configuration;
 
-  @OneToMany(() => ProjectEntity, (project) => project.groupProject, { cascade: true, eager: true })
-  projects: ProjectEntity[];
+    @Column({ type: "varchar", length: 50 })
+    name: string;
 
-  @OneToOne(() => ProjectEntity, { nullable: true, eager: true, cascade: true })
-  @JoinColumn()
-  currentProject?: ProjectEntity;
-}
+    @Column({ type: "varchar", length: 50 })
+    compiler: string;
 
-@Entity()
-export class ProjectEntity implements SortedItem {
-  @PrimaryGeneratedColumn()
-  id: number;
+    @OneToMany(() => WorkspaceProjectLink, (workspaceProject) => workspaceProject.workspace, { cascade: true, eager: true })
+    projects: WorkspaceProjectLink[];
 
-  @ManyToOne(() => WorkspaceEntity, workspace => workspace.discoveredProjects, { nullable: true })
-  workspace?: WorkspaceEntity;
+    // Remove cascade here - you want to manually create this reference
+    @ManyToOne(() => Project, { nullable: true, eager: true })
+    selectedProject?: Project;
 
-  @ManyToOne(() => GroupProjectEntity, groupProject => groupProject.projects, { nullable: true })
-  groupProject?: GroupProjectEntity;
+    @Column({ type: "varchar", length: 1024 })
+    sortValue: string;
+  }
 
-  @Column({ type: "varchar", length: 50 })
-  name: string;
+  @Entity()
+  export class GroupProject implements ProjectOwner {
+    @PrimaryGeneratedColumn()
+    id: number;
 
-  @Column({ type: "varchar", length: 255 })
-  path: string;
+    @Column({ type: "varchar", length: 50 })
+    name: string;
 
-  @Column({
-    type: "varchar",
-    length: 50,
-    default: ProjectType.Application
-  })
-  type: ProjectType;
+    @Column({ type: "varchar", length: 255 })
+    path: string;
 
-  @Column({ type: "varchar", length: 255, nullable: true })
-  dprojPath?: string;
+    @OneToMany(() => GroupProjectProjectLink, (groupProjectProject) => groupProjectProject.groupProject, { cascade: true, eager: true })
+    projects: GroupProjectProjectLink[];
+  }
 
-  @Column({ type: "varchar", length: 255, nullable: true })
-  dprPath?: string;
+  @Entity()
+  export class Project {
+    @PrimaryGeneratedColumn()
+    id: number;
 
-  @Column({ type: "varchar", length: 255, nullable: true })
-  dpkPath?: string;
+    // Remove onDelete here - it should be on the ManyToOne side
+    @OneToMany(() => WorkspaceProjectLink, (workspaceProject) => workspaceProject.project)
+    workspaces: WorkspaceProjectLink[];
 
-  @Column({ type: "varchar", length: 255, nullable: true })
-  exePath?: string;
+    @OneToMany(() => GroupProjectProjectLink, (groupProjectProject) => groupProjectProject.project)
+    groupProjects: GroupProjectProjectLink[];
 
-  @Column({ type: "varchar", length: 255, nullable: true })
-  iniPath?: string;
+    @Column({ type: "varchar", length: 50 })
+    name: string;
 
-  @Column({ type: "varchar", length: 1024 })
-  sortValue: string;
+    @Column({ type: "varchar", length: 255 })
+    path: string;
+
+    @Column({ type: "text", nullable: true })
+    dproj?: string | null;
+
+    @Column({ type: "text", nullable: true })
+    dpr?: string | null;
+
+    @Column({ type: "text", nullable: true })
+    dpk?: string | null;
+
+    @Column({ type: "text", nullable: true })
+    exe?: string | null;
+
+    @Column({ type: "text", nullable: true })
+    ini?: string | null;
+  }
+
+  export interface ProjectLink extends SortedItem {
+    id: number;
+    project: Project;
+    sortValue: string;
+    owner: ProjectOwner;
+  }
+
+  // Join entity for WorkspaceEntity and ProjectEntity with sort value
+  @Entity()
+  export class WorkspaceProjectLink implements ProjectLink {
+    @PrimaryGeneratedColumn()
+    id: number;
+
+    // Remove eager and cascade from the "many" side back to workspace
+    @ManyToOne(() => Workspace, workspace => workspace.projects)
+    workspace: Workspace;
+
+    // Keep cascade for saving projects through links
+    @ManyToOne(() => Project, project => project.workspaces, { eager: true, cascade: true })
+    project: Project;
+
+    @Column({ type: "varchar", length: 1024 })
+    sortValue: string;
+
+    get owner(): Workspace {
+      return this.workspace;
+    }
+  }
+
+  // Join entity for GroupProjectEntity and ProjectEntity with sort value
+  @Entity()
+  export class GroupProjectProjectLink implements ProjectLink {
+    @PrimaryGeneratedColumn()
+    id: number;
+
+    // Remove eager and cascade from the "many" side back to groupProject
+    @ManyToOne(() => GroupProject, groupProject => groupProject.projects)
+    groupProject: GroupProject;
+
+    // Keep cascade for saving projects through links
+    @ManyToOne(() => Project, project => project.groupProjects, { eager: true, cascade: true })
+    project: Project;
+
+    @Column({ type: "varchar", length: 1024 })
+    sortValue: string;
+
+    get owner(): GroupProject {
+      return this.groupProject;
+    }
+  }
+
+  export const ALL = [
+    Configuration,
+    Workspace,
+    GroupProject,
+    Project,
+    WorkspaceProjectLink,
+    GroupProjectProjectLink
+  ];
 }

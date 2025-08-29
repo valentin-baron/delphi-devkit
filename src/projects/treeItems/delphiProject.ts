@@ -1,4 +1,4 @@
-import { TreeItemCollapsibleState, ThemeIcon, Uri, commands } from "vscode";
+import { TreeItemCollapsibleState, ThemeIcon, Uri } from "vscode";
 import { DelphiProjectMainTreeItem, DelphiProjectTreeItem } from "./delphiProjectTreeItem";
 import { DelphiProjectTreeItemType } from "../../types";
 import { DprojFile } from "./dprojFile";
@@ -7,72 +7,55 @@ import { IniFile } from "./iniFile";
 import { ExeFile } from "./exeFile";
 import { DpkFile } from "./dpkFile";
 import { basename } from "path";
-import { ProjectEntity, WorkspaceEntity } from "../../db/entities";
+import { Entities } from "../../db/entities";
 import { Runtime } from "../../runtime";
 import { SortedItem } from "../../utils/lexoSorter";
 import { fileExists } from "../../utils";
-import { Projects } from "../../constants";
-
-export enum ProjectType {
-  Application = "application",
-  Package = "package",
-}
+import { PROJECTS } from "../../constants";
 
 export class DelphiProject extends DelphiProjectTreeItem implements DelphiProjectMainTreeItem, SortedItem {
+  public entity: Entities.Project;
+  public children: DelphiProjectTreeItem[] = [];
+
   constructor(
-    public entity: ProjectEntity,
-    label: string,
-    projectType: ProjectType,
+    public link: Entities.ProjectLink,
     selected: boolean = false
   ) {
-    const path = entity.dprojPath || entity.dprPath || entity.dpkPath || entity.exePath || entity.iniPath;
+    const entity = link.project;
+    const path = entity.dproj || entity.dpr || entity.dpk || entity.exe || entity.ini;
     if (!path) { throw new Error("At least one project file must be provided."); }
-    const uriPath = path.replace(basename(path), label);
+    const uriPath = path.replace(basename(path), entity.name);
     if (selected) {
-      commands.executeCommand(
-        "setContext",
-        Projects.Context.IsProjectSelected,
-        true,
-      );
-      commands.executeCommand(
-        "setContext",
-        Projects.Context.DoesSelectedProjectHaveExe,
-        !!entity.exePath
-      );
+      Runtime.setContext(PROJECTS.CONTEXT.IS_PROJECT_SELECTED, true);
+      Runtime.setContext(PROJECTS.CONTEXT.DOES_SELECTED_PROJECT_HAVE_EXE, !!entity.exe);
     }
     const resourceUri = selected ?
-      Uri.from({ scheme: Projects.Scheme.Selected, path: uriPath }) :
-      Uri.from({ scheme: Projects.Scheme.Default, path: uriPath });
+      Uri.from({ scheme: PROJECTS.SCHEME.SELECTED, path: uriPath }) :
+      Uri.from({ scheme: PROJECTS.SCHEME.DEFAULT, path: uriPath });
     super(
       DelphiProjectTreeItemType.Project,
-      label,
-      resourceUri,
-      projectType,
+      entity.name,
+      resourceUri
     );
+    this.entity = entity;
     this.project = this;
-    this.contextValue = "delphiProject";
+    this.contextValue = PROJECTS.CONTEXT.PROJECT;
     this.setIcon();
   }
 
   public set sortValue(value: string) {
-    this.entity.sortValue = value;
+    this.link.sortValue = value;
   }
 
   public get sortValue(): string {
-    return this.entity.sortValue;
+    return this.link.sortValue;
   }
 
-  public static fromData(workspace: WorkspaceEntity, entity: ProjectEntity): DelphiProject {
-    const selected =
-      workspace.currentGroupProject?.currentProject?.id === entity.id ||
-      workspace.currentProject?.id === entity.id;
+  public static fromData(link: Entities.ProjectLink): DelphiProject {
     const project = new DelphiProject(
-      entity,
-      entity.name,
-      <ProjectType>entity.type,
-      selected
+      link,
+      link.owner.selectedProject?.id === link.project.id
     );
-    project.sortValue = entity.sortValue;
     project.updateCollapsibleState();
     return project;
   }
@@ -101,39 +84,29 @@ export class DelphiProject extends DelphiProjectTreeItem implements DelphiProjec
       : TreeItemCollapsibleState.None;
   }
 
-  async setDproj(value: Uri, save: boolean = false): Promise<void> {
-    this.entity.dprojPath = value.fsPath;
-    if (save) {
-      await Runtime.projects.treeView.save();
-    }
+  async setDproj(value: string): Promise<void> {
+    this.entity.dproj = value;
+    await Runtime.db.saveProject(this.entity);
   }
 
-  async setDpr(value: Uri, save: boolean = false): Promise<void> {
-    this.entity.dprPath = value.fsPath;
-    if (save) {
-      await Runtime.projects.treeView.save();
-    }
+  async setDpr(value: string): Promise<void> {
+    this.entity.dpr = value;
+    await Runtime.db.saveProject(this.entity);
   }
 
-  async setDpk(value: Uri, save: boolean = false): Promise<void> {
-    this.entity.dpkPath = value.fsPath;
-    if (save) {
-      await Runtime.projects.treeView.save();
-    }
+  async setDpk(value: string): Promise<void> {
+    this.entity.dpk = value;
+    await Runtime.db.saveProject(this.entity);
   }
 
-  async setExecutable(value: Uri, save: boolean = false): Promise<void> {
-    this.entity.exePath = value.fsPath;
-    if (save) {
-      await Runtime.projects.treeView.save();
-    }
+  async setExecutable(value: string): Promise<void> {
+    this.entity.exe = value;
+    await Runtime.db.saveProject(this.entity);
   }
 
-  async setIni(value: Uri, save: boolean = false): Promise<void> {
-    this.entity.iniPath = value.fsPath;
-    if (save) {
-      await Runtime.projects.treeView.save();
-    }
+  async setIni(value: string): Promise<void> {
+    this.entity.ini = value;
+    await Runtime.db.saveProject(this.entity);
   }
 
   createChild(
@@ -146,8 +119,7 @@ export class DelphiProject extends DelphiProjectTreeItem implements DelphiProjec
         if (this.projectDproj && fileExists(this.projectDproj)) {
           item = new DprojFile(
             basename(this.projectDproj.fsPath),
-            this.projectDproj,
-            this.projectType,
+            this.projectDproj
           );
         }
         break;
@@ -193,5 +165,6 @@ export class DelphiProject extends DelphiProjectTreeItem implements DelphiProjec
       item.project = this;
       children.push(item);
     }
+    this.children = children;
   }
 }

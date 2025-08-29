@@ -1,133 +1,134 @@
+/**
+ * Controller class for ease of accessing and manipulating the database.
+ */
+
 import { AppDataSource } from "./datasource";
-import { Uri } from "vscode";
-import {
-  GroupProjectEntity,
-  ProjectEntity,
-  WorkspaceEntity,
-} from "./entities";
-import { fileExists } from "../utils";
-import { Runtime } from "../runtime";
-import { WorkspaceViewMode } from "../types";
+import { Entities } from "./entities";
 
 export class DatabaseController {
-  public async getWorkspace(): Promise<WorkspaceEntity | null> {
-    if (!Runtime.assertWorkspaceAvailable()) {
-      return null;
+  public async getConfiguration(): Promise<Entities.Configuration> {
+    let config: Entities.Configuration | null = null;
+    await AppDataSource.transaction(async (manager) => {
+      config = await manager.findOne(Entities.Configuration, {});
+      if (!config) {
+        config = await manager.save(new Entities.Configuration());
+      }
+    });
+    return config!;
+  }
+
+  public async saveConfiguration(config: Entities.Configuration): Promise<void> {
+    if (config) {
+      await AppDataSource.transaction(async (manager) => {
+        await manager.save(config);
+      });
     }
-    return await AppDataSource.load<WorkspaceEntity>(
-      WorkspaceEntity,
-      {
-        where: {
-          hash: Runtime.workspaceHashHumanReadable,
-        },
-      },
-      async () => this.initializeWorkspace()
-    );
   }
 
-  public async modify(
-    callback: (workspace: WorkspaceEntity) => Promise<WorkspaceEntity | unknown>
-  ): Promise<WorkspaceEntity | null> {
-    if (!Runtime.assertWorkspaceAvailable()) {
-      return null;
-    }
-    return await AppDataSource.save<WorkspaceEntity>(
-      WorkspaceEntity,
-      {
-        where: {
-          hash: Runtime.workspaceHashHumanReadable,
-        },
-      },
-      callback,
-      async () => this.initializeWorkspace()
-    );
-  }
-
-  public async reset(): Promise<void> {
-    if (!Runtime.assertWorkspaceAvailable()) { return; }
-    await AppDataSource.reset();
-  }
-
-  public async initializeWorkspace(): Promise<WorkspaceEntity> {
-    const workspace = new WorkspaceEntity();
-    workspace.compiler = (await Runtime.projects.compiler.getConfiguration(false)).name;
-    workspace.hash = Runtime.workspaceHashHumanReadable;
-    workspace.lastUpdated = new Date();
+  public async addWorkspace(name: string, compiler: string): Promise<Entities.Workspace> {
+    const workspace = new Entities.Workspace();
+    workspace.name = name;
+    workspace.compiler = compiler;
+    await AppDataSource.transaction(async (manager) => {
+      await manager.save(workspace);
+    });
     return workspace;
   }
 
-  public async removeNonExistentFiles(
-    inputProjects?: ProjectEntity[]
-  ): Promise<ProjectEntity[]> {
-    if (!inputProjects) {
-      return [];
+  public async removeWorkspace(workspace: Entities.Workspace): Promise<void> {
+    if (workspace) {
+      await AppDataSource.transaction(async (manager) => {
+        await manager.remove(workspace);
+      });
     }
-    const projects: ProjectEntity[] = [];
+  }
 
-    // Batch file existence checks to reduce I/O operations
-    let changed = false;
+  public async saveWorkspace(workspace: Entities.Workspace): Promise<void> {
+    if (workspace) {
+      await AppDataSource.transaction(async (manager) => {
+        await manager.save(workspace);
+      });
+    }
+  }
 
-    let getChanges = (proj: ProjectEntity): [boolean, ProjectEntity | undefined] => {
-      if (!proj) { return [false, proj]; }
-      let changeCount = 0;
-      if (proj.dprojPath && !fileExists(proj.dprojPath)) {
-        proj.dprojPath = undefined;
-        changeCount++;
-      }
-      if (proj.dprPath && !fileExists(proj.dprPath)) {
-        proj.dprPath = undefined;
-        changeCount++;
-      }
-      if (proj.dpkPath && !fileExists(proj.dpkPath)) {
-        proj.dpkPath = undefined;
-        changeCount++;
-      }
-      if (proj.exePath && !fileExists(proj.exePath)) {
-        proj.exePath = undefined;
-        changeCount++;
-      }
-      if (proj.iniPath && !fileExists(proj.iniPath)) {
-        proj.iniPath = undefined;
-        changeCount++;
-      }
-      // If all paths are undefined, we consider the project as not existing
-      return [ changeCount > 0, changeCount === 5 ? undefined : proj];
-    };
+  public async getWorkspaces(): Promise<Entities.Workspace[]> {
+    return (await this.getConfiguration()).workspaces;
+  }
 
-    await Promise.all(
-      Array.from(inputProjects).map(async (project) => {
-        const [chg, proj] = getChanges(project);
-        changed ||= chg;
-        if (proj) {
-          projects.push(proj);
-        }
-      })
-    );
+  public async addGroupProject(name: string, path: string, projects: Entities.Project[]): Promise<Entities.GroupProject> {
+    const groupProject = new Entities.GroupProject();
+    groupProject.name = name;
+    groupProject.path = path;
+    groupProject.projects = projects.map((proj) => {
+      const link = new Entities.GroupProjectProjectLink();
+      link.project = proj;
+      link.groupProject = groupProject;
+      return link;
+    });
+    await AppDataSource.transaction(async (manager) => {
+      await manager.save(groupProject);
+    });
+    return groupProject;
+  }
 
-    if (changed) {
-      await Runtime.db.modify(async (ws) => {
-        ws.lastUpdated = new Date();
-        switch (ws.viewMode) {
-          case WorkspaceViewMode.GroupProject:
-            if (ws.currentGroupProject) {
-              ws.currentGroupProject.projects = projects;
-            }
-            break;
-          case WorkspaceViewMode.Discovery:
-            ws.discoveredProjects = projects;
-            break;
+  public async removeGroupProject(groupProject: Entities.GroupProject): Promise<void> {
+    if (groupProject) {
+      await AppDataSource.transaction(async (manager) => {
+        await manager.remove(groupProject);
+      });
+    }
+  }
+
+  public async saveGroupProject(groupProject: Entities.GroupProject): Promise<void> {
+    if (groupProject) {
+      await AppDataSource.transaction(async (manager) => {
+        await manager.save(groupProject);
+      });
+    }
+  }
+
+  public async getGroupProject(path: string): Promise<Entities.GroupProject | null> {
+    let groupProject: Entities.GroupProject | null = null;
+    await AppDataSource.readConnection(async (manager) => {
+      groupProject = await manager.findOne(Entities.GroupProject, { where: { path: path}});
+    });
+    return groupProject;
+  }
+
+  public async saveProjectLink(link: Entities.ProjectLink): Promise<void> {
+    if (link) {
+      await AppDataSource.transaction(async (manager) => {
+        await manager.save(link);
+      });
+    }
+  }
+
+  public async removeProjectLink(link: Entities.ProjectLink): Promise<void> {
+    if (link) {
+      await AppDataSource.transaction(async (manager) => {
+        await manager.remove(link);
+        const workspaceLinks = await manager.find(Entities.WorkspaceProjectLink, { where: { project: link.project }});
+        const groupProjectLinks = await manager.find(Entities.GroupProjectProjectLink, { where: { project: link.project }});
+        if (workspaceLinks.length === 0 && groupProjectLinks.length === 0) {
+          await manager.remove(link.project);
         }
       });
     }
-
-    return projects;
   }
 
-  public async getGroupProject(uri: Uri): Promise<GroupProjectEntity | null> {
-    return (
-      (await AppDataSource.load<GroupProjectEntity>(GroupProjectEntity, {
-        where: { path: uri.fsPath },
-      })) || null
-    );
+  public async saveProject(project: Entities.Project): Promise<void> {
+    if (project) {
+      await AppDataSource.transaction(async (manager) => {
+        await manager.save(project);
+      });
+    }
+  }
+
+  public async removeProject(project: Entities.Project): Promise<void> {
+    if (project) {
+      await AppDataSource.transaction(async (manager) => {
+        await manager.remove(project);
+      });
+    }
   }
 }

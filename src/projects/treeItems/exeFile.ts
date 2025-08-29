@@ -1,17 +1,16 @@
 import { ThemeIcon, Uri } from 'vscode';
 import { DelphiProjectTreeItem } from './delphiProjectTreeItem';
 import { DelphiProjectTreeItemType } from '../../types';
-import { ProjectType } from './delphiProject';
-import { Projects } from '../../constants';
+import { PROJECTS } from '../../constants';
 
 export class ExeFile extends DelphiProjectTreeItem {
   constructor(
     label: string,
     resourceUri: Uri,
   ) {
-    super(DelphiProjectTreeItemType.ExecutableFile, label, resourceUri, ProjectType.Application);
+    super(DelphiProjectTreeItemType.ExecutableFile, label, resourceUri);
     this.command = {
-      command: Projects.Command.RunExecutable,
+      command: PROJECTS.COMMAND.RUN_EXECUTABLE,
       title: 'Launch Application',
       arguments: [this.projectExe]
     };
