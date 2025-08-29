@@ -16,9 +16,9 @@ export abstract class Runtime {
   public static extension: ExtensionContext;
 
   static async initialize(context: ExtensionContext) {
+    this.extension = context;
     await AppDataSource.initialize();
     this.db = new DatabaseController();
-    this.extension = context;
     this.projects = new ProjectsFeature();
     await this.projects.initialize();
     this.dfm = new DfmFeature();
