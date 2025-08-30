@@ -6,6 +6,7 @@ import { DfmFeature } from './dfm/feature';
 import { Entities } from './db/entities';
 import { CompilerConfiguration } from './projects/compiler/compiler';
 import { PROJECTS } from './constants';
+import { GeneralCommands } from './commands';
 
 /**
  * Runtime class to manage workspace state and global variables.
@@ -40,6 +41,9 @@ export abstract class Runtime {
     await this.projects.initialize();
     this.dfm = new DfmFeature();
     await this.dfm.initialize();
+    context.subscriptions.push(
+      ...GeneralCommands.registers
+    );
   }
 
   public static setContext(name: string, value: any): Thenable<void> {

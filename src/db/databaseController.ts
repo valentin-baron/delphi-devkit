@@ -9,6 +9,10 @@ import { LexoSorter } from '../utils/lexoSorter';
 import { DynamicObject } from '../typings';
 
 export class DatabaseController {
+  public async clear(): Promise<void> {
+    await AppDataSource.resetDatabase();
+  }
+
   public async getConfiguration(): Promise<Entities.Configuration> {
     let config: Entities.Configuration | null = null;
     await AppDataSource.transaction(async (manager) => {

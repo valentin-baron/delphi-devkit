@@ -31,19 +31,27 @@ export class AppDataSource extends DataSource {
     });
   }
 
-  public static async transaction(callback: (manager: EntityManager) => Promise<void>): Promise<void> {
+  public static async resetDatabase(): Promise<void> {
+    const ds = new this(this.getReadBuffer());
+    await ds.initialize();
+    await ds.dropDatabase();
+    await ds.synchronize();
+    await ds.saveToFile();
+  }
+
+  public static async transaction(callback: (manager: EntityManager, ds?: AppDataSource) => Promise<void>): Promise<void> {
     const dataSource = new this(this.getReadBuffer());
     await dataSource.initialize();
     await dataSource.manager.transaction(async (manager) => {
-      await callback(manager);
+      await callback(manager, dataSource);
     });
     await dataSource.saveToFile();
   }
 
-  public static async readConnection(callback: (manager: EntityManager) => Promise<void>): Promise<void> {
+  public static async readConnection(callback: (manager: EntityManager, ds?: AppDataSource) => Promise<void>): Promise<void> {
     const dataSource = new this(this.getReadBuffer());
     await dataSource.initialize();
-    await callback(dataSource.manager);
+    await callback(dataSource.manager, dataSource);
   }
 
   private static get cacheDBFilePath(): string {

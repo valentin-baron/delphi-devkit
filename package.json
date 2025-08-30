@@ -2,7 +2,7 @@
   "name": "delphi-devkit",
   "displayName": "DDK - Delphi Development Kit",
   "description": "Utilities for developing in Delphi using VS Code",
-  "version": "0.1.2",
+  "version": "1.0.0",
   "publisher": "Snowcaloid",
   "license": "SEE LICENSE IN LICENSE",
   "homepage": "https://www.github.com/Snowcaloid",
@@ -23,106 +23,104 @@
         "command": "ddk.projects.refresh",
         "title": "Discover File Paths",
         "icon": "$(refresh)",
-        "category": "DDK TreeView Context Menu",
+        "category": "_ddk_treeview",
         "when": "false"
       },
       {
         "command": "ddk.projects.addProject",
         "title": "Add Project",
         "icon": "$(add)",
-        "category": "DDK TreeView Context Menu",
+        "category": "_ddk_treeview",
         "when": "false"
       },
       {
         "command": "ddk.projects.removeProject",
         "title": "Remove Project",
         "icon": "$(remove)",
-        "category": "DDK TreeView Context Menu",
-        "when": "false"
-      },
-      {
-        "command": "ddk.projects.importConfiguration",
-        "title": "Import Projects Configuration",
-        "icon": "$(cloud-download)",
-        "category": "DDK TreeView Context Menu",
-        "when": "false"
-      },
-      {
-        "command": "ddk.projects.exportConfiguration",
-        "title": "Export Projects Configuration",
-        "icon": "$(cloud-upload)",
-        "category": "DDK TreeView Context Menu",
+        "category": "_ddk_treeview",
         "when": "false"
       },
       {
         "command": "ddk.projects.addWorkspace",
         "title": "Add Workspace",
         "icon": "$(add)",
-        "category": "DDK TreeView Context Menu",
+        "category": "_ddk_treeview",
         "when": "false"
       },
       {
         "command": "ddk.projects.renameWorkspace",
         "title": "Rename Workspace",
         "icon": "$(edit)",
-        "category": "DDK TreeView Context Menu",
+        "category": "_ddk_treeview",
         "when": "false"
       },
       {
         "command": "ddk.projects.removeWorkspace",
         "title": "Remove Workspace",
         "icon": "$(remove)",
-        "category": "DDK TreeView Context Menu",
+        "category": "_ddk_treeview",
         "when": "false"
       },
       {
         "command": "ddk.projects.selectProject",
         "title": "Select Project",
         "icon": "$(check)",
-        "category": "DDK TreeView Context Menu",
+        "category": "_ddk_treeview",
         "when": "false"
       },
       {
         "command": "ddk.projects.compile",
         "title": "Compile",
         "icon": "$(sync-ignored)",
-        "category": "DDK TreeView Context Menu",
+        "category": "_ddk_treeview",
         "when": "false"
       },
       {
         "command": "ddk.projects.recreate",
         "title": "Recreate",
         "icon": "$(sync)",
-        "category": "DDK TreeView Context Menu",
+        "category": "_ddk_treeview",
         "when": "false"
       },
       {
         "command": "ddk.projects.showInExplorer",
         "title": "Show in Explorer",
         "icon": "$(folder)",
-        "category": "DDK TreeView Context Menu",
+        "category": "_ddk_treeview",
         "when": "false"
       },
       {
         "command": "ddk.projects.openInFileExplorer",
         "title": "Open in File Explorer",
         "icon": "$(folder-opened)",
-        "category": "DDK TreeView Context Menu",
+        "category": "_ddk_treeview",
         "when": "false"
       },
       {
         "command": "ddk.projects.runExecutable",
         "title": "Run",
         "icon": "$(play)",
-        "category": "DDK TreeView Context Menu",
+        "category": "_ddk_treeview",
         "when": "false"
       },
       {
         "command": "ddk.projects.configureOrCreateIni",
         "title": "Configure/Create .ini",
         "icon": "$(settings-gear)",
-        "category": "DDK TreeView Context Menu",
+        "category": "_ddk_treeview",
         "when": "false"
+      },
+      {
+        "command": "ddk.importConfiguration",
+        "title": "Import Configuration",
+        "icon": "$(cloud-download)",
+        "category": "DDK"
+      },
+      {
+        "command": "ddk.exportConfiguration",
+        "title": "Export Configuration",
+        "icon": "$(cloud-upload)",
+        "category": "DDK"
       },
       {
         "command": "ddk.projects.editDefaultIni",
@@ -202,6 +200,16 @@
       "view/title": [
         {
           "command": "ddk.projects.addWorkspace",
+          "when": "view == ddk.view.projects.workspaces",
+          "group": "navigation"
+        },
+        {
+          "command": "ddk.importConfiguration",
+          "when": "view == ddk.view.projects.workspaces",
+          "group": "navigation"
+        },
+        {
+          "command": "ddk.exportConfiguration",
           "when": "view == ddk.view.projects.workspaces",
           "group": "navigation"
         },
@@ -293,54 +301,6 @@
         "aliases": [
           "Delphi Form",
           "Delphi DFM"
-        ]
-      },
-      {
-        "id": "ddk.pas",
-        "extensions": [
-          ".pas"
-        ],
-        "aliases": [
-          "Pascal Unit",
-          "Delphi Unit"
-        ]
-      },
-      {
-        "id": "ddk.dpr",
-        "extensions": [
-          ".dpr"
-        ],
-        "aliases": [
-          "Delphi Application File"
-        ]
-      },
-      {
-        "id": "ddk.dproj",
-        "extensions": [
-          ".dproj"
-        ],
-        "aliases": [
-          "Delphi Project File",
-          "Delphi Project Configuration"
-        ]
-      },
-      {
-        "id": "ddk.dpk",
-        "extensions": [
-          ".dpk"
-        ],
-        "aliases": [
-          "Delphi Package File"
-        ]
-      },
-      {
-        "id": "ddk.inc",
-        "extensions": [
-          ".inc"
-        ],
-        "aliases": [
-          "Include File",
-          "Delphi Include File"
         ]
       },
       {
@@ -460,7 +420,8 @@
       {
         "id": "ddk-file-icons",
         "label": "DDK Delphi File Icons",
-        "path": "./config/iconThemes/ddk-file-icons.json"
+        "path": "./config/iconThemes/ddk-file-icons.json",
+        "_watch": true
       }
     ]
   },

@@ -23,8 +23,6 @@ export namespace PROJECTS {
     export const REMOVE_WORKSPACE = `${PROJECTS.CONFIG.KEY}.removeWorkspace`;
     export const ADD_PROJECT = `${PROJECTS.CONFIG.KEY}.addProject`;
     export const REMOVE_PROJECT = `${PROJECTS.CONFIG.KEY}.removeProject`;
-    export const IMPORT_CONFIGURATION = `${PROJECTS.CONFIG.KEY}.importConfiguration`;
-    export const EXPORT_CONFIGURATION = `${PROJECTS.CONFIG.KEY}.exportConfiguration`;
     export const COMPILE = `${PROJECTS.CONFIG.KEY}.compile`;
     export const RECREATE = `${PROJECTS.CONFIG.KEY}.recreate`;
     export const SHOW_IN_EXPLORER = `${PROJECTS.CONFIG.KEY}.showInExplorer`;
@@ -93,4 +91,9 @@ export namespace DFM {
   export enum Commands {
     SWAP_DFM_PAS = 'ddk.dfm.swapToDfmPas'
   }
+}
+
+export namespace COMMANDS {
+  export const IMPORT_CONFIGURATION = 'ddk.importConfiguration';
+  export const EXPORT_CONFIGURATION = 'ddk.exportConfiguration';
 }

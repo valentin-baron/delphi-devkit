@@ -15,13 +15,5 @@
     "dpr": "ddk.dpr",
     "dproj": "ddk.dproj",
     "inc": "ddk.inc"
-  },
-  "languageIds": {
-    "ddk.pas": "ddk.pas",
-    "ddk.dfm": "ddk.dfm",
-    "ddk.dpk": "ddk.dpk",
-    "ddk.dpr": "ddk.dpr",
-    "ddk.dproj": "ddk.dproj",
-    "ddk.inc": "ddk.inc"
   }
 }

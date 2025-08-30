@@ -26,6 +26,65 @@ export namespace Entities {
     @OneToOne(() => GroupProject, { nullable: true, eager: true })
     @JoinColumn()
     selectedGroupProject?: GroupProject | null;
+
+    public static clone(config: Partial<Configuration>): Configuration {
+      const result = new this();
+      result.id = 0;
+      result.groupProjectsCompiler = config.groupProjectsCompiler || null;
+      if (config.selectedGroupProject) {
+        const gp = new GroupProject();
+        result.selectedGroupProject = gp;
+        gp.name = config.selectedGroupProject.name || '';
+        gp.path = config.selectedGroupProject.path || '';
+        gp.projects = (config.selectedGroupProject.projects || []).map((link) => {
+          if (!link || !link.project) return null;
+          const newLink = new GroupProjectLink();
+          newLink.groupProject = gp;
+          newLink.project = this.cloneProject(link.project);
+          newLink.sortValue = link.sortValue || '';
+          return newLink;
+        }).filter((link): link is GroupProjectLink => link !== null);
+      }
+      result.workspaces = [];
+      config.workspaces?.forEach((ws) => {
+        if (!ws) return;
+        const newWs = new Workspace();
+        newWs.name = ws.name || '';
+        newWs.compiler = ws.compiler || (Runtime.compilerConfigurations[0]?.name || '');
+        newWs.sortValue = ws.sortValue || '';
+        newWs.configuration = result;
+        newWs.projects = (ws.projects || []).map((link) => {
+          if (!link || !link.project) return null;
+          const newLink = new WorkspaceLink();
+          newLink.workspace = newWs;
+          newLink.project = this.cloneProject(link.project);
+          newLink.sortValue = link.sortValue || '';
+          return newLink;
+        }).filter((link): link is WorkspaceLink => link !== null);
+        result.workspaces.push(newWs);
+      });
+      if (config.selectedProject) {
+        const wsProject = result.workspaces.flatMap(ws => ws.projects).find(link => link.project.id === config.selectedProject?.id);
+        if (wsProject) result.selectedProject = wsProject.project;
+        else {
+          const gpProject = result.selectedGroupProject?.projects.find(link => link.project.id === config.selectedProject?.id);
+          if (gpProject) result.selectedProject = gpProject.project;
+        }
+      }
+      return result;
+    }
+
+    private static cloneProject(proj: Partial<Project>): Project {
+      const newProj = new Project();
+      newProj.name = proj.name || '';
+      newProj.path = proj.path || '';
+      newProj.dpr = proj.dpr || null;
+      newProj.dpk = proj.dpk || null;
+      newProj.dproj = proj.dproj || null;
+      newProj.exe = proj.exe || null;
+      newProj.ini = proj.ini || null;
+      return newProj;
+    }
   }
 
   export interface ProjectOwner {
