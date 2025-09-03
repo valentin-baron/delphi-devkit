@@ -5,39 +5,42 @@
   "patterns": [
     {
       "name": "meta.compiler-message.delphi",
-      "match": "^(\\[(ERROR|WARN|INFO|HINT)\\])(\\[[A-Z]\\d+\\]) ((?:[A-Za-z]:|/)[^:]+):(\\d+) - (.*)$",
+      "match": "^(\\( [^)]+? \\)) (\\[(ERROR|WARN|INFO|HINT)\\]) (\\[[A-Z]\\d+\\]) ((?:[A-Za-z]:|/)[^:]+):(\\d+) - (.*)$",
       "captures": {
         "1": {
+          "name": "constant.timestamp"
+        },
+        "2": {
           "name": "keyword.control.severity.delphi",
           "patterns": [
             {
               "match": "\\[ERROR\\]",
-              "name": "markup.error"
+              "name": "invalid.illegal.error"
             },
             {
               "match": "\\[WARN\\]",
-              "name": "markup.warning"
+              "name": "meta.return-type.warning"
             },
             {
               "match": "\\[INFO\\]",
-              "name": "markup.info"
+              "name": "meta.preprocessor.string.info"
             },
             {
               "match": "\\[HINT\\]",
-              "name": "markup.hint"
+              "name": "constant.numeric.hint"
             }
           ]
         },
-        "3": {
-          "name": "constant.numeric"
-        },
         "4": {
-          "name": "string.other.link"
+          "name": "constant.numeric.code"
         },
         "5": {
-          "name": "variable.parameter.line-number"
+          "name": "string.other.link"
         },
         "6": {
+          "name": "variable.parameter.line-number"
+        },
+        "7": {
           "name": "comment.message"
         }
       }

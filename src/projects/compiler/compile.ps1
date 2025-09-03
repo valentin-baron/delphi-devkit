@@ -66,6 +66,18 @@ param(
   [Parameter(Mandatory = $true)]
   [string]$CompilerName
 )
+function Test-FileLocked {
+  param([string]$Path)
+  if (-not (Test-Path $Path)) { return $false }
+  try {
+    $fs = [System.IO.File]::Open($Path, 'Open', 'ReadWrite', 'None')
+    $fs.Close()
+    return $false
+  }
+  catch {
+    return $true
+  }
+}
 function Get-CompilerObject {
   param ($line)
 
@@ -103,8 +115,10 @@ function Format-Output {
         $type = 'HINT'
       }
     }
+    # get current formatted time:
+    $timestamp = (Get-Date).ToString("T")
     # Convert Windows-Style path to URI:
-    $outLine = "[$type][$($object.Code)] $($object.FileName):$($object.LineNumber) - $($object.Message)"
+    $outLine = "( $timestamp ) [$type] [$($object.Code)] $($object.FileName):$($object.LineNumber) - $($object.Message)"
     Write-Host $outLine -ForegroundColor $color
   } elseif ($line -ne "") {
     # If no match, just output the line as is
@@ -116,15 +130,15 @@ function Format-Output {
 
 function Draw-Header ([string]$header) {
   function Format-Line ([string]$text, [int]$totalWidth = 70) {
-    $padding = $totalWidth - $text.Length - 2 
+    $padding = $totalWidth - $text.Length - 2
     if ($padding -le 0) {
       return $text
     }
     $leftPadding = [math]::Floor($padding / 2)
     return " " + (" " * $leftPadding) + " $text"
 
-  }  
-  Write-Host "╒══════════════════════════════════════════════════════════════════════╕" 
+  }
+  Write-Host "╒══════════════════════════════════════════════════════════════════════╕"
   Write-Host( Format-Line "🅳🅳🅺 $header 🅳🅳🅺" 72)
   Write-Host( Format-Line "→ $FileName ←" )
   Write-Host( Format-Line "🗲 Action: $ActionDescription" )
@@ -132,6 +146,8 @@ function Draw-Header ([string]$header) {
   Write-Host( Format-Line "🛠 Compiler: $CompilerName" )
   Write-Host "╘══════════════════════════════════════════════════════════════════════╛"
 }
+
+$success = $false
 
 Draw-Header "Compile START"
 
@@ -188,6 +204,22 @@ if (-not (Test-Path $ProjectPath)) {
 try {
   Write-Host "Building project: $ProjectPath" -ForegroundColor Cyan
 
+  # Derive expected primary EXE output (best-effort). For Delphi projects the default is <ProjectName>.exe beside the .dproj
+  $projectDir = [IO.Path]::GetDirectoryName($ProjectPath)
+  $projectBase = [IO.Path]::GetFileNameWithoutExtension($ProjectPath)
+  $expectedExe = Join-Path $projectDir ("$projectBase.exe")
+
+  if (Test-Path $expectedExe) {
+    if (Test-FileLocked -Path $expectedExe) {
+      Write-Host "Target executable appears to be in use: $expectedExe" -ForegroundColor Red
+      Write-Host "Close the running application before compiling." -ForegroundColor Yellow
+      Write-Host "(You can add logic to auto-terminate it if desired.)" -ForegroundColor DarkYellow
+      Write-Host ""; Draw-Header "Compile FAILED"; exit 1
+    }
+  }
+
+  $buildStart = Get-Date
+
   # Build parameters - parse the build arguments string into an array
   $buildArgsArray = $BuildArguments -split ' (?=(?:[^"]|"[^"]*")*$)' | Where-Object { $_ -ne '' }
 
@@ -198,16 +230,19 @@ try {
     Format-Output $_.Trim()
   }
 
-  if ($LASTEXITCODE -eq 0) {
-    Write-Host ""
-    Draw-Header "Compile SUCCESS"
-    Write-Host ""
+  if ($LASTEXITCODE -ne 0) {
+    Write-Host ""; Draw-Header "Compile FAILED"; exit $LASTEXITCODE
   }
-  else {
-    Write-Host ""
-    Draw-Header "Compile FAILED"
-    exit $LASTEXITCODE
+
+  # If an expected exe exists, validate it was updated (helps catch silent skips / lock scenarios)
+  if (Test-Path $expectedExe) {
+    $exeInfo = Get-Item $expectedExe -ErrorAction SilentlyContinue
+    if (-not $exeInfo -or $exeInfo.LastWriteTime -lt $buildStart) {
+      Write-Host ""; Draw-Header "Compile FAILED - exe is locked"; exit 1
+    }
   }
+
+  Write-Host ""; Draw-Header "Compile SUCCESS"; Write-Host ""
 }
 catch {
   Write-Host ""

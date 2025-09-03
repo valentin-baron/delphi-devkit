@@ -1,11 +1,10 @@
-import { Uri, workspace, window, Diagnostic, DiagnosticSeverity, Range, languages, OutputChannel, DiagnosticCollection, DiagnosticTag } from 'vscode';
+import { Uri, workspace, window, languages, OutputChannel } from 'vscode';
 import { basename, dirname, join } from 'path';
 import { spawn } from 'child_process';
 import { Runtime } from '../../runtime';
-import { ProjectItem } from '../trees/items/project';
 import { assertError, fileExists } from '../../utils';
 import { ProjectLinkType } from '../../types';
-import { CompilerOutputDefinitionProvider, CompilerOutputLanguage } from './language';
+import { CompilerOutputDefinitionProvider } from './language';
 import { PROJECTS } from '../../constants';
 import { Entities } from '../../db/entities';
 
@@ -16,23 +15,15 @@ export interface CompilerConfiguration {
   buildArguments: string[];
 }
 
-const DIAGNOSTIC_SEVERITY = {
-  HINT: DiagnosticSeverity.Hint,
-  WARN: DiagnosticSeverity.Warning,
-  ERROR: DiagnosticSeverity.Error
-};
-
 export class Compiler {
   private outputChannel: OutputChannel = window.createOutputChannel('Delphi Compiler', PROJECTS.LANGUAGES.COMPILER);
-  private diagnosticCollection: DiagnosticCollection = languages.createDiagnosticCollection(PROJECTS.LANGUAGES.COMPILER);
   private linkProvider: CompilerOutputDefinitionProvider = new CompilerOutputDefinitionProvider();
 
   constructor() {
     Runtime.extension.subscriptions.push(
       ...[
         this.outputChannel,
-        this.diagnosticCollection,
-        languages.registerDocumentLinkProvider({ language: PROJECTS.LANGUAGES.COMPILER }, this.linkProvider)
+        languages.registerDocumentLinkProvider({ language: PROJECTS.LANGUAGES.COMPILER }, this.linkProvider),
       ]
     );
   }
@@ -132,42 +123,8 @@ export class Compiler {
       proc.stderr.on('data', handleIO);
       proc.on('close', async (code: number) => {
         this.linkProvider.compilerIsActive = false;
-        await resetSmartScroll();
         this.outputChannel.show(true);
-        // Parse and publish diagnostics
-        const lines = output.split(/\r?\n/);
-        const batch = await Promise.all(
-          lines.map(async (line) => {
-            const match = CompilerOutputLanguage.PATTERN.exec(line);
-            if (match) {
-              let filePath: string;
-              let diagnostic: Diagnostic;
-              filePath = match[CompilerOutputLanguage.FILE];
-              const lineNum = parseInt(match[CompilerOutputLanguage.LINE], 10) - 1;
-              const message = `${match[CompilerOutputLanguage.MESSAGE]} [${match[CompilerOutputLanguage.CODE]}]`;
-              const severity = DIAGNOSTIC_SEVERITY[match[CompilerOutputLanguage.SEVERITY].toUpperCase() as keyof typeof DIAGNOSTIC_SEVERITY];
-              diagnostic = new Diagnostic(new Range(lineNum, 0, lineNum, 1000), message, severity);
-              diagnostic.code = match[CompilerOutputLanguage.CODE];
-              if (diagnostic.code === 'W1000') diagnostic.tags = [DiagnosticTag.Deprecated];
-              return [filePath, diagnostic] as [string, Diagnostic];
-            }
-          })
-        );
-        this.diagnosticCollection.clear();
-        const diagnosticsArray: [string, Diagnostic[]][] = batch
-          .filter((item): item is [string, Diagnostic] => item !== undefined)
-          .reduce((acc, [filePath, diagnostic]) => {
-            const existing = acc.find(([path]) => path === filePath);
-            if (existing) existing[1].push(diagnostic);
-            else acc.push([filePath, [diagnostic]]);
-
-            return acc;
-          }, [] as [string, Diagnostic[]][]);
-        await Promise.all(
-          diagnosticsArray.map(async ([filePath, diagnostics]) => {
-            this.diagnosticCollection.set(Uri.file(filePath), diagnostics);
-          })
-        );
+        await resetSmartScroll();
         if (code === 0) window.showInformationMessage('Build succeeded');
         else window.showErrorMessage('Build failed');
       });
