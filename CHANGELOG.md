@@ -53,6 +53,8 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 - [x] Fixing Diagnostics to show correct types of issues.
 - [x] Linking the compiler output to files.
 - [ ] Add timestamps to compiler output lines.
+- [ ] Delphi Formatter
+- [ ] selected Project doesnt work when the tree is collapsed.
 - [ ] Support for compiling / recreating all projects in a workspace / group project.
 - [ ] Support for commandline execution of unit tests (DUnit).
 - [ ] Integrate Delphi Language Server with background compiler. For now, you can use the [OmniPascal extension](https://marketplace.visualstudio.com/items?itemName=Wosi.omnipascal).

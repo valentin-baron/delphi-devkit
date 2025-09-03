@@ -1,40 +1,94 @@
 name: Publish VS Code Extension
 
 on:
-  workflow_dispatch:
-    inputs:
-      release_type:
-        description: "Release type"
-        required: true
-        default: "pre-release"
-        type: choice
-        options:
-          - "pre-release"
-          - "release"
+  push:
+    tags:
+      - 'r/*.*.*'      # Release tags
+      - 'pre/*.*.*'    # Pre-release tags
+
+# This workflow is tag-driven. Tag formats:
+#   r/1.2.3   -> stable release
+#   pre/1.2.3 -> pre-release
+# The tagged commit must be the HEAD of main (enforced below).
 
 jobs:
   publish:
+    name: Publish
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    if: startsWith(github.ref, 'refs/tags/r/') || startsWith(github.ref, 'refs/tags/pre/')
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure tag commit is HEAD of main
+        run: |
+          git fetch origin main --depth=1
+          MAIN_SHA=$(git rev-parse origin/main)
+          if [ "$GITHUB_SHA" != "$MAIN_SHA" ]; then
+            echo "Tag commit ($GITHUB_SHA) is not HEAD of main ($MAIN_SHA)." >&2
+            exit 1
+          fi
+
+      - name: Derive release flags
+        run: |
+          REF_NAME="${GITHUB_REF#refs/tags/}" # e.g. r/1.2.3 or pre/1.2.3
+          if [[ "$REF_NAME" == pre/* ]]; then
+            echo "IS_PRE=true" >> $GITHUB_ENV
+            echo "RELEASE_CHANNEL=pre" >> $GITHUB_ENV
+          else
+            echo "IS_PRE=false" >> $GITHUB_ENV
+            echo "RELEASE_CHANNEL=stable" >> $GITHUB_ENV
+          fi
+          VERSION_PART=${REF_NAME#*/}
+          echo "TAG_VERSION=$VERSION_PART" >> $GITHUB_ENV
+
+      - name: Show derived info
+        run: |
+          echo "Channel: $RELEASE_CHANNEL"
+          echo "Version from tag: $TAG_VERSION"
+          echo "Pre-release: $IS_PRE"
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
-          cache: "npm"
+          node-version: '22'
+          cache: 'npm'
+
       - name: Install dependencies
         run: npm ci
+
+      - name: Verify package.json version matches tag version
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "package.json version ($PKG_VERSION) does not match tag version ($TAG_VERSION)." >&2
+            exit 1
+          fi
+
       - name: Compile extension
         run: npm run compile
+
       - name: Install vsce
         run: npm install -g @vscode/vsce
-      - name: Publish extension
+
+      - name: Publish extension to Marketplace
         run: |
-          if [ "${{ github.event.inputs.release_type }}" = "pre-release" ]; then
+          if [ "$IS_PRE" = "true" ]; then
             vsce publish --pre-release
           else
             vsce publish
           fi
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
+
+      - name: Create / Update GitHub Release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          prerelease: ${{ startsWith(github.ref_name, 'pre/') }}
+          generateReleaseNotes: true
