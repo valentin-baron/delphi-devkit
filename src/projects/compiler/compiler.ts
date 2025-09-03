@@ -7,6 +7,7 @@ import { assertError, fileExists } from '../../utils';
 import { ProjectLinkType } from '../../types';
 import { CompilerOutputDefinitionProvider, CompilerOutputLanguage } from './language';
 import { PROJECTS } from '../../constants';
+import { Entities } from '../../db/entities';
 
 export interface CompilerConfiguration {
   name: string;
@@ -36,26 +37,26 @@ export class Compiler {
     );
   }
 
-  public async compileWorkspaceItem(project: ProjectItem, recreate: boolean = false): Promise<void> {
-    const path = project.entity.dproj || project.entity.dpr || project.entity.dpk;
+  public async compileWorkspaceItem(link: Entities.ProjectLink, recreate: boolean = false): Promise<void> {
+    const path = link.project.dproj || link.project.dpr || link.project.dpk;
     if (!assertError(path, 'No suitable project file (DPROJ, DPR, DPK) found to compile.')) return;
 
     const fileUri = Uri.file(path!);
-    if (!assertError(project.link.linkType === ProjectLinkType.Workspace, 'Project does not belong to a workspace.')) return;
+    if (!assertError(link.linkType === ProjectLinkType.Workspace, 'Project does not belong to a workspace.')) return;
 
-    const ws = project.link.workspaceSafe;
+    const ws = link.workspaceSafe;
     if (!assertError(ws, 'Cannot determine workspace for project.')) return;
 
     await this.compile(fileUri, ws!.compiler, recreate);
   }
 
-  public async compileGroupProjectItem(project: ProjectItem, recreate: boolean = false): Promise<void> {
-    const path = project.entity.dproj || project.entity.dpr || project.entity.dpk;
+  public async compileGroupProjectItem(link: Entities.ProjectLink, recreate: boolean = false): Promise<void> {
+    const path = link.project.dproj || link.project.dpr || link.project.dpk;
     if (!path) {
       window.showErrorMessage('No suitable project file (DPROJ, DPR, DPK) found to compile.');
       return;
     }
-    if (!assertError(project.link.linkType === ProjectLinkType.GroupProject, 'Project does not belong to a group project.')) return;
+    if (!assertError(link.linkType === ProjectLinkType.GroupProject, 'Project does not belong to a group project.')) return;
 
     const fileUri = Uri.file(path);
     const config = Runtime.configEntity;

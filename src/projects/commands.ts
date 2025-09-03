@@ -28,49 +28,48 @@ export namespace ProjectsCommands {
       ];
     }
 
-    private static async selectedProjectAction(callback: Coroutine<void, [ProjectItem]>): Promise<void> {
+    private static async selectedProjectAction(callback: Coroutine<void, [Entities.ProjectLink]>): Promise<void> {
       const config = Runtime.configEntity;
-      if (!config.selectedProject) return;
       const project = config.selectedProject;
-      const item =
-        Runtime.projects.workspacesTreeView.projects.find((i) => i.entity.id === project.id) ||
-        Runtime.projects.groupProjectTreeView.projects.find((i) => i.entity.id === project.id);
-      if (!item) return;
-      await callback(item);
+      if (!assertError(project, 'Could not evaluate selected project.')) return;
+      const link = Runtime.projects.workspacesTreeView.projects.find((i) => i.entity.id === project!.id)?.link ||
+        Runtime.projects.groupProjectTreeView.projects.find((i) => i.entity.id === project!.id)?.link;
+      if (!assertError(link, 'Could not find valid project link for the selected project.')) return;
+      await callback(link!);
     }
 
     private static async compileSelectedProject() {
-      await this.selectedProjectAction(async (item) => {
-        switch (item.link.linkType) {
+      await this.selectedProjectAction(async (link) => {
+        switch (link.linkType) {
           case ProjectLinkType.Workspace:
-            Runtime.projects.compiler.compileWorkspaceItem(item, false);
+            Runtime.projects.compiler.compileWorkspaceItem(link, false);
             break;
           case ProjectLinkType.GroupProject:
-            Runtime.projects.compiler.compileGroupProjectItem(item, false);
+            Runtime.projects.compiler.compileGroupProjectItem(link, false);
             break;
         }
       });
     }
 
     private static async recreateSelectedProject() {
-      await this.selectedProjectAction(async (item) => {
-        switch (item.link.linkType) {
+      await this.selectedProjectAction(async (link) => {
+        switch (link.linkType) {
           case ProjectLinkType.Workspace:
-            Runtime.projects.compiler.compileWorkspaceItem(item, true);
+            Runtime.projects.compiler.compileWorkspaceItem(link, true);
             break;
           case ProjectLinkType.GroupProject:
-            Runtime.projects.compiler.compileGroupProjectItem(item, true);
+            Runtime.projects.compiler.compileGroupProjectItem(link, true);
             break;
         }
       });
     }
 
     private static async runSelectedProject() {
-      await this.selectedProjectAction(async (item) => {
-        if (!item.projectExe) return;
+      await this.selectedProjectAction(async (link) => {
+        if (!link.project.exe) return;
         try {
           // Use the system's default application handler to launch the executable
-          await env.openExternal(item.projectExe);
+          await env.openExternal(Uri.file(link.project.exe));
         } catch (error) {
           window.showErrorMessage(`Failed to launch executable: ${error}`);
         }
@@ -94,10 +93,10 @@ export namespace ProjectsCommands {
     private static async compile(item: BaseFileItem): Promise<void> {
       switch (item.project.link.linkType) {
         case ProjectLinkType.Workspace:
-          Runtime.projects.compiler.compileWorkspaceItem(item.project as ProjectItem, false);
+          Runtime.projects.compiler.compileWorkspaceItem(item.project.link, false);
           break;
         case ProjectLinkType.GroupProject:
-          Runtime.projects.compiler.compileGroupProjectItem(item.project as ProjectItem, false);
+          Runtime.projects.compiler.compileGroupProjectItem(item.project.link, false);
           break;
       }
     }
@@ -105,10 +104,10 @@ export namespace ProjectsCommands {
     private static async recreate(item: BaseFileItem): Promise<void> {
       switch (item.project.link.linkType) {
         case ProjectLinkType.Workspace:
-          Runtime.projects.compiler.compileWorkspaceItem(item.project as ProjectItem, true);
+          Runtime.projects.compiler.compileWorkspaceItem(item.project.link, true);
           break;
         case ProjectLinkType.GroupProject:
-          Runtime.projects.compiler.compileGroupProjectItem(item.project as ProjectItem, true);
+          Runtime.projects.compiler.compileGroupProjectItem(item.project.link, true);
           break;
       }
     }
