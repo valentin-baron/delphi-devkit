@@ -56,6 +56,7 @@ export class DatabaseController {
       await AppDataSource.transaction(async (manager) => {
         await manager.remove(workspace);
       });
+    await Runtime.refreshConfigEntity();
   }
 
   public async addGroupProject(name: string, path: string, projects: Entities.Project[]): Promise<Entities.GroupProject> {
@@ -80,6 +81,7 @@ export class DatabaseController {
       await AppDataSource.transaction(async (manager) => {
         await manager.remove(groupProject);
       });
+    await Runtime.refreshConfigEntity();
   }
 
   public async getGroupProject(path: string): Promise<Entities.GroupProject | null> {
@@ -102,6 +104,7 @@ export class DatabaseController {
         const groupProjectLinks = await manager.find(Entities.GroupProjectLink, { where: { project: link.project } });
         if (workspaceLinks.length === 0 && groupProjectLinks.length === 0) await manager.remove(link.project);
       });
+    await Runtime.refreshConfigEntity();
   }
 
   public async removeProject(project: Entities.Project): Promise<void> {
@@ -109,5 +112,6 @@ export class DatabaseController {
       await AppDataSource.transaction(async (manager) => {
         await manager.remove(project);
       });
+    await Runtime.refreshConfigEntity();
   }
 }
