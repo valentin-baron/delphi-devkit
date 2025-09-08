@@ -13,12 +13,19 @@ import { ProjectLinkType } from '../types';
 import { WorkspaceItem } from './trees/items/workspaceItem';
 import { LexoSorter } from '../utils/lexoSorter';
 
+    // export const COMPILE_ALL_IN_GROUP_PROJECT = `${PROJECTS.CONFIG.KEY}.compileAllInGroupProject`;
+    // export const RECREATE_ALL_IN_GROUP_PROJECT = `${PROJECTS.CONFIG.KEY}.recreateAllInGroupProject`;
+    // export const COMPILE_ALL_IN_WORKSPACE = `${PROJECTS.CONFIG.KEY}.compileAllInWorkspace`;
+    // export const RECREATE_ALL_IN_WORKSPACE = `${PROJECTS.CONFIG.KEY}.recreateAllInWorkspace`;
+    // export const COMPILE_ALL_FROM_HERE = `${PROJECTS.CONFIG.KEY}.compileAllFromHere`;
+    // export const RECREATE_ALL_FROM_HERE = `${PROJECTS.CONFIG.KEY}.recreateAllFromHere`;
 export namespace ProjectsCommands {
   export function register() {
     Runtime.extension.subscriptions.push(
       ...[...SelectedProject.registers, ...ContextMenu.registers, ...Compiler.registers, ...ProjectsTreeView.registers, ...Configuration.registers]
     );
   }
+
   export class SelectedProject {
     public static get registers(): Disposable[] {
       return [
@@ -86,7 +93,11 @@ export namespace ProjectsCommands {
         commands.registerCommand(PROJECTS.COMMAND.OPEN_IN_FILE_EXPLORER, this.openInFileExplorer.bind(this)),
         commands.registerCommand(PROJECTS.COMMAND.RUN_EXECUTABLE, this.runExecutable.bind(this)),
         commands.registerCommand(PROJECTS.COMMAND.CONFIGURE_OR_CREATE_INI, this.configureOrCreateIni.bind(this)),
-        commands.registerCommand(PROJECTS.COMMAND.SELECT_PROJECT, this.selectProject.bind(this))
+        commands.registerCommand(PROJECTS.COMMAND.SELECT_PROJECT, this.selectProject.bind(this)),
+        commands.registerCommand(PROJECTS.COMMAND.COMPILE_ALL_IN_WORKSPACE, this.compileAllInWorkspace.bind(this)),
+        commands.registerCommand(PROJECTS.COMMAND.RECREATE_ALL_IN_WORKSPACE, this.recreateAllInWorkspace.bind(this)),
+        commands.registerCommand(PROJECTS.COMMAND.COMPILE_ALL_FROM_HERE, this.compileAllFromHere.bind(this)),
+        commands.registerCommand(PROJECTS.COMMAND.RECREATE_ALL_FROM_HERE, this.recreateAllFromHere.bind(this)),
       ];
     }
 
@@ -185,6 +196,78 @@ export namespace ProjectsCommands {
       await Runtime.projects.groupProjectTreeView.refresh();
       window.showInformationMessage(`Selected project: ${item.label}`);
     }
+
+    private static async compileAllInWorkspace(item: TreeItem): Promise<void> {
+      const wsItem = Runtime.projects.workspacesTreeView.getWorkspaceByTreeItem(item);
+      if (!assertError(wsItem?.workspace, 'Could not determine workspace from the selected item.')) return;
+      for (const link of wsItem!.workspace.projects) {
+        if (!assertError(link.project, 'Project not found in link.')) return;
+        if (!(await Runtime.projects.compiler.compileWorkspaceItem(link, false))) return;
+      }
+    }
+
+    private static async recreateAllInWorkspace(item: TreeItem): Promise<void> {
+      const wsItem = Runtime.projects.workspacesTreeView.getWorkspaceByTreeItem(item);
+      if (!assertError(wsItem?.workspace, 'Could not determine workspace from the selected item.')) return;
+      for (const link of wsItem!.workspace.projects) {
+        if (!assertError(link.project, 'Project not found in link.')) return;
+        if (!(await Runtime.projects.compiler.compileWorkspaceItem(link, true))) return;
+      }
+    }
+
+    private static async compileAllFromHere(item: BaseFileItem): Promise<void> {
+      let startIndex = -1;
+      switch (item.project.link.linkType) {
+        case ProjectLinkType.Workspace:
+          const wsItem = Runtime.projects.workspacesTreeView.getWorkspaceByTreeItem(item);
+          if (!assertError(wsItem?.workspace, 'Could not determine workspace from the selected item.')) return;
+          startIndex = wsItem!.projects.findIndex((p) => p.entity.id === item.project.entity.id);
+          if (startIndex === -1) return;
+          for (let i = startIndex; i < wsItem!.projects.length; i++) {
+            const link = wsItem!.projects[i].link;
+            if (!assertError(link.project, 'Project not found in link.')) return;
+            if (!(await Runtime.projects.compiler.compileWorkspaceItem(link, false))) return;
+          }
+          break;
+        case ProjectLinkType.GroupProject:
+          const projects = Runtime.projects.groupProjectTreeView.projects;
+          startIndex = projects.findIndex((p) => p.entity.id === item.project.entity.id);
+          if (startIndex === -1) return;
+          for (let i = startIndex; i < projects.length; i++) {
+            const link = projects[i].link;
+            if (!assertError(link.project, 'Project not found in link.')) return;
+            if (!(await Runtime.projects.compiler.compileGroupProjectItem(link, false))) return;
+          }
+          break;
+      }
+    }
+
+    private static async recreateAllFromHere(item: BaseFileItem): Promise<void> {
+      let startIndex = -1;
+      switch (item.project.link.linkType) {
+        case ProjectLinkType.Workspace:
+          const wsItem = Runtime.projects.workspacesTreeView.getWorkspaceByTreeItem(item);
+          if (!assertError(wsItem?.workspace, 'Could not determine workspace from the selected item.')) return;
+          startIndex = wsItem!.projects.findIndex((p) => p.entity.id === item.project.entity.id);
+          if (startIndex === -1) return;
+          for (let i = startIndex; i < wsItem!.projects.length; i++) {
+            const link = wsItem!.projects[i].link;
+            if (!assertError(link.project, 'Project not found in link.')) return;
+            if (!(await Runtime.projects.compiler.compileWorkspaceItem(link, true))) return;
+          }
+          break;
+        case ProjectLinkType.GroupProject:
+          const projects = Runtime.projects.groupProjectTreeView.projects;
+          startIndex = projects.findIndex((p) => p.entity.id === item.project.entity.id);
+          if (startIndex === -1) return;
+          for (let i = startIndex; i < projects.length; i++) {
+            const link = projects[i].link;
+            if (!assertError(link.project, 'Project not found in link.')) return;
+            if (!(await Runtime.projects.compiler.compileGroupProjectItem(link, true))) return;
+          }
+          break;
+      }
+    }
   }
 
   export class Compiler {
@@ -228,7 +311,9 @@ export namespace ProjectsCommands {
         commands.registerCommand(PROJECTS.COMMAND.REFRESH, this.refreshDelphiProjects.bind(this)),
         commands.registerCommand(PROJECTS.COMMAND.SELECT_GROUP_PROJECT, this.pickGroupProject.bind(this)),
         commands.registerCommand(PROJECTS.COMMAND.UNLOAD_GROUP_PROJECT, this.unloadGroupProject.bind(this)),
-        commands.registerCommand(PROJECTS.COMMAND.EDIT_DEFAULT_INI, this.editDefaultIni.bind(this))
+        commands.registerCommand(PROJECTS.COMMAND.EDIT_DEFAULT_INI, this.editDefaultIni.bind(this)),
+        commands.registerCommand(PROJECTS.COMMAND.COMPILE_ALL_IN_GROUP_PROJECT, this.compileAllInGroupProject.bind(this)),
+        commands.registerCommand(PROJECTS.COMMAND.RECREATE_ALL_IN_GROUP_PROJECT, this.recreateAllInGroupProject.bind(this)),
       ];
     }
 
@@ -272,6 +357,24 @@ export namespace ProjectsCommands {
         await commands.executeCommand('vscode.open', Uri.file(defaultIniPath));
       } catch (error) {
         window.showErrorMessage(`Failed to open default.ini: ${error}`);
+      }
+    }
+
+    private static async compileAllInGroupProject(item: TreeItem): Promise<void> {
+      const projects = Runtime.projects.groupProjectTreeView.projects;
+      for (const proj of projects) {
+        const link = proj.link;
+        if (!assertError(link.project, 'Project not found in link.')) return;
+        if (!(await Runtime.projects.compiler.compileGroupProjectItem(link, false))) return;
+      }
+    }
+
+    private static async recreateAllInGroupProject(item: TreeItem): Promise<void> {
+      const projects = Runtime.projects.groupProjectTreeView.projects;
+      for (const proj of projects) {
+        const link = proj.link;
+        if (!assertError(link.project, 'Project not found in link.')) return;
+        if (!(await Runtime.projects.compiler.compileGroupProjectItem(link, true))) return;
       }
     }
   }

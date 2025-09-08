@@ -25,6 +25,12 @@ export namespace PROJECTS {
     export const REMOVE_PROJECT = `${PROJECTS.CONFIG.KEY}.removeProject`;
     export const COMPILE = `${PROJECTS.CONFIG.KEY}.compile`;
     export const RECREATE = `${PROJECTS.CONFIG.KEY}.recreate`;
+    export const COMPILE_ALL_IN_GROUP_PROJECT = `${PROJECTS.CONFIG.KEY}.compileAllInGroupProject`;
+    export const RECREATE_ALL_IN_GROUP_PROJECT = `${PROJECTS.CONFIG.KEY}.recreateAllInGroupProject`;
+    export const COMPILE_ALL_IN_WORKSPACE = `${PROJECTS.CONFIG.KEY}.compileAllInWorkspace`;
+    export const RECREATE_ALL_IN_WORKSPACE = `${PROJECTS.CONFIG.KEY}.recreateAllInWorkspace`;
+    export const COMPILE_ALL_FROM_HERE = `${PROJECTS.CONFIG.KEY}.compileAllFromHere`;
+    export const RECREATE_ALL_FROM_HERE = `${PROJECTS.CONFIG.KEY}.recreateAllFromHere`;
     export const SHOW_IN_EXPLORER = `${PROJECTS.CONFIG.KEY}.showInExplorer`;
     export const OPEN_IN_FILE_EXPLORER = `${PROJECTS.CONFIG.KEY}.openInFileExplorer`;
     export const RUN_EXECUTABLE = `${PROJECTS.CONFIG.KEY}.runExecutable`;

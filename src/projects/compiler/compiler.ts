@@ -29,32 +29,27 @@ export class Compiler {
     );
   }
 
-  public async compileWorkspaceItem(link: Entities.ProjectLink, recreate: boolean = false): Promise<void> {
+  public async compileWorkspaceItem(link: Entities.ProjectLink, recreate: boolean = false): Promise<boolean> {
     const path = link.project.dproj || link.project.dpr || link.project.dpk;
-    if (!assertError(path, 'No suitable project file (DPROJ, DPR, DPK) found to compile.')) return;
+    if (!assertError(path, 'No suitable project file (DPROJ, DPR, DPK) found to compile.')) return false;
+    if (!assertError(link.linkType === ProjectLinkType.Workspace, 'Project does not belong to a workspace.')) return false;
 
     const fileUri = Uri.file(path!);
-    if (!assertError(link.linkType === ProjectLinkType.Workspace, 'Project does not belong to a workspace.')) return;
-
     const ws = link.workspaceSafe;
-    if (!assertError(ws, 'Cannot determine workspace for project.')) return;
+    if (!assertError(ws, 'Cannot determine workspace for project.')) return false;
 
-    await this.compile(link, fileUri, ws!.compiler, recreate);
+    return await this.compile(link, fileUri, ws!.compiler, recreate);
   }
 
-  public async compileGroupProjectItem(link: Entities.ProjectLink, recreate: boolean = false): Promise<void> {
+  public async compileGroupProjectItem(link: Entities.ProjectLink, recreate: boolean = false): Promise<boolean> {
     const path = link.project.dproj || link.project.dpr || link.project.dpk;
-    if (!path) {
-      window.showErrorMessage('No suitable project file (DPROJ, DPR, DPK) found to compile.');
-      return;
-    }
-    if (!assertError(link.linkType === ProjectLinkType.GroupProject, 'Project does not belong to a group project.')) return;
-
-    const fileUri = Uri.file(path);
+    if (!assertError(path, 'No suitable project file (DPROJ, DPR, DPK) found to compile.')) return false;
+    if (!assertError(link.linkType === ProjectLinkType.GroupProject, 'Project does not belong to a group project.')) return false;
     const config = Runtime.configEntity;
-    if (!assertError(config.groupProjectsCompiler, 'No compiler configuration set for group projects. Please select one.')) return;
+    const fileUri = Uri.file(path!);
+    if (!assertError(config.groupProjectsCompiler, 'No compiler configuration set for group projects. Please select one.')) return false;
 
-    await this.compile(link, fileUri, config.groupProjectsCompiler!, recreate);
+    return await this.compile(link, fileUri, config.groupProjectsCompiler!, recreate);
   }
 
   private async compile(
@@ -62,19 +57,13 @@ export class Compiler {
     file: Uri,
     configName: string,
     recreate: boolean = false
-  ): Promise<void> {
+  ): Promise<boolean> {
     // Use OutputChannel and diagnostics
     this.currentlyCompilingProjectId = link.project.id;
     try {
-      if (!fileExists(file)) {
-        window.showErrorMessage(`Project file not found: ${file.fsPath}`);
-        return;
-      }
+      if (!assertError(fileExists(file), `Project file not found: ${file.fsPath}`)) return false;
       const cfg = Runtime.compilerConfigurations.find((cfg) => cfg.name === configName);
-      if (cfg === undefined) {
-        window.showErrorMessage(`Compiler configuration not found: ${configName}`);
-        return;
-      }
+      if (assertError(cfg !== undefined, `Compiler configuration not found: ${configName}`)) return false;
       const config: CompilerConfiguration = cfg!;
       const fileName = basename(file.fsPath);
       const projectDir = dirname(file.fsPath);
@@ -134,11 +123,14 @@ export class Compiler {
         await resetSmartScroll();
         if (code === 0) window.showInformationMessage('Build succeeded');
         else window.showErrorMessage('Build failed');
+        return code === 0;
       });
     } catch (error) {
       window.showErrorMessage(`Failed to ${recreate ? 'recreate' : 'compile'} project: ${error}`);
+      return false;
     } finally {
       this.currentlyCompilingProjectId = -1;
     }
+    return false;
   }
 }
