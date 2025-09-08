@@ -18,6 +18,7 @@ export interface CompilerConfiguration {
 export class Compiler {
   private outputChannel: OutputChannel = window.createOutputChannel('Delphi Compiler', PROJECTS.LANGUAGES.COMPILER);
   private linkProvider: CompilerOutputDefinitionProvider = new CompilerOutputDefinitionProvider();
+  public currentlyCompilingProjectId: number = -1;
 
   constructor() {
     Runtime.extension.subscriptions.push(
@@ -38,7 +39,7 @@ export class Compiler {
     const ws = link.workspaceSafe;
     if (!assertError(ws, 'Cannot determine workspace for project.')) return;
 
-    await this.compile(fileUri, ws!.compiler, recreate);
+    await this.compile(link, fileUri, ws!.compiler, recreate);
   }
 
   public async compileGroupProjectItem(link: Entities.ProjectLink, recreate: boolean = false): Promise<void> {
@@ -53,11 +54,17 @@ export class Compiler {
     const config = Runtime.configEntity;
     if (!assertError(config.groupProjectsCompiler, 'No compiler configuration set for group projects. Please select one.')) return;
 
-    await this.compile(fileUri, config.groupProjectsCompiler!, recreate);
+    await this.compile(link, fileUri, config.groupProjectsCompiler!, recreate);
   }
 
-  private async compile(file: Uri, configName: string, recreate: boolean = false): Promise<void> {
+  private async compile(
+    link: Entities.ProjectLink,
+    file: Uri,
+    configName: string,
+    recreate: boolean = false
+  ): Promise<void> {
     // Use OutputChannel and diagnostics
+    this.currentlyCompilingProjectId = link.project.id;
     try {
       if (!fileExists(file)) {
         window.showErrorMessage(`Project file not found: ${file.fsPath}`);
@@ -130,6 +137,8 @@ export class Compiler {
       });
     } catch (error) {
       window.showErrorMessage(`Failed to ${recreate ? 'recreate' : 'compile'} project: ${error}`);
+    } finally {
+      this.currentlyCompilingProjectId = -1;
     }
   }
 }

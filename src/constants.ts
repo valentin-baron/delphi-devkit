@@ -62,6 +62,7 @@ export namespace PROJECTS {
     export const DEFAULT = 'ddk';
     export const SELECTED = `${DEFAULT}.selected`;
     export const MISSING = `${DEFAULT}.missing`;
+    export const COMPILING = `${DEFAULT}.compiling`;
   }
 
   export namespace MIME_TYPES {

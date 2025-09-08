@@ -29,9 +29,13 @@ export class ProjectItem extends BaseFileItem implements SortedItem, MainProject
       Runtime.setContext(PROJECTS.CONTEXT.IS_PROJECT_SELECTED, true);
       Runtime.setContext(PROJECTS.CONTEXT.DOES_SELECTED_PROJECT_HAVE_EXE, !!entity.exe);
     }
-    const resourceUri = selected
-      ? Uri.from({ scheme: PROJECTS.SCHEME.SELECTED, path: uriPath })
-      : Uri.from({ scheme: PROJECTS.SCHEME.DEFAULT, path: uriPath });
+    let resourceUri: Uri;
+    if (Runtime.projects.isCurrentlyCompiling(entity))
+      resourceUri = Uri.from({ scheme: PROJECTS.SCHEME.COMPILING, path: uriPath });
+    else
+      resourceUri = selected
+        ? Uri.from({ scheme: PROJECTS.SCHEME.SELECTED, path: uriPath })
+        : Uri.from({ scheme: PROJECTS.SCHEME.DEFAULT, path: uriPath });
     super(DelphiProjectTreeItemType.Project, entity.name, resourceUri);
     this.entity = entity;
     this.project = this;
@@ -97,52 +101,52 @@ export class ProjectItem extends BaseFileItem implements SortedItem, MainProject
     switch (type) {
       case DelphiProjectTreeItemType.DprojFile:
         uri = this.projectDproj;
-        if (uri?.fsPath) 
+        if (uri?.fsPath)
           item = new DprojFileItem(
-            this, 
-            basename(uri!.fsPath), 
+            this,
+            basename(uri!.fsPath),
             fileExists(uri) ? uri : Uri.from({ scheme: PROJECTS.SCHEME.MISSING, path: uri.fsPath })
-          );  
+          );
 
         break;
       case DelphiProjectTreeItemType.DprFile:
         uri = this.projectDpr;
-        if (uri?.fsPath) 
+        if (uri?.fsPath)
           item = new DprFileItem(
-            this, 
-            basename(uri!.fsPath), 
+            this,
+            basename(uri!.fsPath),
             fileExists(uri) ? uri : Uri.from({ scheme: PROJECTS.SCHEME.MISSING, path: uri.fsPath })
-          ); 
+          );
 
         break;
       case DelphiProjectTreeItemType.DpkFile:
         uri = this.projectDpk;
-        if (uri?.fsPath) 
+        if (uri?.fsPath)
           item = new DpkFileItem(
-            this, 
-            basename(uri!.fsPath), 
+            this,
+            basename(uri!.fsPath),
             fileExists(uri) ? uri : Uri.from({ scheme: PROJECTS.SCHEME.MISSING, path: uri.fsPath })
-          ); 
+          );
 
         break;
       case DelphiProjectTreeItemType.ExecutableFile:
         uri = this.projectExe;
-        if (uri?.fsPath) 
+        if (uri?.fsPath)
           item = new ExeFileItem(
-            this, 
-            basename(uri!.fsPath), 
+            this,
+            basename(uri!.fsPath),
             fileExists(uri) ? uri : Uri.from({ scheme: PROJECTS.SCHEME.MISSING, path: uri.fsPath })
-        ); 
+        );
 
         break;
       case DelphiProjectTreeItemType.IniFile:
         uri = this.projectIni;
-        if (uri?.fsPath) 
+        if (uri?.fsPath)
           item = new IniFileItem(
-            this, 
-            basename(uri!.fsPath), 
+            this,
+            basename(uri!.fsPath),
             fileExists(uri) ? uri : Uri.from({ scheme: PROJECTS.SCHEME.MISSING, path: uri.fsPath })
-        ); 
+        );
 
         break;
     }

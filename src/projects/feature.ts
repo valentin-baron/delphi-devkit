@@ -5,6 +5,7 @@ import { GroupProjectTreeView, WorkspacesTreeView } from './trees/treeView';
 import { ProjectsCommands } from './commands';
 import { GroupProjectPicker } from './pickers/groupProjPicker';
 import { ProjectItem } from './trees/items/project';
+import { Entities } from '../db/entities';
 
 export class ProjectsFeature implements Feature {
   public workspacesTreeView: WorkspacesTreeView = new WorkspacesTreeView();
@@ -24,5 +25,9 @@ export class ProjectsFeature implements Feature {
       case ProjectLinkType.GroupProject:
         return this.groupProjectTreeView.projects.find((proj) => proj.link.id === id);
     }
+  }
+
+  public isCurrentlyCompiling(project: Entities.Project): boolean {
+    return this.compiler.currentlyCompilingProjectId === project.id;
   }
 }
