@@ -40,6 +40,9 @@ const copyAssetsPlugin = {
 
 			const changelog = path.join(__dirname, 'CHANGELOG.md');
 			copyAsset(changelog);
+
+			const formatterConfig = path.join(__dirname, 'config', 'ddk_formatter.config');
+			copyAsset(formatterConfig);
 		});
 	},
 };

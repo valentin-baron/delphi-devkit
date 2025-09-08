@@ -170,6 +170,11 @@
         "title": "Swap .DFM/.PAS",
         "when": "editorTextFocus && (resourceExtname == '.pas' || resourceExtname == '.dfm')",
         "category": "DDK"
+      },
+      {
+        "command": "ddk.editFormatterConfig",
+        "title": "Edit Formatter Configuration",
+        "category": "DDK"
       }
     ],
     "views": {
@@ -343,6 +348,37 @@
     "configuration": {
       "title": "Delphi Development Kit",
       "properties": {
+        "ddk.formatter.enable": {
+          "type": "boolean",
+          "title": "Enable Delphi Formatter",
+          "default": true,
+          "description": "Enable the Delphi Formatter integration (requires Formatter.exe)."
+        },
+        "ddk.formatter.path": {
+          "type": "string",
+          "title": "Formatter.exe Path",
+          "default": "C:\\Program Files (x86)\\Embarcadero\\Studio\\23.0\\bin\\Formatter.exe",
+          "description": "Path to the Formatter.exe.",
+          "scope": "resource"
+        },
+        "ddk.formatter.args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "-silent"
+          ],
+          "description": "Arguments to pass to Formatter.exe. The default uses the provided ddk_formatter.config.",
+          "scope": "resource"
+        },
+        "ddk.formatter.formatOnSave": {
+          "type": "boolean",
+          "title": "Format On Save",
+          "default": false,
+          "description": "Automatically format the file when saving.",
+          "scope": "resource"
+        },
         "ddk.projects.compiler.configurations": {
           "type": "array",
           "items": {
@@ -419,8 +455,7 @@
       {
         "id": "ddk-file-icons",
         "label": "DDK Delphi File Icons",
-        "path": "./config/iconThemes/ddk-file-icons.json",
-        "_watch": true
+        "path": "./config/iconThemes/ddk-file-icons.json"
       }
     ]
   },

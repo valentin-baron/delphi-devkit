@@ -101,3 +101,16 @@ export namespace COMMANDS {
   export const IMPORT_CONFIGURATION = 'ddk.importConfiguration';
   export const EXPORT_CONFIGURATION = 'ddk.exportConfiguration';
 }
+
+export namespace FORMAT {
+  export const KEY = 'ddk.formatter';
+  export namespace CONFIG {
+    export const ENABLE   = `enable`;
+    export const PATH     = `path`;
+    export const ARGS     = `args`;
+    export const ON_SAVE  = `formatOnSave`;
+  }
+  export namespace COMMAND {
+    export const EDIT_FORMATTER_CONFIG = `${FORMAT.KEY}.editFormatterConfig`;
+  }
+}
