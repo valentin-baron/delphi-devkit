@@ -14,7 +14,7 @@ pub struct GroupProject {
 
 impl GroupProject {
     pub fn compiler(&self) -> Option<CompilerConfiguration> {
-        let mut compilers = load_compilers().ok()?;
+        let mut compilers = CompilerConfigurations::new();
         return compilers.remove(&self.compiler_id.to_string());
     }
 
@@ -44,5 +44,20 @@ impl GroupProject {
             }
         }
         return Ok(());
+    }
+}
+
+impl Named for GroupProject {
+    fn get_name(&self) -> &String {
+        return &self.name;
+    }
+}
+
+impl ProjectLinkContainer for GroupProject {
+    fn get_project_links(&self) -> &Vec<ProjectLink> {
+        return &self.project_links;
+    }
+    fn get_project_links_mut(&mut self) -> &mut Vec<ProjectLink> {
+        return &mut self.project_links;
     }
 }

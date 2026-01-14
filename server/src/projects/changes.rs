@@ -116,118 +116,132 @@ impl Change {
     }
 
     fn new_project(file_path: String, workspace_id: usize) -> Result<()> {
-        let mut projects_data = ProjectsData::new();
+        let mut file_lock: FileLock<ProjectsData> = FileLock::new()?;
+        let projects_data = &mut file_lock.file;
         projects_data.new_project(&file_path, workspace_id)?;
         return projects_data.save();
     }
 
     fn add_project_link(project_id: usize, workspace_id: usize) -> Result<()> {
-        let mut projects_data = ProjectsData::new();
+        let mut file_lock: FileLock<ProjectsData> = FileLock::new()?;
+        let projects_data = &mut file_lock.file;
         projects_data.add_project_link(project_id, workspace_id)?;
         return projects_data.save();
     }
 
     fn remove_project_link(project_link_id: usize) -> Result<()> {
-        let mut projects_data = ProjectsData::new();
+        let mut file_lock: FileLock<ProjectsData> = FileLock::new()?;
+        let projects_data = &mut file_lock.file;
         projects_data.remove_project_link(project_link_id);
         return projects_data.save();
     }
 
     fn move_project(project_link_id: usize, drop_target: usize) -> Result<()> {
-        let mut projects_data = ProjectsData::new();
+        let mut file_lock: FileLock<ProjectsData> = FileLock::new()?;
+        let projects_data = &mut file_lock.file;
         projects_data.move_project_link(project_link_id, drop_target)?;
         return projects_data.save();
     }
 
     fn refresh_project(project_id: usize) -> Result<()> {
-        let mut projects_data = ProjectsData::new();
+        let mut file_lock: FileLock<ProjectsData> = FileLock::new()?;
+        let projects_data = &mut file_lock.file;
         projects_data.refresh_project_paths(project_id)?;
         return projects_data.save();
     }
 
     fn select_project(project_id: usize) -> Result<()> {
-        let mut projects_data = ProjectsData::new();
+        let mut file_lock: FileLock<ProjectsData> = FileLock::new()?;
+        let projects_data = &mut file_lock.file;
         projects_data.select_project(project_id)?;
         return projects_data.save();
     }
 
     fn update_project(project_id: usize, data: ProjectUpdateData) -> Result<()> {
-        let mut projects_data = ProjectsData::new();
+        let mut file_lock: FileLock<ProjectsData> = FileLock::new()?;
+        let projects_data = &mut file_lock.file;
         projects_data.update_project(project_id, data)?;
         return projects_data.save();
     }
 
     fn add_workspace(name: String, compiler: String) -> Result<()> {
-        let mut projects_data = ProjectsData::new();
+        let mut file_lock: FileLock<ProjectsData> = FileLock::new()?;
+        let projects_data = &mut file_lock.file;
         projects_data.new_workspace(&name, &compiler)?;
         return projects_data.save();
     }
 
     fn remove_workspace(workspace_id: usize) -> Result<()> {
-        let mut projects_data = ProjectsData::new();
+        let mut file_lock: FileLock<ProjectsData> = FileLock::new()?;
+        let projects_data = &mut file_lock.file;
         projects_data.remove_workspace(workspace_id);
         return projects_data.save();
     }
 
     fn move_workspace(workspace_id: usize, drop_target: usize) -> Result<()> {
-        let mut projects_data = ProjectsData::new();
+        let mut file_lock: FileLock<ProjectsData> = FileLock::new()?;
+        let projects_data = &mut file_lock.file;
         projects_data.move_workspace(workspace_id, drop_target)?;
         return projects_data.save();
     }
 
     fn update_workspace(workspace_id: usize, data: WorkspaceUpdateData) -> Result<()> {
-        let mut projects_data = ProjectsData::new();
+        let mut file_lock: FileLock<ProjectsData> = FileLock::new()?;
+        let projects_data = &mut file_lock.file;
         projects_data.update_workspace(workspace_id, &data)?;
         return projects_data.save();
     }
 
     fn add_compiler(key: String, config: CompilerConfiguration) -> Result<()> {
-        let mut compilers = load_compilers().map_err(|e| anyhow::anyhow!("Unable to add compiler - unable to load compilers: {}", e))?;
-        if compilers.contains_key(&key) {
-            anyhow::bail!("Unable to add compiler - compiler already exists: {}", key);
-        }
-        compilers.insert(key.clone(), config.clone());
-        return save_compilers(&compilers).map_err(|e| anyhow::anyhow!("Unable to add compiler - unable to save compilers: {}", e));
+        let mut file_lock: FileLock<CompilerConfigurations> = FileLock::new()?;
+        let compilers = &mut file_lock.file;
+        compilers.insert(key, config);
+        return compilers.save();
     }
 
     fn remove_compiler(compiler: String) -> Result<()> {
-        let mut compilers = load_compilers().map_err(|e| anyhow::anyhow!("Unable to remove compiler - unable to load compilers: {}", e))?;
+        let file_lock: FileLock<CompilerConfigurations> = FileLock::new()?;
+        let mut compilers = file_lock.file;
         if compilers.remove(&compiler).is_none() {
             anyhow::bail!("Unable to remove compiler - compiler not found: {}", compiler);
         }
-        return save_compilers(&compilers).map_err(|e| anyhow::anyhow!("Unable to remove compiler - unable to save compilers: {}", e));
+        return compilers.save();
     }
 
     fn update_compiler(key: String, data: PartialCompilerConfiguration) -> Result<()> {
-        let mut compilers = load_compilers().map_err(|e| anyhow::anyhow!("Unable to update compiler - unable to load compilers: {}", e))?;
+        let file_lock: FileLock<CompilerConfigurations> = FileLock::new()?;
+        let mut compilers = file_lock.file;
         if let Some(compiler) = compilers.get_mut(&key) {
             compiler.update(&data);
-            return save_compilers(&compilers).map_err(|e| anyhow::anyhow!("Unable to update compiler - unable to save compilers: {}", e));
+            return compilers.save();
         } else {
             anyhow::bail!("Unable to update compiler - compiler not found: {}", key);
         }
     }
 
     fn set_group_project(groupproj_path: String, compiler: Option<String>) -> Result<()> {
-        let mut projects_data = ProjectsData::new();
+        let mut file_lock: FileLock<ProjectsData> = FileLock::new()?;
+        let projects_data = &mut file_lock.file;
         projects_data.set_group_project(&groupproj_path, &compiler)?;
         return projects_data.save();
     }
 
     fn remove_group_project() -> Result<()> {
-        let mut projects_data = ProjectsData::new();
+        let mut file_lock: FileLock<ProjectsData> = FileLock::new()?;
+        let projects_data = &mut file_lock.file;
         projects_data.remove_group_project();
         return projects_data.save();
     }
 
     fn set_group_project_compiler(compiler: String) -> Result<()> {
-        if !compiler_exists(&compiler)? {
+        if !compiler_exists(&compiler) {
             anyhow::bail!(
                 "Unable to set group project compiler - compiler not found: {}",
                 compiler
             );
         }
-        let mut projects_data = ProjectsData::new();
+        let mut file_lock: FileLock<ProjectsData> = FileLock::new()?;
+        let projects_data = &mut file_lock.file;
         if let Some(group_project) = &mut projects_data.group_project {
             group_project.compiler_id = compiler.clone();
             return projects_data.save();

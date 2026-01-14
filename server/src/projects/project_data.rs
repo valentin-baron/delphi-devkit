@@ -1,3 +1,5 @@
+use crate::utils::{FilePath, Load};
+
 use super::*;
 use serde::{Serialize, Deserialize};
 use anyhow::Result;
@@ -33,27 +35,17 @@ impl Default for ProjectsData {
 
 impl ProjectsData {
     pub fn new() -> Self {
-        if let Ok(path) = Self::projects_data_file_path() {
-            if path.exists() {
-                let content = std::fs::read_to_string(&path).unwrap_or_default();
-                let projects: ProjectsData = ron::from_str(&content).unwrap_or_default();
-                return projects
-            } else {
-                return Self::default();
-            }
-        } else {
-            return Self::default();
-        }
+        return Self::load_from_file(&Self::get_file_path());
     }
 
     fn validate_compilers(&self) -> Result<()> {
         for workspace in &self.workspaces {
-            if !compiler_exists(&workspace.compiler_id)? {
+            if !compiler_exists(&workspace.compiler_id) {
                 anyhow::bail!("Workspace '{}' has invalid compiler id: {}", workspace.name, workspace.compiler_id);
             }
         }
         if let Some(group_project) = &self.group_project {
-            if !compiler_exists(&group_project.compiler_id)? {
+            if !compiler_exists(&group_project.compiler_id) {
                 anyhow::bail!("Group project '{}' has invalid compiler id: {}", group_project.name, group_project.compiler_id);
             }
         }
@@ -153,7 +145,7 @@ impl ProjectsData {
         let path = dirs::config_dir()
             .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?
             .join("ddk")
-            .join("compilers.ron");
+            .join("projects.ron");
         return Ok(path)
     }
 
@@ -415,7 +407,7 @@ impl ProjectsData {
     }
 
     pub fn new_workspace(&mut self, name: &String, compiler: &String) -> Result<()> {
-        if !compiler_exists(compiler)? {
+        if !compiler_exists(compiler) {
            anyhow::bail!("Compiler not found: {}", compiler);
         }
         let workspace_id = self.next_id();
@@ -491,7 +483,7 @@ impl ProjectsData {
             workspace.name = name.clone();
         }
         if let Some(compiler_id) = &data.compiler {
-            if !compiler_exists(compiler_id)? {
+            if !compiler_exists(compiler_id) {
                 anyhow::bail!("Compiler not found: {}", compiler_id);
             }
             workspace.compiler_id = compiler_id.clone();
@@ -502,7 +494,7 @@ impl ProjectsData {
     pub fn set_group_project(&mut self, groupproj_path: &String, compiler: &Option<String>) -> Result<()> {
         let mut compiler_id = String::new();
         if let Some(compiler_id) = compiler {
-            if !compiler_exists(compiler_id)? {
+            if !compiler_exists(compiler_id) {
                anyhow::bail!("Compiler not found: {}", compiler_id);
             }
         } else if let Some(existing_group_project) = &self.group_project {
@@ -603,32 +595,10 @@ impl ProjectsData {
     }
 }
 
-impl Named for workspace::Workspace {
-    fn get_name(&self) -> &String {
-        return &self.name;
+impl FilePath for ProjectsData {
+    fn get_file_path() -> PathBuf {
+        return Self::projects_data_file_path().unwrap();
     }
 }
 
-impl ProjectLinkContainer for workspace::Workspace {
-    fn get_project_links(&self) -> &Vec<ProjectLink> {
-        return &self.project_links;
-    }
-    fn get_project_links_mut(&mut self) -> &mut Vec<ProjectLink> {
-        return &mut self.project_links;
-    }
-}
-
-impl Named for GroupProject {
-    fn get_name(&self) -> &String {
-        return &self.name;
-    }
-}
-
-impl ProjectLinkContainer for GroupProject {
-    fn get_project_links(&self) -> &Vec<ProjectLink> {
-        return &self.project_links;
-    }
-    fn get_project_links_mut(&mut self) -> &mut Vec<ProjectLink> {
-        return &mut self.project_links;
-    }
-}
+impl Load for ProjectsData {}

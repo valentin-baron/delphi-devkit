@@ -2,9 +2,9 @@
     "13.0": (
         condition: "VER370",
         product_name: "Delphi 13.0 Florence",
-        product_version: 37.0,
+        product_version: 37,
         package_version: 370,
-        compiler_version: 37.0,
+        compiler_version: 37,
         installation_path: r"C:\Program Files\Embarcadero\Studio\37.0",
         build_arguments: [
             "/verbosity:minimal",
@@ -16,9 +16,9 @@
     "12.0": (
         condition: "VER360",
         product_name: "Delphi 12.0 Athens",
-        product_version: 23.0,
+        product_version: 23,
         package_version: 290,
-        compiler_version: 36.0,
+        compiler_version: 36,
         installation_path: r"C:\Program Files\Embarcadero\Studio\23.0",
         build_arguments: [
             "/verbosity:minimal",
@@ -30,9 +30,9 @@
     "11.0": (
         condition: "VER350",
         product_name: "Delphi 11.0 Alexandria",
-        product_version: 22.0,
+        product_version: 22,
         package_version: 280,
-        compiler_version: 35.0,
+        compiler_version: 35,
         installation_path: r"C:\Program Files\Embarcadero\Studio\22.0",
         build_arguments: [
             "/verbosity:minimal",
@@ -44,9 +44,9 @@
     "10.4": (
         condition: "VER340",
         product_name: "Delphi 10.4 Sydney",
-        product_version: 21.0,
+        product_version: 21,
         package_version: 270,
-        compiler_version: 34.0,
+        compiler_version: 34,
         installation_path: r"C:\Program Files\Embarcadero\Studio\21.0",
         build_arguments: [
             "/verbosity:minimal",
@@ -58,9 +58,9 @@
     "10.3": (
         condition: "VER330",
         product_name: "Delphi 10.3 Rio",
-        product_version: 20.0,
+        product_version: 20,
         package_version: 260,
-        compiler_version: 33.0,
+        compiler_version: 33,
         installation_path: r"C:\Program Files\Embarcadero\Studio\20.0",
         build_arguments: [
             "/verbosity:minimal",
@@ -78,9 +78,9 @@
             "/p:RuntimeIdentifiers=3.5",
             "/p:Configuration=Debug"
         ]
-        product_version: 19.0,
+        product_version: 19,
         package_version: 250,
-        compiler_version: 32.0,
+        compiler_version: 32,
         installation_path: r"C:\Program Files\Embarcadero\Studio\19.0",
         build_arguments: [
             "/verbosity:minimal",
@@ -92,9 +92,9 @@
     "10.1": (
         condition: "VER310",
         product_name: "Delphi 10.1 Berlin",
-        product_version: 18.0,
+        product_version: 18,
         package_version: 240,
-        compiler_version: 31.0,
+        compiler_version: 31,
         installation_path: r"C:\Program Files\Embarcadero\Studio\18.0",
         build_arguments: [
             "/verbosity:minimal",
@@ -106,9 +106,9 @@
     "10": (
         condition: "VER300",
         product_name: "Delphi 10 Seattle",
-        product_version: 17.0,
+        product_version: 17,
         package_version: 230,
-        compiler_version: 30.0,
+        compiler_version: 30,
         installation_path: r"C:\Program Files\Embarcadero\Studio\17.0",
         build_arguments: [
             "/verbosity:minimal",
@@ -120,9 +120,9 @@
     "XE8": (
         condition: "VER290",
         product_name: "Delphi XE8",
-        product_version: 16.0,
+        product_version: 16,
         package_version: 220,
-        compiler_version: 29.0,
+        compiler_version: 29,
         installation_path: r"C:\Program Files\Embarcadero\Studio\16.0",
         build_arguments: [
             "/verbosity:minimal",
@@ -134,9 +134,9 @@
     "XE7": (
         condition: "VER280",
         product_name: "Delphi XE7",
-        product_version: 15.0,
+        product_version: 15,
         package_version: 210,
-        compiler_version: 28.0,
+        compiler_version: 28,
         installation_path: r"C:\Program Files\Embarcadero\Studio\15.0",
         build_arguments: [
             "/verbosity:minimal",
@@ -148,9 +148,9 @@
     "XE6": (
         condition: "VER270",
         product_name: "Delphi XE6",
-        product_version: 14.0,
+        product_version: 14,
         package_version: 200,
-        compiler_version: 27.0,
+        compiler_version: 27,
         installation_path: r"C:\Program Files\Embarcadero\Studio\14.0",
         build_arguments: [
             "/verbosity:minimal",
@@ -162,9 +162,9 @@
     "XE5": (
         condition: "VER260",
         product_name: "Delphi XE5",
-        product_version: 12.0,
+        product_version: 12,
         package_version: 190,
-        compiler_version: 26.0,
+        compiler_version: 26,
         installation_path: r"C:\Program Files\Embarcadero\Studio\12.0",
         build_arguments: [
             "/verbosity:minimal",
@@ -176,9 +176,9 @@
     "XE4": (
         condition: "VER250",
         product_name: "Delphi XE4",
-        product_version: 11.0,
+        product_version: 11,
         package_version: 180,
-        compiler_version: 25.0,
+        compiler_version: 25,
         installation_path: r"C:\Program Files\Embarcadero\Studio\11.0",
         build_arguments: [
             "/verbosity:minimal",
@@ -190,9 +190,9 @@
     "XE3": (
         condition: "VER240",
         product_name: "Delphi XE3",
-        product_version: 10.0,
+        product_version: 10,
         package_version: 170,
-        compiler_version: 24.0,
+        compiler_version: 24,
         installation_path: r"C:\Program Files\Embarcadero\Studio\10.0",
         build_arguments: [
             "/verbosity:minimal",
@@ -204,9 +204,9 @@
     "XE2": (
         condition: "VER230",
         product_name: "Delphi XE2",
-        product_version: 9.0,
+        product_version: 9,
         package_version: 160,
-        compiler_version: 23.0,
+        compiler_version: 23,
         installation_path: r"C:\Program Files\Embarcadero\Studio\9.0",
         build_arguments: [
             "/verbosity:minimal",
@@ -218,9 +218,9 @@
     "XE": (
         condition: "VER220",
         product_name: "Delphi XE",
-        product_version: 8.0,
+        product_version: 8,
         package_version: 150,
-        compiler_version: 22.0,
+        compiler_version: 22,
         installation_path: r"C:\Program Files\Embarcadero\Studio\8.0",
         build_arguments: [
             "/verbosity:minimal",
@@ -232,9 +232,9 @@
     "2010": (
         condition: "VER210",
         product_name: "Delphi 2010",
-        product_version: 7.0,
+        product_version: 7,
         package_version: 140,
-        compiler_version: 21.0,
+        compiler_version: 21,
         installation_path: r"C:\Program Files\Embarcadero\Studio\7.0",
         build_arguments: [
             "/verbosity:minimal",
@@ -246,9 +246,9 @@
     "2009": (
         condition: "VER200",
         product_name: "Delphi 2009",
-        product_version: 6.0,
+        product_version: 6,
         package_version: 120,
-        compiler_version: 20.0,
+        compiler_version: 20,
         installation_path: r"C:\Program Files\CodeGear\RAD Studio\6.0",
         build_arguments: [
             "/verbosity:minimal",
@@ -260,9 +260,9 @@
     "2007": (
         condition: "VER190",
         product_name: "Delphi 2007",
-        product_version: 5.0,
+        product_version: 5,
         package_version: 110,
-        compiler_version: 19.0,
+        compiler_version: 19,
         installation_path: r"C:\Program Files\CodeGear\RAD Studio\5.0",
         build_arguments: [
             "/verbosity:minimal",

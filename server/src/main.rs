@@ -2,6 +2,7 @@ pub mod projects;
 pub mod lexorank;
 pub mod lsp_types;
 pub mod files;
+pub mod utils;
 
 use anyhow::Result;
 use serde_json::Value;
@@ -12,6 +13,7 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{LanguageServer, LspService, Server};
 
 pub(crate) use lsp_types::*;
+use projects::*;
 
 struct DelphiLsp {
     client: Client,
@@ -352,7 +354,15 @@ impl LanguageServer for DelphiLsp {
 #[tokio::main]
 async fn main() -> Result<()> {
     let (service, socket) =
-        LspService::build(|client| DelphiLsp::new(client)).finish();
+        LspService::build(|client| {
+            let watcher_client = client.clone();
+            tokio::spawn(async move {
+                if let Err(e) = start_file_watchers(watcher_client) {
+                    eprintln!("File watcher error: {}", e);
+                }
+            });
+            DelphiLsp::new(client)
+    }).finish();
 
     Server::new(stdin(), stdout(), socket).serve(service).await;
 

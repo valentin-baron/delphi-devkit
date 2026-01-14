@@ -1,7 +1,7 @@
 use tower_lsp::lsp_types::notification::Notification;
 use serde::{Deserialize, Serialize};
 
-use crate::projects::project_data::ProjectsData;
+use crate::{projects::{CompilerConfigurations, project_data::ProjectsData}};
 
 pub enum EventDone {}
 
@@ -63,6 +63,14 @@ impl NotifyError {
 
 pub enum ProjectsUpdate {}
 
+impl ProjectsUpdate {
+    pub async fn notify(client: &tower_lsp::Client) {
+        client.send_notification::<ProjectsUpdate>(ProjectsUpdateParams {
+            projects: ProjectsData::new(),
+        }).await;
+    }
+}
+
 #[derive(Debug, Eq, PartialEq, Clone, Deserialize, Serialize)]
 pub struct ProjectsUpdateParams {
     pub projects: ProjectsData,
@@ -71,4 +79,24 @@ pub struct ProjectsUpdateParams {
 impl Notification for ProjectsUpdate {
     type Params = ProjectsUpdateParams;
     const METHOD: &'static str = "$/notifications/projects/update";
+}
+
+pub enum CompilersUpdate {}
+
+impl CompilersUpdate {
+    pub async fn notify(client: &tower_lsp::Client) {
+        client.send_notification::<CompilersUpdate>(CompilersUpdateParams {
+            compilers: CompilerConfigurations::new(),
+        }).await;
+    }
+}
+
+#[derive(Debug, Eq, PartialEq, Clone, Deserialize, Serialize)]
+pub struct CompilersUpdateParams {
+    pub compilers: CompilerConfigurations,
+}
+
+impl Notification for CompilersUpdate {
+    type Params = CompilersUpdateParams;
+    const METHOD: &'static str = "$/notifications/compilers/update";
 }

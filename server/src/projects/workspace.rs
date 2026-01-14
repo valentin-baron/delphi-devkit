@@ -22,11 +22,6 @@ impl Workspace {
             sort_rank: lexo_rank,
         }
     }
-
-    pub fn compiler(&self) -> Option<CompilerConfiguration> {
-        let mut compilers = load_compilers().ok()?;
-        return compilers.remove(&self.compiler_id.to_string());
-    }
 }
 
 impl HasLexoRank for Workspace {
@@ -35,5 +30,20 @@ impl HasLexoRank for Workspace {
     }
     fn set_lexorank(&mut self, lexorank: LexoRank) {
         self.sort_rank = lexorank;
+    }
+}
+
+impl Named for Workspace {
+    fn get_name(&self) -> &String {
+        return &self.name;
+    }
+}
+
+impl ProjectLinkContainer for Workspace {
+    fn get_project_links(&self) -> &Vec<ProjectLink> {
+        return &self.project_links;
+    }
+    fn get_project_links_mut(&mut self) -> &mut Vec<ProjectLink> {
+        return &mut self.project_links;
     }
 }
