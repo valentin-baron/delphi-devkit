@@ -3,6 +3,7 @@ pub mod lexorank;
 pub mod lsp_types;
 pub mod files;
 pub mod utils;
+pub mod format;
 
 use anyhow::Result;
 use serde_json::Value;
@@ -14,6 +15,8 @@ use tower_lsp::{LanguageServer, LspService, Server};
 
 pub(crate) use lsp_types::*;
 use projects::*;
+
+use crate::format::Formatter;
 
 #[derive(Debug, Clone)]
 struct DelphiLsp {
@@ -174,23 +177,62 @@ impl LanguageServer for DelphiLsp {
 
     async fn formatting(
         &self,
-        _params: DocumentFormattingParams,
+        params: DocumentFormattingParams,
     ) -> jsonrpc::Result<Option<Vec<TextEdit>>> {
-        return Ok(None);
+        let url = params.text_document.uri.clone();
+        let formatter = Formatter::new(url).map_err(|e| {
+            jsonrpc::Error::invalid_params(format!(
+                "Failed to initialize formatter for file {}: {}",
+                params.text_document.uri,
+                e
+            ))
+        })?;
+        let formatted_content = formatter.execute(None).map_err(|e| {
+            jsonrpc::Error::invalid_params(format!(
+                "Failed to format file {}: {}",
+                params.text_document.uri,
+                e
+            ))
+        })?;
+
+        return Ok(Some(vec![TextEdit {
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: u32::MAX,
+                    character: u32::MAX,
+                },
+            },
+            new_text: formatted_content,
+        }]));
     }
 
     async fn range_formatting(
         &self,
-        _params: DocumentRangeFormattingParams,
+        params: DocumentRangeFormattingParams,
     ) -> jsonrpc::Result<Option<Vec<TextEdit>>> {
-        return Ok(None);
-    }
-
-    async fn on_type_formatting(
-        &self,
-        _params: DocumentOnTypeFormattingParams,
-    ) -> jsonrpc::Result<Option<Vec<TextEdit>>> {
-        return Ok(None);
+        let url = params.text_document.uri.clone();
+        let formatter = Formatter::new(url).map_err(|e| {
+            jsonrpc::Error::invalid_params(format!(
+                "Failed to initialize formatter for file {}: {}",
+                params.text_document.uri,
+                e
+            ))
+        })?;
+        let formatted_content = formatter.execute(Some(params.range)).map_err(|e| {
+            jsonrpc::Error::invalid_params(format!(
+                "Failed to format file {}: {}",
+                params.text_document.uri,
+                e
+            ))
+        })?;
+        return Ok(Some(vec![TextEdit {
+            range: params.range,
+            new_text: formatted_content,
+        }]));
     }
 
     async fn rename(&self, _params: RenameParams) -> jsonrpc::Result<Option<WorkspaceEdit>> {

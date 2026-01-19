@@ -3,7 +3,7 @@ use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::utils::{FilePath, Load};
+use crate::utils::{FileLock, FilePath, Load};
 
 pub(crate) const DEFAULT_COMPILERS: &str = include_str!("presets/default_compilers.ron");
 
@@ -86,6 +86,19 @@ impl<'de> Deserialize<'de> for CompilerConfigurations {
 impl CompilerConfigurations {
     pub fn new() -> Self {
         Self::load_from_file(&Self::get_file_path())
+    }
+
+    pub fn first_available_formatter() -> Option<PathBuf> {
+        let file_lock: FileLock<CompilerConfigurations> = FileLock::new().ok()?;
+        for compiler in file_lock.file._compilers.values() {
+            let path = PathBuf::from(&compiler.installation_path)
+                .join("bin")
+                .join("Formatter.exe");
+            if path.exists() {
+                return Some(path);
+            }
+        }
+        None
     }
 
     pub fn overwrite(&mut self, other: CompilerConfigurations) {

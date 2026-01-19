@@ -1,10 +1,11 @@
-import { commands, env, Uri, window, Disposable } from "vscode";
+import { commands, env, Uri, window, Disposable, workspace } from "vscode";
 import { COMMANDS } from "./constants";
 import { join } from "path";
 import { promises as fs } from 'fs';
 import { Runtime } from "./runtime";
 import { ExtensionDataExport } from "./types";
 import { assertError } from "./utils";
+import { env as osEnv } from "process";
 
 export class GeneralCommands {
   public static get registers(): Disposable[] {
@@ -79,4 +80,37 @@ export class GeneralCommands {
       window.showErrorMessage(`Failed to import configuration: ${error}`);
     }
   }
+}
+
+import { FORMAT } from "./constants";
+
+export class FormatterCommands {
+    public static get registers(): Disposable[] {
+        return [
+            commands.registerCommand(FORMAT.COMMAND.EDIT_FORMATTER_CONFIG, this.editFormatterConfig.bind(this))
+        ];
+    }
+
+    private static async editFormatterConfig(): Promise<void> {
+        workspace.openTextDocument(await this.getFormatterPath());
+    }
+
+    private static async getFormatterPath(): Promise<string> {
+        const path = join(osEnv.APPDATA || osEnv.HOME || '', 'ddk');
+        try {
+            await fs.access(path);
+        } catch {
+            await fs.mkdir(path, { recursive: true });
+        }
+        const configPath = join(path, 'ddk_formatter.config');
+        try {
+            await fs.access(configPath);
+        } catch {
+            await fs.writeFile(
+                configPath,
+                await fs.readFile(Runtime.extension.asAbsolutePath('ddk_formatter.config'))
+            );
+        }
+        return join(path, 'ddk_formatter.config');
+    }
 }

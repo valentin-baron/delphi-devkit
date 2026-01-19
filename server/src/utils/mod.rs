@@ -3,6 +3,9 @@ use std::path::PathBuf;
 use fslock::LockFile;
 use anyhow::Result;
 
+mod document;
+pub use document::*;
+
 #[macro_export]
 macro_rules! defer_async {
     ($inner:expr) => {
