@@ -88,6 +88,15 @@ impl CompilerConfigurations {
         Self::load_from_file(&Self::get_file_path())
     }
 
+    pub fn initialize() -> Result<()> {
+        if !Self::get_file_path().exists() {
+            let file_lock: FileLock<Self> = FileLock::new()?;
+            let data = &file_lock.file;
+            data.save()?;
+        }
+        Ok(())
+    }
+
     pub fn first_available_formatter() -> Option<PathBuf> {
         let file_lock: FileLock<CompilerConfigurations> = FileLock::new().ok()?;
         for compiler in file_lock.file._compilers.values() {

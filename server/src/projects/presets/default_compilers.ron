@@ -72,12 +72,6 @@
     "10.2": (
         condition: "VER320",
         product_name: "Delphi 10.2 Tokyo",
-        build_arguments: [
-            "/verbosity:minimal",
-            "/p:DCC_DebugInformation=1",
-            "/p:RuntimeIdentifiers=3.5",
-            "/p:Configuration=Debug"
-        ]
         product_version: 19,
         package_version: 250,
         compiler_version: 32,

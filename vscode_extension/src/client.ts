@@ -7,12 +7,25 @@ import { Runtime } from './runtime';
 import { Entities } from './projects/entities';
 import { UUID } from 'crypto';
 
-export interface Change {
-    type: 'NewProject' |'AddProject' | 'RemoveProject' | 'MoveProject' | 'RefreshProject' | 'UpdateProject' |'SelectProject' |
-          'AddWorkspace' | 'RemoveWorkspace' | 'MoveWorkspace' | 'UpdateWorkspace' |
-          'AddCompiler' | 'RemoveCompiler' | 'UpdateCompiler' | 'SetGroupProject' | 'RemoveGroupProject' | 'SetGroupProjectCompiler',
-    [key: string]: any;
-}
+export type Change =
+    | { type: 'NewProject', file_path: string, workspace_id: number }
+    | { type: 'AddProject', project_id: number, workspace_id: number }
+    | { type: 'RemoveProject', project_link_id: number }
+    | { type: 'MoveProject', project_link_id: number, drop_target: number }
+    | { type: 'RefreshProject', project_id: number }
+    | { type: 'UpdateProject', project_id: number, data: Partial<Entities.Project> }
+    | { type: 'SelectProject', project_id: number }
+    | { type: 'AddWorkspace', name: string, compiler: string }
+    | { type: 'RemoveWorkspace', workspace_id: number }
+    | { type: 'MoveWorkspace', workspace_id: number, drop_target: number }
+    | { type: 'UpdateWorkspace', workspace_id: number, data: { name?: string; compiler?: string; } }
+    | { type: 'AddCompiler', key: string, config: Entities.CompilerConfiguration }
+    | { type: 'RemoveCompiler', compiler: string }
+    | { type: 'UpdateCompiler', key: string, data: Partial<Entities.CompilerConfiguration> }
+    | { type: 'SetGroupProject', groupproj_path: string }
+    | { type: 'RemoveGroupProject' }
+    | { type: 'SetGroupProjectCompiler', compiler: string };
+
 
 export interface Changes {
     changes: Change[];
@@ -43,11 +56,16 @@ export type CompilerProgressParams = {
     lines: string[],
 } | never;
 
+interface ConfigurationData {
+    projects: Entities.ProjectsData;
+    compilers: Entities.CompilerConfigurations;
+}
+
 export class DDK_Client {
     private client: LanguageClient;
 
     public async initialize(): Promise<void> {
-        const serverPath = path.join(Runtime.extension.extensionPath, 'dist', 'ddk_server.exe');
+        const serverPath = 'C:/workspaces/vscode/delphi-devkit/server/target/debug/deps/ddk_server.exe';
         const serverOptions: ServerOptions = {
             run: { command: serverPath, transport: TransportKind.stdio },
             debug: { command: serverPath, transport: TransportKind.stdio }
@@ -62,8 +80,8 @@ export class DDK_Client {
         );
         this.client.onNotification(
             'notifications/projects/update',
-            async (it: { projectsData: Entities.ProjectsData }) => {
-                Runtime.projectsData = it.projectsData;
+            async (it: { projects: Entities.ProjectsData }) => {
+                Runtime.projectsData = it.projects;
                 await Runtime.projects.workspacesTreeView.refresh();
                 await Runtime.projects.groupProjectTreeView.refresh();
             }
@@ -93,6 +111,13 @@ export class DDK_Client {
             this.onCompilerProgress.bind(this)
         );
         await this.client.start();
+        try {
+            const data: ConfigurationData = await this.client.sendRequest('configuration/fetch', {});
+            Runtime.projectsData = data.projects;
+            Runtime.compilerConfigurations = data.compilers;
+        } catch (e) {
+            window.showErrorMessage(`Failed to fetch initial configuration from DDK Server: ${e}`);
+        }
     }
 
     public async projectsDataOverride(data: Entities.ProjectsData): Promise<void> {
@@ -123,7 +148,7 @@ export class DDK_Client {
         const changes = newChanges(changesArray);
         await this.client.sendNotification('workspace/didChangeConfiguration', {
             settings: {
-                changes: changes
+                changeSet: changes
             }
         });
         await Runtime.waitForEvent(changes.event_id);

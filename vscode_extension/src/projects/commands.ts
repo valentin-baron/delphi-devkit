@@ -10,6 +10,7 @@ import { ProjectItem } from './trees/items/project';
 import { assertError, basenameNoExt } from '../utils';
 import { WorkspaceItem } from './trees/items/workspaceItem';
 import { Change } from '../client';
+import { Option } from '../types';
 
 export namespace ProjectsCommands {
   export function register() {
@@ -139,7 +140,9 @@ export namespace ProjectsCommands {
       await Runtime.client.applyChanges([{
         type: 'UpdateProject',
         project_id: project.entity.id,
-        ini_path: iniPath
+        data: {
+          ini: iniPath
+        }
       }]);
     }
 
@@ -224,7 +227,7 @@ export namespace ProjectsCommands {
           type: 'UpdateProject',
           project_id: item.project.entity.id,
           data: {
-            fileType: uri[0].fsPath
+            [fileType]: uri[0].fsPath
           }
         }
       ]);
@@ -237,7 +240,7 @@ export namespace ProjectsCommands {
     }
 
     public static async selectCompilerConfiguration(): Promise<void> {
-      const configurations = Runtime.getCompilerConfigurations();
+      const configurations = await Runtime.getCompilerConfigurations();
 
       if (Object.keys(configurations).length <= 0) {
         window.showErrorMessage('No compiler configurations found.');
@@ -245,7 +248,9 @@ export namespace ProjectsCommands {
       }
 
       // we need to use both keys and values, so we map them to an array of objects
-      const items = Object.entries(configurations).map(([key, config]) => ({
+      const items = Object.entries(configurations).sort(([keyA, configA], [keyB, configB]) =>
+        configB.compiler_version - configA.compiler_version
+      ).map(([key, config]) => ({
         label: config.product_name,
         description: config.installation_path,
         detail: key
@@ -262,7 +267,7 @@ export namespace ProjectsCommands {
       await Runtime.client.applyChanges([
         {
           type: 'SetGroupProjectCompiler',
-          compiler_id: selected.detail
+          compiler: selected.detail
         }
       ]);
       window.showInformationMessage(`Compiler configuration set to: ${selected?.label}`);
@@ -375,20 +380,20 @@ export namespace ProjectsCommands {
       await Runtime.client.applyChanges([
         {
           type: 'RemoveProject',
-          project_id: link.id
+          project_link_id: link.id
         }
       ]);
       window.showInformationMessage(`Removed project: ${item.label}`);
     }
 
-    private static checkWorkspaceName(name: string, data: Entities.ProjectsData): string | undefined {
+    private static checkWorkspaceName(name: string, data?: Option<Entities.ProjectsData>): string | undefined {
       if (!name || !name.trim()) return 'Workspace name cannot be empty';
-      else if (data.workspaces.some((ws) => ws.name.toLowerCase() === name.trim().toLowerCase()))
+      else if (data && data.workspaces.some((ws) => ws.name.toLowerCase() === name.trim().toLowerCase()))
         return 'A workspace with this name already exists';
     }
 
     private static async addWorkspace(): Promise<void> {
-      const data = await Runtime.getProjectsData();
+      const data = Runtime.projectsData;
       const name = await window.showInputBox({
         prompt: 'Enter a name for the new workspace',
         placeHolder: 'Workspace Name',

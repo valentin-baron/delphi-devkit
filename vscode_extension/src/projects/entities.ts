@@ -95,7 +95,7 @@ export namespace Entities {
     product_name: string;
     product_version: number;
     package_version: number;
-    compiler_version: string;
+    compiler_version: number;
     installation_path: string;
     build_arguments: string[];
   }

@@ -46,6 +46,7 @@ impl<T> FileLock<T> {
         T: Serialize + FilePath + Load + Default + for<'de> Deserialize<'de>,
     {
         let path = T::get_file_path();
+        std::fs::create_dir_all(path.parent().unwrap())?;
         let mut tries = 100;
 
         while tries > 0 {

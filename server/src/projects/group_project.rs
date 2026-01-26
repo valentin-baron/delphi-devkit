@@ -8,26 +8,10 @@ use crate::files::groupproj::parse_groupproj;
 pub struct GroupProject {
     pub name: String,
     pub path: String,
-    pub compiler_id: String,
     pub project_links: Vec<ProjectLink>,
 }
 
 impl GroupProject {
-    pub fn compiler(&self) -> CompilerConfiguration {
-        let mut compilers = {
-            // lock the file only while reading it
-            if let Ok(file_lock) = FileLock::<CompilerConfigurations>::new() {
-                file_lock.file.clone()
-            } else {
-                CompilerConfigurations::default()
-            }
-        };
-        if let Some(compiler) = compilers.remove(&self.compiler_id.to_string()) {
-            return compiler;
-        }
-        return compilers.remove("12.0").expect(format!("Compiler with id {} not found; should not be possible.", self.compiler_id).as_str());
-    }
-
     pub fn fill(&mut self, projects_data: &mut ProjectsData) -> Result<()> {
         let project_paths = parse_groupproj(PathBuf::from(&self.path))?;
         for project_path in project_paths {

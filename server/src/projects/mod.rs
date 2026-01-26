@@ -105,7 +105,10 @@ pub async fn update(json: Value, client: tower_lsp::Client) -> Result<()> {
     }
     if let Some(inner) = json.get("changeSet") {
         let change_set: ChangeSet = serde_json::from_value(inner.clone())?;
-        change_set.execute(&client).await?;
+        match change_set.execute(&client).await {
+            Ok(_) => EventDone::notify_json(&client, &json).await,
+            Err(e) => anyhow::bail!("Failed to execute ChangeSet: {}", e)
+        }
         return Ok(());
     }
     if let Some(inner) = json.get("compilerConfigurations") {

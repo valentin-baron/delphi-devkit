@@ -19,13 +19,13 @@ impl ChangeSet {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct WorkspaceUpdateData {
     pub name: Option<String>,
     pub compiler: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ProjectUpdateData {
     pub name: Option<String>,
     pub directory: Option<String>,
@@ -36,7 +36,7 @@ pub struct ProjectUpdateData {
     pub ini: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Change {
     NewProject { file_path: String, workspace_id: usize },
@@ -53,7 +53,7 @@ pub enum Change {
     AddCompiler { key: String, config: CompilerConfiguration },
     RemoveCompiler { compiler: String },
     UpdateCompiler { key: String, data: PartialCompilerConfiguration },
-    SetGroupProject { groupproj_path: String, compiler: Option<String> },
+    SetGroupProject { groupproj_path: String },
     RemoveGroupProject,
     SetGroupProjectCompiler { compiler: String },
 }
@@ -103,8 +103,8 @@ impl Change {
             Change::UpdateCompiler { key, data } => {
                 return Self::update_compiler(key, data);
             }
-            Change::SetGroupProject { groupproj_path, compiler } => {
-                return Self::set_group_project(groupproj_path, compiler);
+            Change::SetGroupProject { groupproj_path} => {
+                return Self::set_group_project(groupproj_path);
             }
             Change::RemoveGroupProject => {
                 return Self::remove_group_project();
@@ -219,10 +219,10 @@ impl Change {
         }
     }
 
-    fn set_group_project(groupproj_path: String, compiler: Option<String>) -> Result<()> {
+    fn set_group_project(groupproj_path: String) -> Result<()> {
         let mut file_lock: FileLock<ProjectsData> = FileLock::new()?;
         let projects_data = &mut file_lock.file;
-        projects_data.set_group_project(&groupproj_path, &compiler)?;
+        projects_data.set_group_project(&groupproj_path)?;
         return projects_data.save();
     }
 
@@ -242,11 +242,7 @@ impl Change {
         }
         let mut file_lock: FileLock<ProjectsData> = FileLock::new()?;
         let projects_data = &mut file_lock.file;
-        if let Some(group_project) = &mut projects_data.group_project {
-            group_project.compiler_id = compiler.clone();
-            return projects_data.save();
-        } else {
-            anyhow::bail!("Unable to set group project compiler - no group project is set");
-        }
+        projects_data.group_project_compiler_id = compiler.clone();
+        return projects_data.save();
     }
 }

@@ -35,11 +35,23 @@ impl DelphiLsp {
         }
         Ok(())
     }
+
+    async fn configuration_fetch(
+        &self,
+        _params: serde_json::Value,
+    ) -> tower_lsp::jsonrpc::Result<ConfigurationFetchResponse> {
+        Ok(ConfigurationFetchResponse {
+            projects: ProjectsData::new(),
+            compilers: CompilerConfigurations::new(),
+        })
+    }
 }
 
 #[async_trait]
 impl LanguageServer for DelphiLsp {
     async fn initialize(&self, params: InitializeParams) -> jsonrpc::Result<InitializeResult> {
+        ProjectsUpdate::notify(&self.client).await;
+        CompilersUpdate::notify(&self.client).await;
         if let Some(_init_options) = params.initialization_options {
             return Ok(InitializeResult {
                 capabilities: ServerCapabilities::default(), // none
@@ -135,12 +147,17 @@ async fn main() -> Result<()> {
     let (service, socket) = LspService::build(|client| {
         let watcher_client = client.clone();
         tokio::spawn(async move {
+            let _ = ProjectsData::initialize()
+                .expect("Failed to initialize projects data");
+            let _ = CompilerConfigurations::initialize()
+                .expect("Failed to initialize compiler configuration");
             if let Err(e) = start_file_watchers(watcher_client) {
                 eprintln!("File watcher error: {}", e);
             }
         });
         DelphiLsp::new(client)
     }).custom_method("projects/compile", DelphiLsp::projects_compile)
+    .custom_method("configuration/fetch", DelphiLsp::configuration_fetch)
         .finish();
 
     Server::new(stdin(), stdout(), socket).serve(service).await;

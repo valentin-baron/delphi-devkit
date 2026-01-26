@@ -1,4 +1,4 @@
-use tower_lsp::lsp_types::notification::Notification;
+use tower_lsp::lsp_types::{MessageType, notification::Notification};
 use serde::{Deserialize, Serialize};
 
 use crate::projects::*;
@@ -65,6 +65,7 @@ pub enum ProjectsUpdate {}
 
 impl ProjectsUpdate {
     pub async fn notify(client: &tower_lsp::Client) {
+        client.log_message(MessageType::INFO, "Projects updated").await;
         client.send_notification::<ProjectsUpdate>(ProjectsUpdateParams {
             projects: ProjectsData::new(),
         }).await;
@@ -85,6 +86,7 @@ pub enum CompilersUpdate {}
 
 impl CompilersUpdate {
     pub async fn notify(client: &tower_lsp::Client) {
+        client.log_message(MessageType::INFO, "Compilers updated").await;
         client.send_notification::<CompilersUpdate>(CompilersUpdateParams {
             compilers: CompilerConfigurations::new(),
         }).await;
@@ -170,7 +172,7 @@ impl CompilerProgress {
     }
 }
 
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub enum CompileProjectParams {
     Project {
@@ -189,4 +191,10 @@ pub enum CompileProjectParams {
         project_link_id: usize,
         rebuild: bool,
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ConfigurationFetchResponse {
+    pub projects: ProjectsData,
+    pub compilers: CompilerConfigurations,
 }

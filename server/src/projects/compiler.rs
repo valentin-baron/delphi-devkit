@@ -42,10 +42,8 @@ impl Compiler {
                 single = true;
                 let project = self.projects_data.get_project(project_id).ok_or_else(|| anyhow::anyhow!("Project with id {} not found", project_id))?;
                 if let Some(link_id) = project_link_id {
-                    if self.projects_data.is_project_link_in_group_project(link_id)
-                        && let Some(group_project) = &self.projects_data.group_project
-                    {
-                        configuration = group_project.compiler();
+                    if self.projects_data.is_project_link_in_group_project(link_id) {
+                        configuration = self.projects_data.group_projects_compiler();
                     } else if let Some(workspace_id) = self.projects_data.get_workspace_id_containing_project_link(link_id) {
                         let workspace = self
                             .projects_data
@@ -125,7 +123,7 @@ impl Compiler {
                     Some(gp) => gp,
                     _ => anyhow::bail!("No group project defined"),
                 };
-                configuration = group_project.compiler();
+                configuration = self.projects_data.group_projects_compiler();
                 projects = group_project.project_links.iter()
                     .map(|link| {
                         self.projects_data
@@ -200,7 +198,7 @@ impl Compiler {
                                     .ok_or_else(|| anyhow::anyhow!("Project with id {} not found", link.project_id))
                             })
                             .collect::<Result<Vec<_>>>()?;
-                        configuration = group_project.compiler();
+                        configuration = self.projects_data.group_projects_compiler();
                         let project_name = projects.first().map(|p| p.name.clone()).unwrap_or("<unknown>".to_string());
                         header = CompHeader::new(
                             format!("Group Project '{}'", group_project.name),

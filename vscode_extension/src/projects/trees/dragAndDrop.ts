@@ -214,7 +214,7 @@ export class WorkspaceTreeDragDropController implements TreeDragAndDropControlle
       {
         type: 'MoveWorkspace',
         workspace_id: source.entity.workspace!.id,
-        drop_target: target.entity.workspace?.id
+        drop_target: target.entity.workspace!.id
       }
     ]);
   }

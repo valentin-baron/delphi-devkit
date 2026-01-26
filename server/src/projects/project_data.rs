@@ -19,6 +19,7 @@ pub struct ProjectsData {
     pub workspaces: Vec<Workspace>,
     pub projects: Vec<Project>,
     pub group_project: Option<GroupProject>,
+    pub group_project_compiler_id: String,
 }
 
 impl Default for ProjectsData {
@@ -29,6 +30,7 @@ impl Default for ProjectsData {
             workspaces: Vec::new(),
             projects: Vec::new(),
             group_project: None,
+            group_project_compiler_id: String::from("12.0"),
         }
     }
 }
@@ -38,16 +40,38 @@ impl ProjectsData {
         return Self::load_from_file(&Self::get_file_path());
     }
 
+    pub fn initialize() -> Result<()> {
+        if !Self::get_file_path().exists() {
+            let file_lock: FileLock<Self> = FileLock::new()?;
+            let data = &file_lock.file;
+            data.save()?;
+        }
+        Ok(())
+    }
+
+    pub fn group_projects_compiler(&self) -> CompilerConfiguration {
+        let mut compilers = {
+            // lock the file only while reading it
+            if let Ok(file_lock) = FileLock::<CompilerConfigurations>::new() {
+                file_lock.file.clone()
+            } else {
+                CompilerConfigurations::default()
+            }
+        };
+        if let Some(compiler) = compilers.remove(&self.group_project_compiler_id.to_string()) {
+            return compiler;
+        }
+        return compilers.remove("12.0").expect(format!("Compiler with id {} not found; should not be possible.", self.group_project_compiler_id).as_str());
+    }
+
     fn validate_compilers(&self) -> Result<()> {
         for workspace in &self.workspaces {
             if !compiler_exists(&workspace.compiler_id) {
                 anyhow::bail!("Workspace '{}' has invalid compiler id: {}", workspace.name, workspace.compiler_id);
             }
         }
-        if let Some(group_project) = &self.group_project {
-            if !compiler_exists(&group_project.compiler_id) {
-                anyhow::bail!("Group project '{}' has invalid compiler id: {}", group_project.name, group_project.compiler_id);
-            }
+        if !compiler_exists(&self.group_project_compiler_id) {
+            anyhow::bail!("Group project compiler has invalid id: {}", self.group_project_compiler_id);
         }
         Ok(())
     }
@@ -499,17 +523,7 @@ impl ProjectsData {
         return Ok(());
     }
 
-    pub fn set_group_project(&mut self, groupproj_path: &String, compiler: &Option<String>) -> Result<()> {
-        let mut compiler_id = String::new();
-        if let Some(compiler_id) = compiler {
-            if !compiler_exists(compiler_id) {
-               anyhow::bail!("Compiler not found: {}", compiler_id);
-            }
-        } else if let Some(existing_group_project) = &self.group_project {
-            compiler_id = existing_group_project.compiler_id.clone();
-        } else {
-            compiler_id = "12.0".to_string();
-        }
+    pub fn set_group_project(&mut self, groupproj_path: &String) -> Result<()> {
         let path = PathBuf::from(groupproj_path);
         if !path.exists() {
             anyhow::bail!("Group project file does not exist: {}", groupproj_path);
@@ -518,7 +532,6 @@ impl ProjectsData {
             name: path.file_stem().and_then(|s| s.to_str()).unwrap_or("<name error>").to_string(),
             project_links: Vec::new(),
             path: groupproj_path.clone(),
-            compiler_id,
         };
         group_project.fill(self)?;
         self.group_project = Some(group_project);
