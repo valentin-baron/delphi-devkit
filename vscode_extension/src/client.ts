@@ -65,7 +65,7 @@ export class DDK_Client {
     private client: LanguageClient;
 
     public async initialize(): Promise<void> {
-        const serverPath = 'C:/workspaces/vscode/delphi-devkit/server/target/debug/deps/ddk_server.exe';
+        const serverPath = 'D:/workspaces/delphi-devkit/server/target/debug/deps/ddk_server.exe';
         const serverOptions: ServerOptions = {
             run: { command: serverPath, transport: TransportKind.stdio },
             debug: { command: serverPath, transport: TransportKind.stdio }

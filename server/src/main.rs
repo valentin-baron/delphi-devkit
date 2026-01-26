@@ -36,6 +36,14 @@ impl DelphiLsp {
         Ok(())
     }
 
+    async fn projects_compile_cancel(
+        &self,
+        _params: CancelCompilationParams,
+    ) -> tower_lsp::jsonrpc::Result<()> {
+        CANCEL_COMPILATION.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
     async fn configuration_fetch(
         &self,
         _params: serde_json::Value,
@@ -158,6 +166,7 @@ async fn main() -> Result<()> {
         DelphiLsp::new(client)
     }).custom_method("projects/compile", DelphiLsp::projects_compile)
     .custom_method("configuration/fetch", DelphiLsp::configuration_fetch)
+    .custom_method("projects/compile-cancel", DelphiLsp::projects_compile_cancel)
         .finish();
 
     Server::new(stdin(), stdout(), socket).serve(service).await;

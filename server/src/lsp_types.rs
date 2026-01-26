@@ -198,3 +198,6 @@ pub struct ConfigurationFetchResponse {
     pub projects: ProjectsData,
     pub compilers: CompilerConfigurations,
 }
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CancelCompilationParams {}

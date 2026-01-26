@@ -29,6 +29,7 @@ pub struct CompilerLineDiagnostic {
     pub message: String,
     pub code: String,
     pub kind: DiagnosticKind,
+    pub compiler_name: String,
 }
 
 impl Display for CompilerLineDiagnostic {
@@ -54,7 +55,7 @@ impl Display for CompilerLineDiagnostic {
 }
 
 impl CompilerLineDiagnostic {
-    pub fn from_line(line: &str) -> Option<Self> {
+    pub fn from_line(line: &str, compiler_name: String) -> Option<Self> {
         if let Some(captures) = regex::Regex::new(MSBUILD_OUTPUT_REGEX).unwrap().captures(line) {
             let file = captures.name("file")?.as_str().to_string();
             let line = captures.name("line")?.as_str().parse().ok()?;
@@ -79,14 +80,17 @@ impl CompilerLineDiagnostic {
                 message,
                 code,
                 kind,
+                compiler_name
             })
         } else {
             None
         }
     }
+}
 
-    pub async fn publish(&self, client: &tower_lsp::Client, compiler_name: &str) {
-        let diagnostic = Diagnostic {
+impl Into<Diagnostic> for CompilerLineDiagnostic {
+    fn into(self) -> Diagnostic {
+        return Diagnostic {
             range: Range {
                 start: Position {
                     line: self.line.saturating_sub(1),
@@ -103,15 +107,9 @@ impl CompilerLineDiagnostic {
                 DiagnosticKind::HINT => Some(DiagnosticSeverity::HINT),
             },
             code: Some(NumberOrString::String(self.code.clone())),
-            source: Some(compiler_name.to_string()),
+            source: Some(self.compiler_name.to_string()),
             message: self.message.clone(),
             ..Default::default()
         };
-
-        let uri = Url::from_file_path(&self.file).unwrap_or_else(|_| {
-            Url::parse("untitled:unknown").unwrap()
-        });
-
-        client.publish_diagnostics(uri, vec![diagnostic], None).await;
     }
 }
