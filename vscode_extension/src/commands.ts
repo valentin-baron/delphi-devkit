@@ -1,5 +1,5 @@
 import { commands, env, Uri, window, Disposable, workspace } from "vscode";
-import { COMMANDS } from "./constants";
+import { COMMANDS, FORMAT } from "./constants";
 import { join } from "path";
 import { promises as fs } from 'fs';
 import { Runtime } from "./runtime";
@@ -11,7 +11,10 @@ export class GeneralCommands {
   public static get registers(): Disposable[] {
     return [
       commands.registerCommand(COMMANDS.EXPORT_CONFIGURATION, this.exportConfiguration.bind(this)),
-      commands.registerCommand(COMMANDS.IMPORT_CONFIGURATION, this.importConfiguration.bind(this))
+      commands.registerCommand(COMMANDS.IMPORT_CONFIGURATION, this.importConfiguration.bind(this)),
+      commands.registerCommand(COMMANDS.EDIT_COMPILER_CONFIGURATIONS, this.editCompilerConfigurations.bind(this)),
+      commands.registerCommand(COMMANDS.RESET_COMPILER_CONFIGURATIONS, this.resetCompilerConfigurations.bind(this)),
+      commands.registerCommand(COMMANDS.EDIT_PROJECTS_DATA, this.editProjectsData.bind(this))
     ];
   }
 
@@ -80,37 +83,51 @@ export class GeneralCommands {
       window.showErrorMessage(`Failed to import configuration: ${error}`);
     }
   }
-}
 
-import { FORMAT } from "./constants";
+  private static async editCompilerConfigurations(): Promise<void> {
+    const path = join(osEnv.APPDATA || osEnv.HOME || '', 'ddk', 'compilers.ron');
+    const document = await workspace.openTextDocument(Uri.file(path));
+    await window.showTextDocument(document);
+    await Runtime.client.refresh();
+    await Runtime.projects.workspacesTreeView.refresh();
+    await Runtime.projects.groupProjectTreeView.refresh();
+    await Runtime.projects.compilerStatusBarItem.updateDisplay();
+  }
+
+  private static async resetCompilerConfigurations(): Promise<void> {
+    window.showInformationMessage("Not yet implemented.");
+  }
+
+  private static async editProjectsData(): Promise<void> {
+    const path = join(osEnv.APPDATA || osEnv.HOME || '', 'ddk', 'projects.ron');
+    const document = await workspace.openTextDocument(Uri.file(path));
+    await window.showTextDocument(document);
+    await Runtime.client.refresh();
+    await Runtime.projects.workspacesTreeView.refresh();
+    await Runtime.projects.groupProjectTreeView.refresh();
+    await Runtime.projects.compilerStatusBarItem.updateDisplay();
+  }
+}
 
 export class FormatterCommands {
     public static get registers(): Disposable[] {
         return [
-            commands.registerCommand(FORMAT.COMMAND.EDIT_FORMATTER_CONFIG, this.editFormatterConfig.bind(this))
+            commands.registerCommand(FORMAT.COMMAND.EDIT_FORMATTER_CONFIG, this.editConfig.bind(this)),
+            commands.registerCommand(FORMAT.COMMAND.RESET_FORMATTER_CONFIG, this.resetConfig.bind(this))
         ];
     }
 
-    private static async editFormatterConfig(): Promise<void> {
-        workspace.openTextDocument(await this.getFormatterPath());
+    private static async editConfig(): Promise<void> {
+        const path = join(osEnv.APPDATA || osEnv.HOME || '', 'ddk', 'ddk_formatter.config');
+        const document = await workspace.openTextDocument(Uri.file(path));
+        await window.showTextDocument(document);
+        await Runtime.client.refresh();
+        await Runtime.projects.workspacesTreeView.refresh();
+        await Runtime.projects.groupProjectTreeView.refresh();
+        await Runtime.projects.compilerStatusBarItem.updateDisplay();
     }
 
-    private static async getFormatterPath(): Promise<string> {
-        const path = join(osEnv.APPDATA || osEnv.HOME || '', 'ddk');
-        try {
-            await fs.access(path);
-        } catch {
-            await fs.mkdir(path, { recursive: true });
-        }
-        const configPath = join(path, 'ddk_formatter.config');
-        try {
-            await fs.access(configPath);
-        } catch {
-            await fs.writeFile(
-                configPath,
-                await fs.readFile(Runtime.extension.asAbsolutePath('ddk_formatter.config'))
-            );
-        }
-        return join(path, 'ddk_formatter.config');
+    private static async resetConfig(): Promise<void> {
+        window.showInformationMessage("Not yet implemented.");
     }
 }

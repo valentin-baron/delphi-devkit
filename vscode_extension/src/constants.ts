@@ -109,6 +109,9 @@ export namespace DFM {
 export namespace COMMANDS {
   export const IMPORT_CONFIGURATION = 'ddk.importConfiguration';
   export const EXPORT_CONFIGURATION = 'ddk.exportConfiguration';
+  export const EDIT_COMPILER_CONFIGURATIONS = 'ddk.editCompilerConfigurations';
+  export const RESET_COMPILER_CONFIGURATIONS = 'ddk.resetCompilerConfigurations';
+  export const EDIT_PROJECTS_DATA = 'ddk.editProjectsData';
 }
 
 export namespace FORMAT {
@@ -120,6 +123,7 @@ export namespace FORMAT {
     export const ON_SAVE  = `formatOnSave`;
   }
   export namespace COMMAND {
-    export const EDIT_FORMATTER_CONFIG = `${FORMAT.KEY}.editFormatterConfig`;
+    export const EDIT_FORMATTER_CONFIG = `${FORMAT.KEY}.editConfig`;
+    export const RESET_FORMATTER_CONFIG = `${FORMAT.KEY}.resetConfig`;
   }
 }

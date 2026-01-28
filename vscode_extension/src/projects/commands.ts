@@ -423,7 +423,9 @@ export namespace ProjectsCommands {
         validateInput: (value) => this.checkWorkspaceName(value, data)
       });
       if (!assertError(name, 'Cannot create Workspace without name.')) return;
-      const items = Object.entries(Runtime.compilerConfigurations).map(([key, cfg]) => ({
+      const items = Object.entries(Runtime.compilerConfigurations).sort(([keyA, configA], [keyB, configB]) =>
+        configB.compiler_version - configA.compiler_version
+      ).map(([key, cfg]) => ({
         label: cfg.product_name,
         description: cfg.installation_path,
         detail: key

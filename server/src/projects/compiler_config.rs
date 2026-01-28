@@ -172,7 +172,9 @@ impl CompilerConfigurations {
                 .map_err(|e| anyhow::anyhow!("Failed to create config directory: {}", e))?;
         }
 
-        let content = ron::ser::to_string_pretty(&self, PrettyConfig::default())
+        let content = ron::ser::to_string_pretty(&self, PrettyConfig::default()
+            .struct_names(true)
+            .escape_strings(false))
             .map_err(|e| anyhow::anyhow!("Failed to serialize compilers: {}", e))?;
         std::fs::write(&path, content)
             .map_err(|e| anyhow::anyhow!("Failed to write compilers file: {}", e))?;

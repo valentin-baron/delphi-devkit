@@ -222,8 +222,28 @@
         "category": "DDK"
       },
       {
-        "command": "ddk.editFormatterConfig",
+        "command": "ddk.formatter.editConfig",
         "title": "Edit Formatter Configuration",
+        "category": "DDK"
+      },
+      {
+        "command": "ddk.formatter.resetConfig",
+        "title": "Reset Formatter Configuration",
+        "category": "DDK"
+      },
+      {
+        "command": "ddk.editCompilerConfigurations",
+        "title": "Edit Compiler Configurations",
+        "category": "DDK"
+      },
+      {
+        "command": "ddk.resetCompilerConfigurations",
+        "title": "Reset Compiler Configurations",
+        "category": "DDK"
+      },
+      {
+        "command": "ddk.editProjectsData",
+        "title": "Edit Projects Data",
         "category": "DDK"
       }
     ],
@@ -253,6 +273,11 @@
     },
     "menus": {
       "view/title": [
+        {
+          "command": "ddk.projects.refresh",
+          "when": "view == ddk.view.projects.workspaces",
+          "group": "navigation"
+        },
         {
           "command": "ddk.projects.addWorkspace",
           "when": "view == ddk.view.projects.workspaces",
