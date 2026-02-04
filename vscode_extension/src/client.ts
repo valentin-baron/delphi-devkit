@@ -183,7 +183,7 @@ export class DDK_Client {
 
     public async compileProject(rebuild: boolean, projectId: number, projectLinkId?: number): Promise<boolean> {
         const event = Runtime.addEvent();
-        await this.client.sendNotification('projects/compile', {
+        await this.client.sendRequest('projects/compile', {
             type: 'Project',
             project_id: projectId,
             project_link_id: projectLinkId,
@@ -195,7 +195,7 @@ export class DDK_Client {
 
     public async compileAllInWorkspace(rebuild: boolean, workspaceId: number): Promise<boolean> {
         const event = Runtime.addEvent();
-        await this.client.sendNotification('projects/compile', {
+        await this.client.sendRequest('projects/compile', {
             type: 'AllInWorkspace',
             workspace_id: workspaceId,
             rebuild: rebuild,
@@ -206,7 +206,7 @@ export class DDK_Client {
 
     public async compileAllInGroupProject(rebuild: boolean): Promise<boolean> {
         const event = Runtime.addEvent();
-        await this.client.sendNotification('projects/compile', {
+        await this.client.sendRequest('projects/compile', {
             type: 'AllInGroupProject',
             rebuild: rebuild,
             event_id: event,
@@ -216,7 +216,7 @@ export class DDK_Client {
 
     public async compileFromLink(rebuild: boolean, linkId: number): Promise<boolean> {
         const event = Runtime.addEvent();
-        await this.client.sendNotification('projects/compile', {
+        await this.client.sendRequest('projects/compile', {
             type: 'FromLink',
             link_id: linkId,
             rebuild: rebuild,
