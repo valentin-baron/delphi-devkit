@@ -4,6 +4,13 @@ All notable changes to the "delphi-devkit" extension will be documented in this 
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [2.2.0] - 2026-06-02
+
+### Fixed
+
+- **Exe path resolution for projects with dotted names**: projects like `example.test.external.dproj` now correctly resolve their executable path (e.g. `example.test.external.exe`) using `dproj-rs` 0.3.0's improved `ProjectName` and `DCC_ExeOutput` / `DCC_DependencyCheckOutputName` handling.
+- **Stale exe paths after DDK upgrade**: previously, persisted project data could retain outdated exe/ini paths from older DDK versions. Developer can rediscover paths for affected projects via the "Discover File Paths" command to refresh them.
+
 ## [2.1.3] - 2026-04-28
 
 ### Added

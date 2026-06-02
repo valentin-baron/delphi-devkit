@@ -57,6 +57,7 @@ fn make_data() -> ProjectsData {
             ..Default::default()
         }),
         group_project_compiler_id: "12.0".into(),
+        ..Default::default()
     }
 }
 
@@ -119,6 +120,7 @@ fn project_list_display_with_workspace() {
                 name: "Proj".into(),
                 directory: "dir".into(),
                 dproj: None,
+                exe: None,
                 active: true,
             }],
         }],
