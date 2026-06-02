@@ -54,6 +54,7 @@ fn sample_data() -> ProjectsData {
         ],
         group_project: None,
         group_project_compiler_id: "12.0".to_string(),
+        ..Default::default()
     }
 }
 

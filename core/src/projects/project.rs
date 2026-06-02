@@ -146,7 +146,7 @@ impl Project {
                     get_exe_path(&dproj_path)
                 };
                 if let Ok(exe_path) = exe_result {
-                    let exe_file_name = exe_path.with_extension("exe");
+                    let exe_file_name = exe_path;
                     self.exe = Some(exe_file_name.to_string_lossy().to_string());
                     self.ini = Some(exe_file_name.with_extension("ini").to_string_lossy().to_string());
                 } else {
