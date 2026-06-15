@@ -282,3 +282,180 @@ fn set_compiler_result_display() {
     assert!(display.contains("Delphi 12"));
     assert!(display.contains("12.0"));
 }
+
+#[test]
+fn add_project_result_display() {
+    let result = AddProjectResult {
+        project_id: 7,
+        project_name: "MyApp".into(),
+        workspace_id: 3,
+        workspace_name: "Workspace 1".into(),
+        dproj: None,
+        dpr: Some(r"C:\temp\MyApp.dpr".into()),
+        dpk: None,
+        exe: Some(r"C:\temp\MyApp.exe".into()),
+    };
+    let display = format!("{}", result);
+    assert!(display.contains("MyApp"));
+    assert!(display.contains("Workspace 1"));
+    assert!(display.contains("7"));
+}
+
+#[test]
+fn add_workspace_result_display() {
+    let result = AddWorkspaceResult {
+        workspace_id: 5,
+        name: "Workspace 1".into(),
+        compiler_key: "12.0".into(),
+        compiler_product_name: "Delphi 12.0 Athens".into(),
+    };
+    let display = format!("{}", result);
+    assert!(display.contains("Workspace 1"));
+    assert!(display.contains("Delphi 12.0 Athens"));
+    assert!(display.contains("12.0"));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  resolve_workspace_id
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn resolve_workspace_by_exact_name() {
+    let data = make_data();
+    assert_eq!(resolve_workspace_id(&data, "WS").unwrap(), 4);
+}
+
+#[test]
+fn resolve_workspace_case_insensitive() {
+    let data = make_data();
+    assert_eq!(resolve_workspace_id(&data, "ws").unwrap(), 4);
+}
+
+#[test]
+fn resolve_workspace_by_numeric_id() {
+    let data = make_data();
+    assert_eq!(resolve_workspace_id(&data, "4").unwrap(), 4);
+}
+
+#[test]
+fn resolve_workspace_not_found_errors() {
+    let data = make_data();
+    let err = resolve_workspace_id(&data, "Nope").unwrap_err();
+    assert!(err.to_string().contains("not found"));
+    // Should list the available workspace name.
+    assert!(err.to_string().contains("WS"));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  resolve_project_reference
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn resolve_project_by_numeric_id() {
+    let data = make_data();
+    match resolve_project_reference(&data, "2") {
+        ProjectResolution::Single(id) => assert_eq!(id, 2),
+        other => panic!("expected Single(2), got {other:?}"),
+    }
+}
+
+#[test]
+fn resolve_project_by_exact_name_case_insensitive() {
+    let data = make_data();
+    match resolve_project_reference(&data, "alpha") {
+        ProjectResolution::Single(id) => assert_eq!(id, 1),
+        other => panic!("expected Single(1), got {other:?}"),
+    }
+}
+
+#[test]
+fn resolve_project_substring_single() {
+    let data = make_data();
+    // "amm" only occurs in "Gamma".
+    match resolve_project_reference(&data, "amm") {
+        ProjectResolution::Single(id) => assert_eq!(id, 3),
+        other => panic!("expected Single(3), got {other:?}"),
+    }
+}
+
+#[test]
+fn resolve_project_ambiguous_lists_candidates() {
+    let mut data = make_data();
+    // Two distinct projects sharing the name "be".
+    data.projects.push(Project { id: 20, name: "be".into(), directory: "d1".into(), ..Default::default() });
+    data.projects.push(Project { id: 21, name: "BE".into(), directory: "d2".into(), ..Default::default() });
+    match resolve_project_reference(&data, "be") {
+        ProjectResolution::Ambiguous(matches) => {
+            let ids: Vec<usize> = matches.iter().map(|m| m.id).collect();
+            assert!(ids.contains(&20) && ids.contains(&21));
+            assert_eq!(matches.len(), 2);
+        }
+        other => panic!("expected Ambiguous, got {other:?}"),
+    }
+}
+
+#[test]
+fn resolve_project_not_found() {
+    let data = make_data();
+    matches!(resolve_project_reference(&data, "zzz"), ProjectResolution::NotFound);
+}
+
+#[test]
+fn resolve_project_by_path_unique() {
+    let mut data = make_data();
+    data.projects[0].dproj = Some(r"C:\src\be\D12\be.dproj".into());
+    match resolve_project_by_path(&data, r"C:\src\be\D12\be.dproj") {
+        ProjectResolution::Single(id) => assert_eq!(id, 1),
+        other => panic!("expected Single(1), got {other:?}"),
+    }
+}
+
+#[test]
+fn resolve_project_by_path_case_insensitive_and_separators() {
+    let mut data = make_data();
+    data.projects[1].dpr = Some(r"C:\src\be\D12\be.dpr".into());
+    // Different case + forward slashes must still match.
+    match resolve_project_by_path(&data, r"c:/SRC/be/D12/BE.dpr") {
+        ProjectResolution::Single(id) => assert_eq!(id, 2),
+        other => panic!("expected Single(2), got {other:?}"),
+    }
+}
+
+#[test]
+fn resolve_project_by_path_ambiguous() {
+    let mut data = make_data();
+    // Two projects referencing the same .dproj file.
+    data.projects[0].dproj = Some(r"C:\shared\thing.dproj".into());
+    data.projects[1].dproj = Some(r"C:\shared\thing.dproj".into());
+    match resolve_project_by_path(&data, r"C:\shared\thing.dproj") {
+        ProjectResolution::Ambiguous(matches) => {
+            let ids: Vec<usize> = matches.iter().map(|m| m.id).collect();
+            assert!(ids.contains(&1) && ids.contains(&2));
+        }
+        other => panic!("expected Ambiguous, got {other:?}"),
+    }
+}
+
+#[test]
+fn resolve_project_by_path_not_found_falls_through() {
+    let data = make_data();
+    matches!(
+        resolve_project_by_path(&data, r"C:\nowhere\unmanaged.dpr"),
+        ProjectResolution::NotFound
+    );
+}
+
+#[test]
+fn ambiguous_projects_display_matches_spec() {
+    let amb = AmbiguousProjects {
+        reference: "be".into(),
+        matches: vec![
+            ProjectRef { id: 123, name: "be".into(), location: "Workspace 1".into(), path: r"path\to\be.dpr".into() },
+            ProjectRef { id: 124, name: "be".into(), location: "Workspace 2".into(), path: r"other\be.dpr".into() },
+        ],
+    };
+    let display = format!("{amb}");
+    assert!(display.contains("Project \"be\" matches multiple projects:"));
+    assert!(display.contains("- ID 123 = Workspace 1 - be (path\\to\\be.dpr)"));
+    assert!(display.contains("- ID 124 = Workspace 2 - be"));
+}

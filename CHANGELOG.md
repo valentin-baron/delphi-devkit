@@ -8,6 +8,21 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ### Added
 
+- **Ad-hoc compile by path (CLI + MCP)**: compile a `.dproj`/`.dpr`/`.dpk` that has not been added to any workspace.
+  - CLI: `ddk compile <PATH>`, with `--compiler`/`-c` to pick the compiler (exact key like `12.0` or product name like `"Delphi 12"`; defaults to the newest installed), plus optional `--config` / `--platform` build overrides.
+  - MCP: new `delphi_compile_file` tool with the same options.
+  - If the path already belongs to a managed project (its `.dproj`/`.dpr`/`.dpk` matches one), it is compiled as that project — identical to referencing it by name — and a path shared by several projects lists the candidates instead of compiling. Only a file owned by no project is compiled ad-hoc, against an ephemeral in-memory project (one throw-away workspace bound to the chosen compiler); the persisted project/workspace state is never read or modified.
+- **Compile by project name (CLI + MCP)**: the compile target may now be a project **name** as well as a numeric id. CLI `ddk compile -p <NAME>` and the MCP `delphi_compile_project` `project` parameter accept either. The CLI also accepts a bare positional shorthand — `ddk compile <NAME|ID>` is identical to `-p` (a TARGET ending in `.dproj`/`.dpr`/`.dpk` is treated as an ad-hoc file path instead). When a name matches a single project it is compiled; when it matches several, the candidate projects are listed (ID, workspace, path) instead of compiling, e.g.:
+  ```
+  Project "be" matches multiple projects:
+  - ID 123 = Workspace 1 - be (path\to\be.dpr)
+  - ID 124 = Workspace 2 - be (other\be.dpr)
+  Re-run targeting the specific project ID to compile the correct one.
+  ```
+- **Add projects and workspaces from CLI + MCP**:
+  - CLI: `ddk projects add <PATH> <WORKSPACE>` adds a project file to an existing workspace (workspace resolved by name or numeric id); `ddk projects add_workspace <NAME> <COMPILER>` creates a workspace bound to a compiler. `ddk projects` is an alias of `ddk project`.
+  - MCP: new `delphi_add_project` and `delphi_add_workspace` tools.
+  - Compiler references accept an exact key or a product-name (sub)string, e.g. `"Delphi 12"`.
 - **Compile projects without a `.dproj`**: a project consisting of only a `.dpr` or `.dpk` (no `.dproj`) is now a fully valid, compilable project. Previously MSBuild was handed the bare source file and failed with `MSB4025` ("invalid project file"). DevKit now detects the missing `.dproj` and compiles such projects with the Delphi command-line compiler (`dcc32`/`dcc64`) directly, while projects that have a `.dproj` continue to build through MSBuild as before.
   - **Configuration / platform selection** is offered for bare projects too: since there is no `.dproj` to enumerate, DevKit synthesises `Debug`/`Release` configurations and `Win32`/`Win64` platforms. The selected platform picks the compiler (`Win32` → `dcc32`, `Win64` → `dcc64`); the configuration maps to the relevant `-$` compiler switches. Defaults are `Win32` + `Debug` when nothing is selected.
   - Bare projects now also resolve their executable / INI paths from the source name (a `.dpk` package has no standalone executable), so they no longer fail discovery on add.

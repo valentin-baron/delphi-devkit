@@ -47,10 +47,17 @@ Or download `ddk-windows-x86_64.zip` from the [latest release](https://github.co
 ```
 ddk project list                       # List all known projects
 ddk project select <ID>                # Select a project by ID
+ddk projects add <PATH> <WORKSPACE>    # Add a .dproj/.dpr/.dpk to a workspace (by name)
+ddk projects add_workspace <NAME> <COMPILER>  # Create a workspace bound to a compiler
 ddk compiler list                      # List available compiler configurations
 ddk compiler set <KEY>                 # Set the group project compiler
 ddk compile                            # Compile the active project
+ddk compile <ID|NAME>                  # Compile a project by ID or name (= -p; lists candidates if ambiguous)
+ddk compile -p <ID|NAME>               # Same, explicit flag form
 ddk compile --rebuild -p <ID>          # Rebuild a specific project by ID
+ddk compile <PATH>                     # Compile a .dproj/.dpr/.dpk (uses the owning project if managed, else ad-hoc)
+ddk compile <PATH> -c "Delphi 12"      # ...choosing the compiler (key or product name)
+ddk compile <PATH> --config Release --platform Win64   # ...with build overrides
 ddk compile --show-warnings            # Include warnings verbatim
 ddk compile --show-hints               # Include hints verbatim
 ddk compile --summarize-diagnostics    # Append `<file>: X warn, Y hint` per project
@@ -58,6 +65,15 @@ ddk env                                # Show active project & compiler info
 ddk info                               # Print the DDK README
 ddk --json <command>                   # Output as JSON
 ```
+
+`ddk compile <PATH>` compiles a `.dproj`/`.dpr`/`.dpk`. If the file already
+belongs to a managed project it is compiled as that project (and a file shared
+by several projects lists the candidates instead of compiling); otherwise it is
+compiled ad-hoc without adding it to the saved project list (handy for one-off
+builds). For the ad-hoc case `--compiler`/`-c` selects the compiler by exact key
+(`12.0`) or product name (`Delphi 12`), defaulting to the newest installed
+compiler. The same is exposed to AI tooling via the MCP `delphi_compile_file`,
+`delphi_add_project`, and `delphi_add_workspace` tools.
 
 Compile output for the CLI and the MCP `delphi_compile_project` tool is
 trimmed for AI / token-efficient consumption: the decorative banner box is

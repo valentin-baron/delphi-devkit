@@ -47,6 +47,22 @@ impl Compiler {
         }
     }
 
+    /// Create a standalone compiler operating on an explicit, caller-supplied
+    /// [`ProjectsData`] instead of the persisted global state. Used for ad-hoc
+    /// compilation of a file that has not been added to any saved workspace:
+    /// the caller assembles an ephemeral `ProjectsData` (one workspace + the
+    /// target project) and the regular compile path runs against it unchanged.
+    pub async fn new_standalone_with_data(
+        params: &CompileProjectParams,
+        projects_data: ProjectsData,
+    ) -> Self {
+        Compiler {
+            client: None,
+            params: params.clone(),
+            projects_data,
+        }
+    }
+
     async fn get_project_parameters<'a>(
         &'a self,
         project_id: usize,

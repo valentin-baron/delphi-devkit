@@ -13,6 +13,14 @@ use ddk_core::commands::CompileFilterOptions;
 use ddk_core::projects::{CompilerConfigurations, ProjectsData};
 use ddk_core::state::Stateful;
 
+/// Whether a compile TARGET should be treated as a project file (ad-hoc
+/// compile) rather than a project id/name reference. Decided purely by
+/// extension so a bare name like "be" or "123" is never mistaken for a file.
+fn is_project_file(target: &str) -> bool {
+    let lower = target.to_lowercase();
+    lower.ends_with(".dproj") || lower.ends_with(".dpr") || lower.ends_with(".dpk")
+}
+
 /// DDK – Delphi Development Kit CLI
 #[derive(Parser)]
 #[command(name = "ddk", version, about, long_about = None)]
@@ -28,7 +36,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Manage Delphi projects.
-    #[command(subcommand)]
+    #[command(subcommand, name = "project", visible_alias = "projects")]
     Project(ProjectCmd),
 
     /// Manage Delphi compiler configurations.
@@ -36,14 +44,42 @@ enum Commands {
     Compiler(CompilerCmd),
 
     /// Compile a project. Compiles the active project by default.
+    ///
+    /// TARGET may be a project ID, a project name (same as --project), or a
+    /// path to a .dproj/.dpr/.dpk. A path is compiled ad-hoc (without adding it
+    /// to a workspace); choose its compiler with --compiler.
     Compile {
+        /// What to compile: a project ID, a project name, or a path to a
+        /// .dproj/.dpr/.dpk. Anything ending in .dproj/.dpr/.dpk is treated as
+        /// a file (ad-hoc compile); otherwise as a project ID or name.
+        /// Mutually exclusive with --project.
+        #[arg(conflicts_with = "project")]
+        target: Option<String>,
+
         /// Rebuild from scratch instead of incremental compile.
         #[arg(long)]
         rebuild: bool,
 
-        /// Project ID to compile. If provided, selects the project first.
+        /// Project to compile: a numeric ID or a project name. A name that
+        /// matches several projects lists the candidates instead of compiling.
         #[arg(long, short)]
-        project: Option<usize>,
+        project: Option<String>,
+
+        /// Compiler configuration for an ad-hoc file TARGET: an exact key
+        /// (e.g. "12.0") or product name (e.g. "Delphi 12"). Defaults to the
+        /// newest installed compiler. Only meaningful when TARGET is a file.
+        #[arg(long, short = 'c', requires = "target")]
+        compiler: Option<String>,
+
+        /// Build configuration override for an ad-hoc file TARGET
+        /// (e.g. "Debug", "Release"). Only meaningful when TARGET is a file.
+        #[arg(long, requires = "target")]
+        config: Option<String>,
+
+        /// Target platform override for an ad-hoc file TARGET
+        /// (e.g. "Win32", "Win64"). Only meaningful when TARGET is a file.
+        #[arg(long, requires = "target")]
+        platform: Option<String>,
 
         /// Show warning lines verbatim instead of suppressing them.
         #[arg(long)]
@@ -84,6 +120,21 @@ enum ProjectCmd {
     Select {
         /// The project ID to select.
         id: usize,
+    },
+    /// Add a project file (.dproj/.dpr/.dpk) to a workspace.
+    Add {
+        /// Path to the project file to add.
+        path: String,
+        /// Target workspace name (or numeric id).
+        workspace: String,
+    },
+    /// Create a new workspace bound to a compiler.
+    #[command(name = "add_workspace", visible_alias = "add-workspace")]
+    AddWorkspace {
+        /// Name for the new workspace.
+        name: String,
+        /// Compiler key (e.g. "12.0") or product name (e.g. "Delphi 12").
+        compiler: String,
     },
 }
 
@@ -138,6 +189,22 @@ async fn main() -> Result<()> {
                     println!("{result}");
                 }
             }
+            ProjectCmd::Add { path, workspace } => {
+                let result = commands::cmd_add_project(path, workspace).await?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else {
+                    println!("{result}");
+                }
+            }
+            ProjectCmd::AddWorkspace { name, compiler } => {
+                let result = commands::cmd_add_workspace(name, compiler).await?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else {
+                    println!("{result}");
+                }
+            }
         },
 
         Commands::Compiler(cmd) => match cmd {
@@ -164,8 +231,12 @@ async fn main() -> Result<()> {
         },
 
         Commands::Compile {
+            target,
             rebuild,
             project,
+            compiler,
+            config,
+            platform,
             show_warnings,
             show_hints,
             summarize_diagnostics,
@@ -176,24 +247,60 @@ async fn main() -> Result<()> {
                 show_hints,
                 summarize_diagnostics,
             };
+            // A TARGET ending in a project-file extension is an ad-hoc file
+            // compile; otherwise it is a project reference (id or name), exactly
+            // like --project. `--project` (when no TARGET) keeps working too.
+            let (file_path, project_ref) = match target {
+                Some(t) if is_project_file(&t) => (Some(t), None),
+                Some(t) => (None, Some(t)),
+                None => (None, project),
+            };
+            use commands::CompileOrAmbiguity;
             if cli.json {
-                let output = commands::cmd_compile(rebuild, project, filter).await?;
-                println!("{}", serde_json::to_string_pretty(&output)?);
+                let result = match file_path {
+                    Some(p) => {
+                        commands::cmd_compile_file(p, compiler, config, platform, rebuild, filter)
+                            .await?
+                    }
+                    _ => commands::cmd_compile_ref(rebuild, project_ref, filter).await?,
+                };
+                match result {
+                    CompileOrAmbiguity::Output(o) => {
+                        println!("{}", serde_json::to_string_pretty(&o)?)
+                    }
+                    CompileOrAmbiguity::Ambiguity(a) => {
+                        println!("{}", serde_json::to_string_pretty(&a)?)
+                    }
+                }
             } else {
                 let stdout = std::sync::Arc::new(std::sync::Mutex::new(io::stdout()));
-                let output = commands::cmd_compile_with_progress(
-                    rebuild,
-                    project,
-                    filter,
-                    Some(std::sync::Arc::new(move |line: String| {
+                let on_progress: commands::CompileProgressCallback =
+                    std::sync::Arc::new(move |line: String| {
                         let mut handle = stdout.lock().unwrap();
                         let _ = writeln!(handle, "{line}");
                         let _ = handle.flush();
-                    })),
-                )
-                .await?;
-                if output.lines.is_empty() {
-                    print!("{output}");
+                    });
+                let result = match file_path {
+                    Some(p) => {
+                        commands::cmd_compile_file_with_progress(
+                            p, compiler, config, platform, rebuild, filter, Some(on_progress),
+                        )
+                        .await?
+                    }
+                    _ => {
+                        commands::cmd_compile_ref_with_progress(
+                            rebuild, project_ref, filter, Some(on_progress),
+                        )
+                        .await?
+                    }
+                };
+                match result {
+                    CompileOrAmbiguity::Output(o) => {
+                        if o.lines.is_empty() {
+                            print!("{o}");
+                        }
+                    }
+                    CompileOrAmbiguity::Ambiguity(a) => print!("{a}"),
                 }
             }
         }

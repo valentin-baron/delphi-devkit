@@ -75,10 +75,13 @@ pub struct SetGroupProjectsCompilerArgs {
 
 #[macros::mcp_tool(
     name = "delphi_compile_project",
-    description = "Compiles a Delphi project. \
-        Pass project_id to target a specific project (does not change the active project). \
-        Omit project_id to compile the currently active project. \
-        Use delphi_list_projects to discover IDs. Always match by project name from the user's request. \
+    description = "Compiles a Delphi project (does not change the active project). \
+        Target it with `project`: either a numeric ID or a project name (e.g. \"be\"). \
+        If a name matches several projects, the tool returns the list of candidates \
+        (with their IDs, workspaces and paths) instead of compiling — re-call with the \
+        chosen ID. `project_id` is also accepted for an exact numeric target. \
+        Omit both to compile the currently active project. \
+        Use delphi_list_projects to discover names/IDs. Always match by project name from the user's request. \
         Returns compiler output with the decorative banner stripped. \
         By default warnings and hints are suppressed to save tokens — \
         set show_warnings / show_hints to surface them verbatim, \
@@ -90,8 +93,11 @@ pub struct SetGroupProjectsCompilerArgs {
 pub struct CompileSelectedProjectArgs {
     /// If true, rebuilds the project from scratch. If false, performs an incremental compile.
     pub rebuild: Option<bool>,
-    /// Optional project ID to compile. If provided, that specific project is compiled
-    /// without changing the active project. If omitted, the currently active project is compiled.
+    /// Project to compile: a numeric ID or a project name. A name matching several
+    /// projects returns the candidate list instead of compiling. Takes precedence over project_id.
+    pub project: Option<String>,
+    /// Optional exact project ID to compile (alternative to `project`). If omitted and
+    /// `project` is also omitted, the currently active project is compiled.
     pub project_id: Option<u64>,
     /// Show warning lines verbatim instead of suppressing them. Default: false.
     pub show_warnings: Option<bool>,
@@ -100,6 +106,71 @@ pub struct CompileSelectedProjectArgs {
     /// Emit a per-file `<file>: X warn, Y hint` summary for any
     /// warnings/hints that were not shown verbatim. Default: false.
     pub summarize_diagnostics: Option<bool>,
+}
+
+#[macros::mcp_tool(
+    name = "delphi_compile_file",
+    description = "Compiles a Delphi project file (.dproj/.dpr/.dpk) from a path. \
+        If the file already belongs to a managed project it is compiled as that project \
+        (using its workspace compiler); if several projects share the file, the candidate \
+        list is returned instead of compiling. Only a file owned by no project is compiled \
+        ad-hoc (without adding it to a workspace), which is the main use of this tool. \
+        A bare .dpr/.dpk without a .dproj is supported. \
+        The compiler is selected by `compiler` (an exact key like \"12.0\" or a product name like \
+        \"Delphi 12\"); if omitted, the newest installed compiler is used. \
+        Call delphi_get_available_compilers to discover valid keys. \
+        Optional config (\"Debug\"/\"Release\") and platform (\"Win32\"/\"Win64\") override the build. \
+        Output filtering matches delphi_compile_project (banner stripped; warnings/hints suppressed by default)."
+)]
+#[derive(Debug, Deserialize, Serialize, macros::JsonSchema)]
+pub struct CompileFileArgs {
+    /// Absolute or relative path to the .dproj/.dpr/.dpk file to compile.
+    pub file_path: String,
+    /// Compiler configuration key (e.g. "12.0") or product name (e.g. "Delphi 12").
+    /// If omitted, the newest installed compiler is used.
+    pub compiler: Option<String>,
+    /// Build configuration override, e.g. "Debug" or "Release". Optional.
+    pub config: Option<String>,
+    /// Target platform override, e.g. "Win32" or "Win64". Optional.
+    pub platform: Option<String>,
+    /// If true, rebuilds from scratch. If false/omitted, incremental compile.
+    pub rebuild: Option<bool>,
+    /// Show warning lines verbatim instead of suppressing them. Default: false.
+    pub show_warnings: Option<bool>,
+    /// Show hint lines verbatim instead of suppressing them. Default: false.
+    pub show_hints: Option<bool>,
+    /// Emit a per-file `<file>: X warn, Y hint` summary for suppressed diagnostics. Default: false.
+    pub summarize_diagnostics: Option<bool>,
+}
+
+#[macros::mcp_tool(
+    name = "delphi_add_project",
+    description = "Adds a Delphi project file (.dproj/.dpr/.dpk) to an existing workspace so it \
+        becomes a managed project (listed by delphi_list_projects, compilable by delphi_compile_project). \
+        The workspace is identified by name (e.g. \"Workspace 1\") or numeric id. \
+        Use delphi_list_projects to see existing workspaces, or delphi_add_workspace to create one first."
+)]
+#[derive(Debug, Deserialize, Serialize, macros::JsonSchema)]
+pub struct AddProjectArgs {
+    /// Absolute or relative path to the .dproj/.dpr/.dpk file to add.
+    pub file_path: String,
+    /// Target workspace name (or numeric id).
+    pub workspace: String,
+}
+
+#[macros::mcp_tool(
+    name = "delphi_add_workspace",
+    description = "Creates a new workspace bound to a compiler configuration. Projects added to \
+        the workspace compile with this compiler. The compiler is selected by an exact key \
+        (e.g. \"12.0\") or a product name (e.g. \"Delphi 12\"); call delphi_get_available_compilers \
+        to discover valid keys."
+)]
+#[derive(Debug, Deserialize, Serialize, macros::JsonSchema)]
+pub struct AddWorkspaceArgs {
+    /// Name for the new workspace.
+    pub name: String,
+    /// Compiler key (e.g. "12.0") or product name (e.g. "Delphi 12").
+    pub compiler: String,
 }
 
 #[macros::mcp_tool(
@@ -126,6 +197,9 @@ rust_mcp_sdk::tool_box!(DdkTools, [
     GetAvailableCompilersArgs,
     SetGroupProjectsCompilerArgs,
     CompileSelectedProjectArgs,
+    CompileFileArgs,
+    AddProjectArgs,
+    AddWorkspaceArgs,
     FormatFileArgs,
 ]);
 
@@ -165,6 +239,9 @@ impl ServerHandler for DdkMcpHandler {
             "delphi_get_available_compilers"  => get_available_compilers().await,
             "delphi_set_group_projects_compiler" => set_group_projects_compiler(&args).await,
             "delphi_compile_project"          => compile_project(&args).await,
+            "delphi_compile_file"             => compile_file(&args).await,
+            "delphi_add_project"              => add_project(&args).await,
+            "delphi_add_workspace"            => add_workspace(&args).await,
             "delphi_format_file"              => format_file(&args).await,
             _ => format!("Unknown tool: {name}"),
         };
@@ -226,7 +303,6 @@ async fn set_group_projects_compiler(args: &Value) -> String {
 
 async fn compile_project(args: &Value) -> String {
     let rebuild = args.get("rebuild").and_then(|v| v.as_bool()).unwrap_or(false);
-    let project_id = args.get("project_id").and_then(|v| v.as_u64()).map(|id| id as usize);
     let filter = CompileFilterOptions {
         trim_banners: true,
         show_warnings: args.get("show_warnings").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -236,8 +312,74 @@ async fn compile_project(args: &Value) -> String {
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
     };
-    match commands::cmd_compile(rebuild, project_id, filter).await {
-        Ok(output) => output.to_string(),
+    // `project` (name or id) takes precedence; fall back to a numeric `project_id`.
+    let reference = args
+        .get("project")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            args.get("project_id")
+                .and_then(|v| v.as_u64())
+                .map(|id| id.to_string())
+        });
+    match commands::cmd_compile_ref(rebuild, reference, filter).await {
+        Ok(commands::CompileOrAmbiguity::Output(output)) => output.to_string(),
+        Ok(commands::CompileOrAmbiguity::Ambiguity(amb)) => amb.to_string(),
+        Err(e) => format!("{e}"),
+    }
+}
+
+async fn compile_file(args: &Value) -> String {
+    let file_path = match args.get("file_path").and_then(|v| v.as_str()) {
+        Some(p) => p.to_string(),
+        _ => return "Missing required parameter: file_path".to_string(),
+    };
+    let compiler = args.get("compiler").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let config = args.get("config").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let platform = args.get("platform").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let rebuild = args.get("rebuild").and_then(|v| v.as_bool()).unwrap_or(false);
+    let filter = CompileFilterOptions {
+        trim_banners: true,
+        show_warnings: args.get("show_warnings").and_then(|v| v.as_bool()).unwrap_or(false),
+        show_hints: args.get("show_hints").and_then(|v| v.as_bool()).unwrap_or(false),
+        summarize_diagnostics: args
+            .get("summarize_diagnostics")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    };
+    match commands::cmd_compile_file(file_path, compiler, config, platform, rebuild, filter).await {
+        Ok(commands::CompileOrAmbiguity::Output(output)) => output.to_string(),
+        Ok(commands::CompileOrAmbiguity::Ambiguity(amb)) => amb.to_string(),
+        Err(e) => format!("{e}"),
+    }
+}
+
+async fn add_project(args: &Value) -> String {
+    let file_path = match args.get("file_path").and_then(|v| v.as_str()) {
+        Some(p) => p.to_string(),
+        _ => return "Missing required parameter: file_path".to_string(),
+    };
+    let workspace = match args.get("workspace").and_then(|v| v.as_str()) {
+        Some(w) => w.to_string(),
+        _ => return "Missing required parameter: workspace".to_string(),
+    };
+    match commands::cmd_add_project(file_path, workspace).await {
+        Ok(result) => result.to_string(),
+        Err(e) => format!("{e}"),
+    }
+}
+
+async fn add_workspace(args: &Value) -> String {
+    let name = match args.get("name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        _ => return "Missing required parameter: name".to_string(),
+    };
+    let compiler = match args.get("compiler").and_then(|v| v.as_str()) {
+        Some(c) => c.to_string(),
+        _ => return "Missing required parameter: compiler".to_string(),
+    };
+    match commands::cmd_add_workspace(name, compiler).await {
+        Ok(result) => result.to_string(),
         Err(e) => format!("{e}"),
     }
 }

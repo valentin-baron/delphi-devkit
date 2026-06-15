@@ -11,6 +11,7 @@ use std::fmt;
 use crate::lsp_types::{CompileProjectParams, CompilerProgress, CompilerProgressParams};
 use crate::projects::*;
 use crate::state::*;
+use crate::utils::normalize_path;
 
 // ---------------------------------------------------------------------------
 // Result types
@@ -404,6 +405,206 @@ pub fn find_project_link_id(data: &ProjectsData, project_id: usize) -> Option<us
     None
 }
 
+/// A project candidate surfaced when a name reference is ambiguous.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectRef {
+    pub id: usize,
+    pub name: String,
+    /// Workspace or group-project name the project belongs to (or "(unlinked)").
+    pub location: String,
+    /// The project's primary file (.dproj/.dpr/.dpk) or its directory.
+    pub path: String,
+}
+
+/// Outcome of resolving a project reference (name or numeric id).
+#[derive(Debug, Clone)]
+pub enum ProjectResolution {
+    /// Exactly one project matched; carries its id.
+    Single(usize),
+    /// Several projects matched; the caller should present these candidates.
+    Ambiguous(Vec<ProjectRef>),
+    /// Nothing matched.
+    NotFound,
+}
+
+/// The workspace/group-project name that contains `project_id`.
+fn project_location(data: &ProjectsData, project_id: usize) -> String {
+    for ws in &data.workspaces {
+        if ws.project_links.iter().any(|l| l.project_id == project_id) {
+            return ws.name.clone();
+        }
+    }
+    if let Some(gp) = &data.group_project {
+        if gp.project_links.iter().any(|l| l.project_id == project_id) {
+            return gp.name.clone();
+        }
+    }
+    "(unlinked)".to_string()
+}
+
+fn project_ref(data: &ProjectsData, p: &Project) -> ProjectRef {
+    let path = p
+        .dproj
+        .clone()
+        .or_else(|| p.dpr.clone())
+        .or_else(|| p.dpk.clone())
+        .unwrap_or_else(|| p.directory.clone());
+    ProjectRef {
+        id: p.id,
+        name: p.name.clone(),
+        location: project_location(data, p.id),
+        path,
+    }
+}
+
+/// Resolve a project reference to a concrete project.
+///
+/// A reference that parses as a number and matches an existing project id wins
+/// outright. Otherwise the reference is matched against project names: an
+/// exact (case-insensitive) match is preferred, falling back to a
+/// case-insensitive substring match. A single match resolves to that project;
+/// multiple matches are returned as candidates so the caller can disambiguate.
+pub fn resolve_project_reference(data: &ProjectsData, reference: &str) -> ProjectResolution {
+    if let Ok(id) = reference.parse::<usize>() {
+        if data.get_project(id).is_some() {
+            return ProjectResolution::Single(id);
+        }
+    }
+    let needle = reference.to_lowercase();
+    let exact: Vec<&Project> = data
+        .projects
+        .iter()
+        .filter(|p| p.name.to_lowercase() == needle)
+        .collect();
+    let chosen: Vec<&Project> = if exact.is_empty() {
+        data.projects
+            .iter()
+            .filter(|p| p.name.to_lowercase().contains(&needle))
+            .collect()
+    } else {
+        exact
+    };
+    match chosen.len() {
+        0 => ProjectResolution::NotFound,
+        1 => ProjectResolution::Single(chosen[0].id),
+        _ => ProjectResolution::Ambiguous(chosen.iter().map(|p| project_ref(data, p)).collect()),
+    }
+}
+
+/// Resolve a project **file path** to the managed project(s) that own it
+/// (i.e. whose `.dproj`/`.dpr`/`.dpk` is that file). Paths are normalised and
+/// compared case-insensitively (Windows). Used so that `compile <path>` for a
+/// file already belonging to a project behaves like referencing that project
+/// by name, rather than compiling it ad-hoc.
+pub fn resolve_project_by_path(data: &ProjectsData, path: &str) -> ProjectResolution {
+    let target = normalize_path(path).to_string_lossy().to_lowercase();
+    let owns = |field: &Option<String>| -> bool {
+        field
+            .as_ref()
+            .map(|p| normalize_path(p).to_string_lossy().to_lowercase() == target)
+            .unwrap_or(false)
+    };
+    let chosen: Vec<&Project> = data
+        .projects
+        .iter()
+        .filter(|p| owns(&p.dproj) || owns(&p.dpr) || owns(&p.dpk))
+        .collect();
+    match chosen.len() {
+        0 => ProjectResolution::NotFound,
+        1 => ProjectResolution::Single(chosen[0].id),
+        _ => ProjectResolution::Ambiguous(chosen.iter().map(|p| project_ref(data, p)).collect()),
+    }
+}
+
+/// Resolve a user-supplied compiler reference to a concrete configuration key.
+///
+/// Matching order: exact key (`"12.0"`) → exact product name (case-insensitive,
+/// e.g. `"Delphi 12.0 Athens"`) → unique product-name substring (e.g.
+/// `"Delphi 12"` or `"Athens"`). When `requested` is `None`, the newest
+/// installed compiler (highest `compiler_version`, preferring `"12.0"` on a
+/// tie) is chosen. Errors list the available compilers.
+async fn resolve_compiler_key(requested: Option<String>) -> Result<String> {
+    let configs = COMPILER_CONFIGURATIONS.read().await;
+    if configs.iter().next().is_none() {
+        bail!("No compiler configurations available.");
+    }
+    let available = || -> String {
+        let mut entries: Vec<String> = configs
+            .iter()
+            .map(|(k, c)| format!("{k} ({})", c.product_name))
+            .collect();
+        entries.sort();
+        entries.join(", ")
+    };
+
+    let Some(req) = requested else {
+        // No preference: prefer the canonical default, else the newest compiler.
+        if configs.contains_key("12.0") {
+            return Ok("12.0".to_string());
+        }
+        return configs
+            .iter()
+            .max_by_key(|(_, c)| c.compiler_version)
+            .map(|(k, _)| k.clone())
+            .ok_or_else(|| anyhow::anyhow!("No compiler configurations available."));
+    };
+
+    if configs.contains_key(&req) {
+        return Ok(req);
+    }
+    let needle = req.to_lowercase();
+    let exact: Vec<String> = configs
+        .iter()
+        .filter(|(_, c)| c.product_name.to_lowercase() == needle)
+        .map(|(k, _)| k.clone())
+        .collect();
+    if exact.len() == 1 {
+        return Ok(exact.into_iter().next().unwrap());
+    }
+    let partial: Vec<String> = configs
+        .iter()
+        .filter(|(_, c)| c.product_name.to_lowercase().contains(&needle))
+        .map(|(k, _)| k.clone())
+        .collect();
+    match partial.len() {
+        1 => Ok(partial.into_iter().next().unwrap()),
+        0 => bail!("Unknown compiler \"{req}\". Available: {}", available()),
+        _ => bail!(
+            "Ambiguous compiler \"{req}\" matches keys: {}. Use an exact key from: {}",
+            partial.join(", "),
+            available()
+        ),
+    }
+}
+
+/// Resolve a workspace reference (name, or numeric id) to a workspace id.
+/// Names are matched exactly first, then case-insensitively. Errors list the
+/// available workspace names.
+pub fn resolve_workspace_id(data: &ProjectsData, reference: &str) -> Result<usize> {
+    if let Some(ws) = data.workspaces.iter().find(|w| w.name == reference) {
+        return Ok(ws.id);
+    }
+    let needle = reference.to_lowercase();
+    let ci: Vec<&Workspace> = data
+        .workspaces
+        .iter()
+        .filter(|w| w.name.to_lowercase() == needle)
+        .collect();
+    if ci.len() == 1 {
+        return Ok(ci[0].id);
+    }
+    if let Ok(id) = reference.parse::<usize>() {
+        if data.workspaces.iter().any(|w| w.id == id) {
+            return Ok(id);
+        }
+    }
+    let names: Vec<String> = data.workspaces.iter().map(|w| format!("\"{}\"", w.name)).collect();
+    if names.is_empty() {
+        bail!("No workspaces exist yet. Create one first (e.g. `ddk projects add_workspace`).");
+    }
+    bail!("Workspace \"{reference}\" not found. Available: {}", names.join(", "));
+}
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
@@ -612,6 +813,131 @@ pub async fn cmd_set_group_compiler(compiler_key: String) -> Result<SetCompilerR
     })
 }
 
+/// Confirmation after adding a project to a workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddProjectResult {
+    pub project_id: usize,
+    pub project_name: String,
+    pub workspace_id: usize,
+    pub workspace_name: String,
+    pub dproj: Option<String>,
+    pub dpr: Option<String>,
+    pub dpk: Option<String>,
+    pub exe: Option<String>,
+}
+
+impl fmt::Display for AddProjectResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Added project \"{}\" (ID {}) to workspace \"{}\".",
+            self.project_name, self.project_id, self.workspace_name
+        )
+    }
+}
+
+/// Confirmation after creating a workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddWorkspaceResult {
+    pub workspace_id: usize,
+    pub name: String,
+    pub compiler_key: String,
+    pub compiler_product_name: String,
+}
+
+impl fmt::Display for AddWorkspaceResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Created workspace \"{}\" (ID {}) with compiler {} ({}).",
+            self.name, self.workspace_id, self.compiler_product_name, self.compiler_key
+        )
+    }
+}
+
+/// Adds a project to an existing workspace, identified by workspace name (or
+/// numeric id). The file may be a `.dproj`, `.dpr`, or `.dpk`; bare sources
+/// without a `.dproj` are supported. Returns the newly created project.
+pub async fn cmd_add_project(file_path: String, workspace: String) -> Result<AddProjectResult> {
+    if !std::path::Path::new(&file_path).exists() {
+        bail!("File not found: {file_path}");
+    }
+    let workspace_id = {
+        let data = PROJECTS_DATA.read().await;
+        resolve_workspace_id(&data, &workspace)?
+    };
+
+    let change = Change::NewProject {
+        file_path: file_path.clone(),
+        workspace_id,
+    };
+    change.execute().await?;
+
+    // The newly added project is the last link in the target workspace.
+    let data = PROJECTS_DATA.read().await;
+    let ws = data
+        .get_workspace(workspace_id)
+        .ok_or_else(|| anyhow::anyhow!("Workspace with id {workspace_id} disappeared after add."))?;
+    let workspace_name = ws.name.clone();
+    let project = ws
+        .project_links
+        .last()
+        .and_then(|link| data.get_project(link.project_id))
+        .ok_or_else(|| anyhow::anyhow!("Project was not added to workspace \"{workspace_name}\"."))?;
+
+    Ok(AddProjectResult {
+        project_id: project.id,
+        project_name: project.name.clone(),
+        workspace_id,
+        workspace_name,
+        dproj: project.dproj.clone(),
+        dpr: project.dpr.clone(),
+        dpk: project.dpk.clone(),
+        exe: project.exe.clone(),
+    })
+}
+
+/// Creates a new workspace bound to a compiler configuration. `compiler` is
+/// resolved like the compile commands: exact key, exact product name, or a
+/// unique product-name substring (e.g. `"Delphi 12"`).
+pub async fn cmd_add_workspace(name: String, compiler: String) -> Result<AddWorkspaceResult> {
+    if name.trim().is_empty() {
+        bail!("Workspace name cannot be empty.");
+    }
+    {
+        let data = PROJECTS_DATA.read().await;
+        if data.workspaces.iter().any(|w| w.name == name) {
+            bail!("A workspace named \"{name}\" already exists.");
+        }
+    }
+    let compiler_key = resolve_compiler_key(Some(compiler)).await?;
+    let compiler_product_name = {
+        let configs = COMPILER_CONFIGURATIONS.read().await;
+        configs.get(&compiler_key).map(|c| c.product_name.clone()).unwrap_or_default()
+    };
+
+    let change = Change::AddWorkspace {
+        name: name.clone(),
+        compiler: compiler_key.clone(),
+    };
+    change.execute().await?;
+
+    let data = PROJECTS_DATA.read().await;
+    let workspace_id = data
+        .workspaces
+        .iter()
+        .find(|w| w.name == name)
+        .map(|w| w.id)
+        .ok_or_else(|| anyhow::anyhow!("Workspace \"{name}\" was not created."))?;
+
+    Ok(AddWorkspaceResult {
+        workspace_id,
+        name,
+        compiler_key,
+        compiler_product_name,
+    })
+}
+
 /// Result of formatting a file in-place.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FormatFileResult {
@@ -624,6 +950,32 @@ impl fmt::Display for FormatFileResult {
     }
 }
 
+/// Several projects matched a name reference; presented to the user instead of
+/// compiling so they can re-run with a specific project id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AmbiguousProjects {
+    pub reference: String,
+    pub matches: Vec<ProjectRef>,
+}
+
+impl fmt::Display for AmbiguousProjects {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "Project \"{}\" matches multiple projects:", self.reference)?;
+        for m in &self.matches {
+            writeln!(f, "- ID {} = {} - {} ({})", m.id, m.location, m.name, m.path)?;
+        }
+        write!(f, "Re-run targeting the specific project ID to compile the correct one.")
+    }
+}
+
+/// Result of a reference-based compile: either the compilation output, or a
+/// list of candidate projects when the reference was ambiguous.
+#[derive(Debug, Clone)]
+pub enum CompileOrAmbiguity {
+    Output(CompileOutput),
+    Ambiguity(AmbiguousProjects),
+}
+
 /// Compiles a project. If `project_id` is `Some`, that project is compiled
 /// directly **without** changing the active project in state; otherwise the
 /// currently active project is compiled.
@@ -634,6 +986,50 @@ pub async fn cmd_compile(
     filter: CompileFilterOptions,
 ) -> Result<CompileOutput> {
     cmd_compile_with_progress(rebuild, project_id, filter, None).await
+}
+
+/// Compiles a project selected by a reference (project name or numeric id).
+///
+/// `None` compiles the active project. A reference that uniquely identifies a
+/// project compiles it; a reference matching several projects returns
+/// [`CompileOrAmbiguity::Ambiguity`] (the candidate list) **without** compiling;
+/// a reference matching nothing is an error.
+pub async fn cmd_compile_ref(
+    rebuild: bool,
+    project: Option<String>,
+    filter: CompileFilterOptions,
+) -> Result<CompileOrAmbiguity> {
+    cmd_compile_ref_with_progress(rebuild, project, filter, None).await
+}
+
+/// Like [`cmd_compile_ref`] but streams each compiler output line to
+/// `on_progress` as it arrives (used by the CLI for live output).
+pub async fn cmd_compile_ref_with_progress(
+    rebuild: bool,
+    project: Option<String>,
+    filter: CompileFilterOptions,
+    on_progress: Option<CompileProgressCallback>,
+) -> Result<CompileOrAmbiguity> {
+    let project_id: Option<usize> = match project {
+        None => None,
+        Some(reference) => {
+            let data = PROJECTS_DATA.read().await;
+            match resolve_project_reference(&data, &reference) {
+                ProjectResolution::Single(id) => Some(id),
+                ProjectResolution::Ambiguous(matches) => {
+                    return Ok(CompileOrAmbiguity::Ambiguity(AmbiguousProjects {
+                        reference,
+                        matches,
+                    }));
+                }
+                ProjectResolution::NotFound => {
+                    bail!("No project matches \"{reference}\". Use `list` to see available projects.")
+                }
+            }
+        }
+    };
+    let output = cmd_compile_with_progress(rebuild, project_id, filter, on_progress).await?;
+    Ok(CompileOrAmbiguity::Output(output))
 }
 
 /// Compiles a project and optionally invokes `on_progress` for each emitted
@@ -672,6 +1068,116 @@ pub async fn cmd_compile_with_progress(
         event_id: "cmd-compile".to_string(),
     };
 
+    let compiler = Compiler::new_standalone(&params).await;
+    run_compile_collecting(compiler, project_name, filter, on_progress).await
+}
+
+/// Compiles a Delphi project from a file path.
+///
+/// If the file already belongs to a managed project (its `.dproj`/`.dpr`/`.dpk`
+/// matches one), it is compiled as that managed project — identical to
+/// referencing it by name — and a path shared by several projects yields the
+/// candidate list ([`CompileOrAmbiguity::Ambiguity`]) instead of compiling.
+/// Only a file owned by no project is compiled **ad-hoc**: an ephemeral
+/// [`ProjectsData`] is assembled in memory (a throw-away workspace bound to the
+/// chosen compiler) and the regular compile path runs against it, leaving the
+/// persisted state untouched.
+///
+/// `compiler` selects the ad-hoc compiler configuration: matched first as an
+/// exact key (e.g. `"12.0"`), then by product name (e.g. `"Delphi 12"`); `None`
+/// uses the newest installed compiler. `config` / `platform` are optional
+/// ad-hoc build overrides. (These three are ignored for a managed match, which
+/// uses the project's own workspace compiler and overrides.)
+pub async fn cmd_compile_file(
+    file_path: String,
+    compiler: Option<String>,
+    config: Option<String>,
+    platform: Option<String>,
+    rebuild: bool,
+    filter: CompileFilterOptions,
+) -> Result<CompileOrAmbiguity> {
+    cmd_compile_file_with_progress(file_path, compiler, config, platform, rebuild, filter, None)
+        .await
+}
+
+/// Like [`cmd_compile_file`] but invokes `on_progress` for each emitted
+/// compiler output line as it arrives.
+pub async fn cmd_compile_file_with_progress(
+    file_path: String,
+    compiler: Option<String>,
+    config: Option<String>,
+    platform: Option<String>,
+    rebuild: bool,
+    filter: CompileFilterOptions,
+    on_progress: Option<CompileProgressCallback>,
+) -> Result<CompileOrAmbiguity> {
+    // Prefer a managed project that owns this file: compile it like a named
+    // reference (with ambiguity reporting) rather than ad-hoc.
+    let managed_id = {
+        let data = PROJECTS_DATA.read().await;
+        match resolve_project_by_path(&data, &file_path) {
+            ProjectResolution::Single(id) => Some(id),
+            ProjectResolution::Ambiguous(matches) => {
+                return Ok(CompileOrAmbiguity::Ambiguity(AmbiguousProjects {
+                    reference: file_path,
+                    matches,
+                }));
+            }
+            ProjectResolution::NotFound => None,
+        }
+    };
+    if let Some(id) = managed_id {
+        let output = cmd_compile_with_progress(rebuild, Some(id), filter, on_progress).await?;
+        return Ok(CompileOrAmbiguity::Output(output));
+    }
+
+    // Ad-hoc: the file is not part of any managed project.
+    if !std::path::Path::new(&file_path).exists() {
+        bail!("File not found: {file_path}");
+    }
+    let compiler_key = resolve_compiler_key(compiler).await?;
+
+    // Assemble the ephemeral, non-persisted project state.
+    let mut data = ProjectsData::default();
+    data.new_workspace(&"ad-hoc".to_string(), &compiler_key).await?;
+    let workspace_id = data.workspaces[0].id;
+    data.new_project(&file_path, workspace_id)?;
+    let project = data
+        .projects
+        .last_mut()
+        .ok_or_else(|| anyhow::anyhow!("Failed to create ad-hoc project from: {file_path}"))?;
+    if config.is_some() {
+        project.active_configuration = config;
+    }
+    if platform.is_some() {
+        project.active_platform = platform;
+    }
+    let project_id = project.id;
+    let project_name = project.name.clone();
+    let link_id = find_project_link_id(&data, project_id)
+        .ok_or_else(|| anyhow::anyhow!("Ad-hoc project link was not created."))?;
+
+    let params = CompileProjectParams::Project {
+        project_id,
+        project_link_id: Some(link_id),
+        rebuild,
+        event_id: "cmd-compile-file".to_string(),
+    };
+
+    let compiler = Compiler::new_standalone_with_data(&params, data).await;
+    let output = run_compile_collecting(compiler, project_name, filter, on_progress).await?;
+    Ok(CompileOrAmbiguity::Output(output))
+}
+
+/// Drives a prepared [`Compiler`] to completion while collecting (and
+/// optionally streaming) its broadcast output, applying the diagnostic
+/// filters, and returns the assembled [`CompileOutput`].
+async fn run_compile_collecting(
+    compiler: Compiler,
+    project_name: String,
+    filter: CompileFilterOptions,
+    on_progress: Option<CompileProgressCallback>,
+) -> Result<CompileOutput> {
     // Collect broadcast messages concurrently with compilation.
     let collected: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -750,7 +1256,6 @@ pub async fn cmd_compile_with_progress(
         }
     });
 
-    let compiler = Compiler::new_standalone(&params).await;
     let compile_result = compiler.compile().await;
 
     // Brief settling window for in-flight broadcasts, then stop collector.
