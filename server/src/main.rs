@@ -100,12 +100,23 @@ impl DelphiLsp {
                     params.project_id
                 ))
             })?;
-        let dproj_path = project.dproj.as_ref().ok_or_else(|| {
-            jsonrpc::Error::invalid_params(format!(
-                "Project {} has no .dproj file",
-                params.project_id
-            ))
-        })?;
+        // A bare `.dpr`/`.dpk` has no `.dproj` to enumerate configurations or
+        // platforms from. Such projects are compiled directly with dcc32/dcc64,
+        // so DevKit offers a synthetic set the command-line compiler supports.
+        // The user can still pick a platform; the choice is stored as the
+        // project's `active_platform` override and honoured at compile time.
+        let Some(dproj_path) = project.dproj.as_ref() else {
+            return Ok(DprojMetadataResponse {
+                configurations: ddk_core::projects::BARE_CONFIGURATIONS
+                    .iter().map(|s| s.to_string()).collect(),
+                platforms: ddk_core::projects::BARE_PLATFORMS
+                    .iter().map(|s| s.to_string()).collect(),
+                active_configuration: project.active_configuration.clone()
+                    .unwrap_or_else(|| ddk_core::projects::BARE_DEFAULT_CONFIGURATION.to_string()),
+                active_platform: project.active_platform.clone()
+                    .unwrap_or_else(|| ddk_core::projects::BARE_DEFAULT_PLATFORM.to_string()),
+            });
+        };
         let path = std::path::PathBuf::from(dproj_path);
         let dproj_obj = dproj_cache::get_or_load(project.id, &path).map_err(|e| {
             jsonrpc::Error::invalid_params(format!("Failed to load .dproj: {}", e))

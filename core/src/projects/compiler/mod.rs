@@ -374,8 +374,11 @@ impl Compiler {
                      project.active_platform.clone().unwrap_or_else(|| "Win32".to_string()))
                 }
             } else {
-                (project.active_configuration.clone().unwrap_or_else(|| "Debug".to_string()),
-                 project.active_platform.clone().unwrap_or_else(|| "Win32".to_string()))
+                // Bare `.dpr`/`.dpk`: no dproj defaults exist, so fall back to the
+                // synthetic bare-project defaults (matching what `dproj/metadata`
+                // advertises to the platform picker).
+                (project.active_configuration.clone().unwrap_or_else(|| BARE_DEFAULT_CONFIGURATION.to_string()),
+                 project.active_platform.clone().unwrap_or_else(|| BARE_DEFAULT_PLATFORM.to_string()))
             };
 
             if !parameters.only_one_project {
@@ -404,22 +407,48 @@ impl Compiler {
             let envs = dproj_rs::rsvars::parse_rsvars_file(&rsvars_path)
                 .map_err(|e| anyhow::anyhow!("Failed to parse rsvars.bat: {}", e))?;
             let project_file = project.get_project_file()?;
-            let args = parameters.configuration.build_arguments.join(" ");
-            let target = if parameters.rebuild { "Build" } else { "Make" };
 
-            let msbuild_path = find_msbuild()?;
-            let mut child_process = Command::new(msbuild_path)
-                .arg(project_file)
-                .arg(format!("/t:Clean,{}", target))
-                .args(args.split_whitespace())
-                .arg(format!("/p:Config={}", eff_config))
-                .arg(format!("/p:Configuration={}", eff_config))
-                .arg(format!("/p:Platform={}", eff_platform))
+            // A project with a real `.dproj` is built through MSBuild as before.
+            // A bare `.dpr`/`.dpk` (no `.dproj`) cannot be loaded by MSBuild
+            // (it is Pascal source, not an MSBuild XML project → MSB4025), so it
+            // is compiled with the Delphi command-line compiler directly.
+            let has_dproj = project.dproj.as_deref()
+                .map(|p| !p.is_empty() && PathBuf::from(p).exists())
+                .unwrap_or(false);
+
+            let mut command = if has_dproj {
+                let args = parameters.configuration.build_arguments.join(" ");
+                let target = if parameters.rebuild { "Build" } else { "Make" };
+                let msbuild_path = find_msbuild()?;
+                let mut command = Command::new(msbuild_path);
+                command
+                    .arg(&project_file)
+                    .arg(format!("/t:Clean,{}", target))
+                    .args(args.split_whitespace())
+                    .arg(format!("/p:Config={}", eff_config))
+                    .arg(format!("/p:Configuration={}", eff_config))
+                    .arg(format!("/p:Platform={}", eff_platform));
+                command
+            } else {
+                let dcc_path = find_dcc(&parameters.configuration.installation_path, &eff_platform)?;
+                let mut command = Command::new(dcc_path);
+                command
+                    .arg(&project_file)
+                    .args(dcc_arguments(&eff_config, parameters.rebuild));
+                command
+            };
+
+            command
                 .envs(envs)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()?;
+                .kill_on_drop(true);
+            // dcc resolves relative include/output paths against the working
+            // directory, so run the compiler from the project's own folder.
+            if let Some(dir) = project_file.parent() {
+                command.current_dir(dir);
+            }
+            let mut child_process = command.spawn()?;
 
             // Capture the PID before taking stdio handles so we can kill the
             // entire process tree on cancellation (taskkill /F /T kills MSBuild
@@ -618,6 +647,52 @@ async fn process_output_lines<R: AsyncRead + Unpin + Send>(
         compiler_state::track_diagnosed_file(last_file.clone());
         publish_diagnostics(client.as_ref(), &last_file, &diagnostics).await;
     }
+}
+
+/// Resolve the Delphi command-line compiler for a bare `.dpr`/`.dpk` build.
+/// The platform selects the bitness: `Win64` → `dcc64.exe`, everything else
+/// (including `Win32`) → `dcc32.exe`. The binary lives in the compiler's
+/// `bin` directory.
+fn find_dcc(installation_path: &str, platform: &str) -> Result<PathBuf> {
+    let exe = if platform.eq_ignore_ascii_case("Win64") {
+        "dcc64.exe"
+    } else {
+        "dcc32.exe"
+    };
+    let path = PathBuf::from(installation_path).join("bin").join(exe);
+    if path.exists() {
+        return Ok(path);
+    }
+    anyhow::bail!(
+        "Cannot find {} at path: {}. Please ensure the Delphi installation path is correct.",
+        exe,
+        path.to_string_lossy()
+    );
+}
+
+/// Build the dcc command-line switches for a bare-source compile. There is no
+/// `.dproj` to carry configuration, so the (Debug|Release) selection is mapped
+/// onto the relevant `-$` compiler directives. `rebuild` adds `-B` to force a
+/// full build of every unit.
+fn dcc_arguments(config: &str, rebuild: bool) -> Vec<String> {
+    let mut args = vec!["-Q".to_string()]; // quiet: suppress per-unit progress chatter
+    if rebuild {
+        args.push("-B".to_string()); // build all units, not just out-of-date ones
+    }
+    if config.eq_ignore_ascii_case("Release") {
+        args.push("-$O+".to_string()); // optimization on
+        args.push("-$D-".to_string()); // no debug information
+        args.push("-$L-".to_string()); // no local symbols
+        args.push("-$Y-".to_string()); // no symbol reference info
+    } else {
+        // Debug (also the fallback for any unknown configuration name)
+        args.push("-$O-".to_string()); // optimization off
+        args.push("-$D+".to_string()); // debug information
+        args.push("-$L+".to_string()); // local symbols
+        args.push("-$Y+".to_string()); // symbol reference info
+        args.push("-V".to_string());   // emit TD32 debug info for the debugger
+    }
+    args
 }
 
 fn find_msbuild() -> Result<String> {

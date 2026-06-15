@@ -6,6 +6,17 @@ use crate::projects::*;
 use crate::files::dproj::{find_dproj_file, get_main_source, get_exe_path, get_exe_path_for};
 use crate::utils::normalize_path;
 
+/// Build configurations offered for a bare-source project (no `.dproj`).
+/// DevKit synthesises these because there is no project file to enumerate, and
+/// they map onto the dcc switches produced by the compiler for such projects.
+pub const BARE_CONFIGURATIONS: [&str; 2] = ["Debug", "Release"];
+/// Target platforms offered for a bare-source project. Limited to the two the
+/// command-line compiler can produce directly: `Win32` → dcc32, `Win64` → dcc64.
+pub const BARE_PLATFORMS: [&str; 2] = ["Win32", "Win64"];
+/// Default configuration/platform when a bare project has no override set.
+pub const BARE_DEFAULT_CONFIGURATION: &str = "Debug";
+pub const BARE_DEFAULT_PLATFORM: &str = "Win32";
+
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
 pub struct ProjectLink {
     pub id: usize,
@@ -110,15 +121,32 @@ impl Project {
 
     fn discover_paths_inner(&mut self, config: Option<&str>, platform: Option<&str>) -> Result<()> {
         if self.dproj.is_none() {
+            // A sibling `.dproj` may exist next to the main source; adopt it if so.
+            // Its absence is not an error: a bare `.dpr`/`.dpk` is a valid project.
             if let Some(dpr_path) = &self.dpr {
-                let dproj_path = find_dproj_file(&PathBuf::from(dpr_path))?;
-                self.dproj = Some(normalize_path(&dproj_path).to_string_lossy().to_string());
+                if let Ok(dproj_path) = find_dproj_file(&PathBuf::from(dpr_path)) {
+                    self.dproj = Some(normalize_path(&dproj_path).to_string_lossy().to_string());
+                }
             } else if let Some(dpk_path) = &self.dpk {
-                let dproj_path = find_dproj_file(&PathBuf::from(dpk_path))?;
-                self.dproj = Some(normalize_path(&dproj_path).to_string_lossy().to_string());
+                if let Ok(dproj_path) = find_dproj_file(&PathBuf::from(dpk_path)) {
+                    self.dproj = Some(normalize_path(&dproj_path).to_string_lossy().to_string());
+                }
             }
         }
         if self.dproj.is_none() {
+            // No `.dproj`: resolve paths straight from the bare source. A `.dpr`
+            // yields an executable (and matching `.ini`) alongside the source;
+            // a `.dpk` produces a package with no standalone executable.
+            if let Some(dpr_path) = &self.dpr {
+                let exe = PathBuf::from(dpr_path).with_extension("exe");
+                self.ini = Some(exe.with_extension("ini").to_string_lossy().to_string());
+                self.exe = Some(exe.to_string_lossy().to_string());
+                return Ok(());
+            } else if self.dpk.is_some() {
+                self.exe = None;
+                self.ini = None;
+                return Ok(());
+            }
             anyhow::bail!("Cannot discover paths - no dproj, dpr or dpk available for project id: {}", self.id);
         }
         let dproj_path = PathBuf::from(self.dproj.as_ref().unwrap());

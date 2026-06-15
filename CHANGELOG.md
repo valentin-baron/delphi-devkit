@@ -4,6 +4,14 @@ All notable changes to the "delphi-devkit" extension will be documented in this 
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [2.3.0] - 2026-06-15
+
+### Added
+
+- **Compile projects without a `.dproj`**: a project consisting of only a `.dpr` or `.dpk` (no `.dproj`) is now a fully valid, compilable project. Previously MSBuild was handed the bare source file and failed with `MSB4025` ("invalid project file"). DevKit now detects the missing `.dproj` and compiles such projects with the Delphi command-line compiler (`dcc32`/`dcc64`) directly, while projects that have a `.dproj` continue to build through MSBuild as before.
+  - **Configuration / platform selection** is offered for bare projects too: since there is no `.dproj` to enumerate, DevKit synthesises `Debug`/`Release` configurations and `Win32`/`Win64` platforms. The selected platform picks the compiler (`Win32` → `dcc32`, `Win64` → `dcc64`); the configuration maps to the relevant `-$` compiler switches. Defaults are `Win32` + `Debug` when nothing is selected.
+  - Bare projects now also resolve their executable / INI paths from the source name (a `.dpk` package has no standalone executable), so they no longer fail discovery on add.
+
 ## [2.2.0] - 2026-06-02
 
 ### Fixed

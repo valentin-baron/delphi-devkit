@@ -111,3 +111,63 @@ fn discover_paths_resolves_exe_from_dproj_name() {
         "example.debug.test.ini",
     );
 }
+
+#[test]
+fn discover_paths_resolves_exe_for_bare_dpr_without_dproj() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let dir = tmp_dir.path();
+
+    // Only a .dpr exists — no sibling .dproj. This is a valid project.
+    let dpr_path = dir.join("standalone.dpr");
+    fs::write(&dpr_path, "program standalone;\nbegin\nend.\n").unwrap();
+
+    let mut project = Project {
+        id: 1,
+        name: "standalone".to_string(),
+        directory: dir.to_string_lossy().to_string(),
+        dpr: Some(dpr_path.to_string_lossy().to_string()),
+        ..Default::default()
+    };
+
+    // Must succeed (previously bailed with "DPROJ file not found").
+    project.discover_paths().unwrap();
+
+    // No .dproj should have been invented.
+    assert!(project.dproj.is_none(), "bare .dpr must not gain a .dproj");
+
+    // exe/ini are derived directly from the source name.
+    let exe = project.exe.expect("exe should be set for a bare .dpr");
+    assert_eq!(
+        PathBuf::from(&exe).file_name().unwrap().to_str().unwrap(),
+        "standalone.exe",
+    );
+    let ini = project.ini.expect("ini should be set for a bare .dpr");
+    assert_eq!(
+        PathBuf::from(&ini).file_name().unwrap().to_str().unwrap(),
+        "standalone.ini",
+    );
+}
+
+#[test]
+fn discover_paths_bare_dpk_has_no_exe() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let dir = tmp_dir.path();
+
+    // Only a .dpk exists — a package has no standalone executable.
+    let dpk_path = dir.join("mypackage.dpk");
+    fs::write(&dpk_path, "package mypackage;\nend.\n").unwrap();
+
+    let mut project = Project {
+        id: 1,
+        name: "mypackage".to_string(),
+        directory: dir.to_string_lossy().to_string(),
+        dpk: Some(dpk_path.to_string_lossy().to_string()),
+        ..Default::default()
+    };
+
+    project.discover_paths().unwrap();
+
+    assert!(project.dproj.is_none(), "bare .dpk must not gain a .dproj");
+    assert!(project.exe.is_none(), "a package has no executable");
+    assert!(project.ini.is_none(), "a package has no ini");
+}

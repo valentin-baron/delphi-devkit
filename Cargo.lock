@@ -297,7 +297,7 @@ dependencies = [
 
 [[package]]
 name = "ddk-cli"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -308,7 +308,7 @@ dependencies = [
 
 [[package]]
 name = "ddk-core"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "ddk-mcp-server"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "async-trait",
  "ddk-core",
@@ -348,7 +348,7 @@ dependencies = [
 
 [[package]]
 name = "ddk-server"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "anyhow",
  "ddk-core",

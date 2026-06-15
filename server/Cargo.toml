@@ -1,6 +1,6 @@
 [package]
 name = "ddk-server"
-version = "2.2.0"
+version = "2.3.0"
 edition = "2024"
 authors = ["Valentin Baron"]
 license-file = "../LICENSE"
