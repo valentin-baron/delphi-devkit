@@ -33,6 +33,7 @@ pub struct ProjectUpdateData {
     pub dpk: Option<String>,
     pub exe: Option<String>,
     pub ini: Option<String>,
+    pub start_parameters: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

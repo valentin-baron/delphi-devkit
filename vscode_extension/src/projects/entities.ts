@@ -38,6 +38,7 @@ export namespace Entities {
     ini?: Option<string>;
     active_configuration?: Option<string>;
     active_platform?: Option<string>;
+    start_parameters?: Option<string>;
   }
 
   export class ProjectLink {

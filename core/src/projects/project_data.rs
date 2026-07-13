@@ -196,6 +196,7 @@ impl ProjectsData {
                     ini: None,
                     active_configuration: None,
                     active_platform: None,
+                    start_parameters: None,
                 }
             },
             Some(ext) if ext == "dpr" => {
@@ -210,6 +211,7 @@ impl ProjectsData {
                     ini: None,
                     active_configuration: None,
                     active_platform: None,
+                    start_parameters: None,
                 }
             },
             Some(ext) if ext == "dpk" => {
@@ -224,6 +226,7 @@ impl ProjectsData {
                     ini: None,
                     active_configuration: None,
                     active_platform: None,
+                    start_parameters: None,
                 }
             },
             _ => {
@@ -423,6 +426,10 @@ impl ProjectsData {
                 anyhow::bail!(".ini file does not exist: {}", ini);
             }
             project.ini = Some(ini);
+        }
+        if let Some(start_parameters) = data.start_parameters {
+            let start_parameters = start_parameters.trim().to_string();
+            project.start_parameters = if start_parameters.is_empty() { None } else { Some(start_parameters) };
         }
         return Ok(());
     }

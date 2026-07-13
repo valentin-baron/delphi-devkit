@@ -75,6 +75,8 @@ pub struct Project {
     /// Per-project build platform override (e.g. "Win32", "Win64").
     /// `None` means use the `.dproj` file default.
     pub active_platform: Option<String>,
+    /// Command-line arguments passed to the executable when run via RunProgram.
+    pub start_parameters: Option<String>,
 }
 
 impl Default for Project {
@@ -90,6 +92,7 @@ impl Default for Project {
             ini: None,
             active_configuration: None,
             active_platform: None,
+            start_parameters: None,
         }
     }
 }

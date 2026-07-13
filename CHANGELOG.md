@@ -4,6 +4,12 @@ All notable changes to the "delphi-devkit" extension will be documented in this 
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [Unreleased]
+
+### Added
+
+- **Start Parameters for RunProgram**: new "Set Start Parameters" context menu item on projects lets you configure command-line arguments passed to the executable. Running a project (via the context menu "Run" action or "Run Selected Project" / `F9`) now launches the executable directly with those arguments instead of via the OS shell handler, which previously could not pass arguments at all.
+
 ## [2.3.0] - 2026-06-15
 
 ### Added

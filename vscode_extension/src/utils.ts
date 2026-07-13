@@ -1,5 +1,6 @@
-import { basename, extname } from 'path';
+import { basename, dirname, extname } from 'path';
 import { Uri, workspace, window } from 'vscode';
+import { spawn } from 'child_process';
 
 export async function fileExists(filePath: string | Uri | undefined | null): Promise<boolean> {
   if (!filePath) return false;
@@ -20,4 +21,18 @@ export function basenameNoExt(filePath: string | Uri): string {
 
 export function assertError(condition: any, message: string): boolean {
   return !!condition || (window.showErrorMessage(message), false);
+}
+
+// Splits a start-parameters string into argv entries, honoring double-quoted segments.
+export function splitCommandLineArgs(input: string): string[] {
+  const args: string[] = [];
+  const regex = /"([^"]*)"|(\S+)/g;
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(input)) !== null) args.push(match[1] !== undefined ? match[1] : match[2]);
+  return args;
+}
+
+export function launchExecutable(exePath: string, startParameters?: string | null): void {
+  const args = startParameters ? splitCommandLineArgs(startParameters) : [];
+  spawn(exePath, args, { cwd: dirname(exePath), detached: true, stdio: 'ignore' }).unref();
 }

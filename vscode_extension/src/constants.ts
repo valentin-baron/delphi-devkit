@@ -44,6 +44,7 @@ export namespace PROJECTS {
     export const OPEN_IN_FILE_EXPLORER = `${PROJECTS.CONFIG.KEY}.openInFileExplorer`;
     export const RUN_EXECUTABLE = `${PROJECTS.CONFIG.KEY}.runExecutable`;
     export const CONFIGURE_OR_CREATE_INI = `${PROJECTS.CONFIG.KEY}.configureOrCreateIni`;
+    export const SET_START_PARAMETERS = `${PROJECTS.CONFIG.KEY}.setStartParameters`;
     export const SELECT_GROUP_PROJECT = `${PROJECTS.CONFIG.KEY}.pickGroupProject`;
     export const UNLOAD_GROUP_PROJECT = `${PROJECTS.CONFIG.KEY}.unloadGroupProject`;
     export const SELECT_COMPILER = `${PROJECTS.CONFIG.KEY}.selectCompilerConfiguration`;

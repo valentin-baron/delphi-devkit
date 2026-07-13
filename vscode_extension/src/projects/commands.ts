@@ -1,4 +1,4 @@
-import { commands, env, Uri, window, Disposable, TreeItem } from 'vscode';
+import { commands, Uri, window, Disposable, TreeItem } from 'vscode';
 import { dirname, join } from 'path';
 import { promises as fs } from 'fs';
 import { Runtime } from '../runtime';
@@ -7,7 +7,7 @@ import { Coroutine, DelphiProjectTreeItemType } from '../types';
 import { Entities } from './entities';
 import { BaseFileItem } from './trees/items/baseFile';
 import { ProjectItem } from './trees/items/project';
-import { assertError, basenameNoExt } from '../utils';
+import { assertError, basenameNoExt, launchExecutable } from '../utils';
 import { WorkspaceItem } from './trees/items/workspaceItem';
 import { Change } from '../client';
 import { Option } from '../types';
@@ -60,8 +60,7 @@ export namespace ProjectsCommands {
           return;
         }
         try {
-          // Use the system's default application handler to launch the executable
-          await env.openExternal(Uri.file(project.exe));
+          launchExecutable(project.exe, project.start_parameters);
           window.showInformationMessage(`Running: ${project.exe}`);
         } catch (error) {
           window.showErrorMessage(`Failed to launch executable: ${error}`);
@@ -79,6 +78,7 @@ export namespace ProjectsCommands {
         commands.registerCommand(PROJECTS.COMMAND.OPEN_IN_FILE_EXPLORER, this.openInFileExplorer.bind(this)),
         commands.registerCommand(PROJECTS.COMMAND.RUN_EXECUTABLE, this.runExecutable.bind(this)),
         commands.registerCommand(PROJECTS.COMMAND.CONFIGURE_OR_CREATE_INI, this.configureOrCreateIni.bind(this)),
+        commands.registerCommand(PROJECTS.COMMAND.SET_START_PARAMETERS, this.setStartParameters.bind(this)),
         commands.registerCommand(PROJECTS.COMMAND.SELECT_PROJECT, this.selectProject.bind(this)),
         commands.registerCommand(PROJECTS.COMMAND.COMPILE_ALL_IN_WORKSPACE, this.compileAllInWorkspace.bind(this)),
         commands.registerCommand(PROJECTS.COMMAND.RECREATE_ALL_IN_WORKSPACE, this.recreateAllInWorkspace.bind(this)),
@@ -116,10 +116,40 @@ export namespace ProjectsCommands {
     }
 
     private static async runExecutable(item: BaseFileItem): Promise<void> {
-      if (item.projectExe) {
-        await env.openExternal(item.projectExe);
+      if (!item.projectExe) {
+        window.showWarningMessage(`No executable found for: ${item.label}`);
+        return;
+      }
+      try {
+        launchExecutable(item.projectExe.fsPath, item.project.entity.start_parameters);
         window.showInformationMessage(`Running: ${item.projectExe.fsPath}`);
-      } else window.showWarningMessage(`No executable found for: ${item.label}`);
+      } catch (error) {
+        window.showErrorMessage(`Failed to launch executable: ${error}`);
+      }
+    }
+
+    private static async setStartParameters(item: BaseFileItem): Promise<void> {
+      if (!assertError(item.projectExe, `No executable for: ${item.label} - cannot set start parameters.`)) return;
+      const project = item.project;
+      const value = await window.showInputBox({
+        title: `Start Parameters – ${project.entity.name}`,
+        prompt: 'Command-line arguments passed to the executable when run',
+        placeHolder: 'e.g. -flag "value with spaces"',
+        value: project.entity.start_parameters ?? ''
+      });
+      if (value === undefined) return;
+      await Runtime.client.applyChanges([
+        {
+          type: 'UpdateProject',
+          project_id: project.entity.id,
+          data: {
+            start_parameters: value
+          }
+        }
+      ]);
+      window.showInformationMessage(
+        value.trim() ? `Updated start parameters for: ${project.entity.name}` : `Cleared start parameters for: ${project.entity.name}`
+      );
     }
 
     private static async createIniFile(item: BaseFileItem): Promise<void> {

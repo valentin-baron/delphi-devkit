@@ -108,6 +108,12 @@
         "category": "DDK"
       },
       {
+        "command": "ddk.projects.setStartParameters",
+        "title": "Set Start Parameters",
+        "icon": "$(terminal)",
+        "category": "DDK"
+      },
+      {
         "command": "ddk.projects.compileAllFromHere",
         "title": "Compile all from here",
         "category": "DDK"
@@ -384,6 +390,10 @@
           "when": "false"
         },
         {
+          "command": "ddk.projects.setStartParameters",
+          "when": "false"
+        },
+        {
           "command": "ddk.projects.compileAllFromHere",
           "when": "false"
         },
@@ -554,6 +564,11 @@
           "command": "ddk.projects.configureOrCreateIni",
           "when": "view =~ /^ddk\\.view\\.projects.*/ && (viewItem == ddk.context.projects.project || viewItem == ddk.context.projects.projectFile)",
           "group": "4_exe_actions@2"
+        },
+        {
+          "command": "ddk.projects.setStartParameters",
+          "when": "view =~ /^ddk\\.view\\.projects.*/ && (viewItem == ddk.context.projects.project || viewItem == ddk.context.projects.projectFile)",
+          "group": "4_exe_actions@3"
         },
         {
           "command": "ddk.projects.renameWorkspace",
