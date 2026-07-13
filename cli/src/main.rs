@@ -21,6 +21,12 @@ fn is_project_file(target: &str) -> bool {
     lower.ends_with(".dproj") || lower.ends_with(".dpr") || lower.ends_with(".dpk")
 }
 
+/// Whether a `run` TARGET should be treated as a file path (project file or
+/// executable) rather than a project id/name reference.
+fn is_run_target_file(target: &str) -> bool {
+    is_project_file(target) || target.to_lowercase().ends_with(".exe")
+}
+
 /// DDK – Delphi Development Kit CLI
 #[derive(Parser)]
 #[command(name = "ddk", version, about, long_about = None)]
@@ -93,6 +99,32 @@ enum Commands {
         /// warnings/hints that were not shown verbatim.
         #[arg(long)]
         summarize_diagnostics: bool,
+    },
+
+    /// Run a project's built executable directly. Runs the active project by
+    /// default. Never compiles — the executable must already exist.
+    ///
+    /// TARGET may be a project ID, a project name (same as --project), or a
+    /// path to a .dproj/.dpr/.dpk/.exe. A project-file path resolves to its
+    /// managed project (like referencing it by name); a .exe path runs
+    /// directly, bypassing project resolution entirely.
+    Run {
+        /// What to run: a project ID, a project name, or a path to a
+        /// .dproj/.dpr/.dpk/.exe. Anything ending in one of those extensions
+        /// is treated as a file; otherwise as a project ID or name. Mutually
+        /// exclusive with --project.
+        #[arg(conflicts_with = "project")]
+        target: Option<String>,
+
+        /// Project to run: a numeric ID or a project name. A name that
+        /// matches several projects lists the candidates instead of running.
+        #[arg(long, short)]
+        project: Option<String>,
+
+        /// Command-line arguments passed to the executable, overriding the
+        /// project's saved Start Parameters for this run only.
+        #[arg(long, short)]
+        args: Option<String>,
     },
 
     /// Show environment info for the active project.
@@ -301,6 +333,39 @@ async fn main() -> Result<()> {
                         }
                     }
                     CompileOrAmbiguity::Ambiguity(a) => print!("{a}"),
+                }
+            }
+        }
+
+        Commands::Run { target, project, args } => {
+            // A TARGET that looks like a project file or executable is a
+            // file-path run; otherwise it is a project reference (id or
+            // name), exactly like --project. `--project` (when no TARGET)
+            // keeps working too.
+            let (file_path, project_ref) = match target {
+                Some(t) if is_run_target_file(&t) => (Some(t), None),
+                Some(t) => (None, Some(t)),
+                None => (None, project),
+            };
+            use commands::RunOrAmbiguity;
+            let result = match file_path {
+                Some(p) => commands::cmd_run_path(p, args).await?,
+                _ => commands::cmd_run_ref(project_ref, args).await?,
+            };
+            match result {
+                RunOrAmbiguity::Output(o) => {
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&o)?);
+                    } else {
+                        println!("{o}");
+                    }
+                }
+                RunOrAmbiguity::Ambiguity(a) => {
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&a)?);
+                    } else {
+                        print!("{a}");
+                    }
                 }
             }
         }

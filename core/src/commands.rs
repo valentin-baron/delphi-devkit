@@ -5,6 +5,7 @@
 //! present it (JSON for MCP, human-readable table for CLI, etc.).
 
 use anyhow::{Context, Result, bail};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -1291,6 +1292,175 @@ async fn run_compile_collecting(
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Run
+// ---------------------------------------------------------------------------
+
+/// Result of running a project's built executable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunOutput {
+    /// Name of the managed project that owns the executable, or `None` when
+    /// an `.exe` path was run directly without going through a project.
+    pub project_name: Option<String>,
+    pub exe: String,
+    pub args: Vec<String>,
+}
+
+impl fmt::Display for RunOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.project_name {
+            Some(name) => write!(f, "Running \"{name}\": {}", self.exe)?,
+            _ => write!(f, "Running: {}", self.exe)?,
+        }
+        if !self.args.is_empty() {
+            write!(f, " {}", self.args.join(" "))?;
+        }
+        Ok(())
+    }
+}
+
+/// Result of a reference-based run: either the run output, or a list of
+/// candidate projects when the reference/path was ambiguous.
+#[derive(Debug, Clone)]
+pub enum RunOrAmbiguity {
+    Output(RunOutput),
+    Ambiguity(AmbiguousProjects),
+}
+
+/// Splits a start-parameters string into argv entries, honoring
+/// double-quoted segments (e.g. `-flag "value with spaces"`).
+fn split_run_args(args: &str) -> Vec<String> {
+    let re = Regex::new(r#""([^"]*)"|(\S+)"#).unwrap();
+    re.captures_iter(args)
+        .map(|c| c.get(1).or_else(|| c.get(2)).unwrap().as_str().to_string())
+        .collect()
+}
+
+/// Launches an executable detached (not awaited); the child process outlives
+/// this call and keeps running independently of DDK.
+fn launch_executable(exe_path: &str, args: &[String]) -> Result<()> {
+    let exe = std::path::Path::new(exe_path);
+    if !exe.exists() {
+        bail!("Executable not found: {exe_path}");
+    }
+    let mut command = std::process::Command::new(exe);
+    command.args(args);
+    if let Some(dir) = exe.parent() {
+        command.current_dir(dir);
+    }
+    command
+        .spawn()
+        .with_context(|| format!("Failed to launch executable: {exe_path}"))?;
+    Ok(())
+}
+
+/// Runs a project selected by internal id (or the active project when
+/// `None`). `args`, when given, overrides the project's persisted Start
+/// Parameters for this invocation only.
+pub async fn cmd_run(project_id: Option<usize>, args: Option<String>) -> Result<RunOutput> {
+    let (project_name, exe, start_parameters) = {
+        let data = PROJECTS_DATA.read().await;
+        let target_id = match project_id.or(data.active_project_id) {
+            Some(id) => id,
+            _ => bail!("No active project selected."),
+        };
+        let project = match data.get_project(target_id) {
+            Some(p) => p,
+            _ => bail!("Project with ID {target_id} not found."),
+        };
+        let exe = match &project.exe {
+            Some(exe) => exe.clone(),
+            _ => bail!(
+                "Project \"{}\" has no executable. Compile it first, or set its .exe path.",
+                project.name
+            ),
+        };
+        (project.name.clone(), exe, project.start_parameters.clone())
+    };
+    let raw_args = args.or(start_parameters).unwrap_or_default();
+    let parsed_args = split_run_args(&raw_args);
+    launch_executable(&exe, &parsed_args)?;
+    Ok(RunOutput { project_name: Some(project_name), exe, args: parsed_args })
+}
+
+/// Runs a project selected by a reference (project name or numeric id).
+///
+/// `None` runs the active project. A reference that uniquely identifies a
+/// project runs it; a reference matching several projects returns
+/// [`RunOrAmbiguity::Ambiguity`] (the candidate list) **without** running; a
+/// reference matching nothing is an error.
+pub async fn cmd_run_ref(project: Option<String>, args: Option<String>) -> Result<RunOrAmbiguity> {
+    let project_id: Option<usize> = match project {
+        None => None,
+        Some(reference) => {
+            let data = PROJECTS_DATA.read().await;
+            match resolve_project_reference(&data, &reference) {
+                ProjectResolution::Single(id) => Some(id),
+                ProjectResolution::Ambiguous(matches) => {
+                    return Ok(RunOrAmbiguity::Ambiguity(AmbiguousProjects { reference, matches }));
+                }
+                ProjectResolution::NotFound => {
+                    bail!("No project matches \"{reference}\". Use `list` to see available projects.")
+                }
+            }
+        }
+    };
+    Ok(RunOrAmbiguity::Output(cmd_run(project_id, args).await?))
+}
+
+/// Runs a Delphi project's executable identified by its project file.
+///
+/// If the file belongs to a managed project (its `.dproj`/`.dpr`/`.dpk`
+/// matches one), that project's stored executable is run — identical to
+/// referencing it by name — and a path shared by several projects yields the
+/// candidate list ([`RunOrAmbiguity::Ambiguity`]) instead of running. Unlike
+/// `compile`, a file owned by no project is an **error**: `run` never builds
+/// or assembles ad-hoc state, since there is nothing to execute until the
+/// project is compiled. Run a bare `.exe` path directly via [`cmd_run_exe`]
+/// instead.
+pub async fn cmd_run_file(file_path: String, args: Option<String>) -> Result<RunOrAmbiguity> {
+    let managed_id = {
+        let data = PROJECTS_DATA.read().await;
+        match resolve_project_by_path(&data, &file_path) {
+            ProjectResolution::Single(id) => Some(id),
+            ProjectResolution::Ambiguous(matches) => {
+                return Ok(RunOrAmbiguity::Ambiguity(AmbiguousProjects { reference: file_path, matches }));
+            }
+            ProjectResolution::NotFound => None,
+        }
+    };
+    match managed_id {
+        Some(id) => Ok(RunOrAmbiguity::Output(cmd_run(Some(id), args).await?)),
+        _ => bail!(
+            "\"{file_path}\" is not part of a managed project. Add it to a workspace first, or run its .exe path directly."
+        ),
+    }
+}
+
+/// Runs an arbitrary executable directly, bypassing project resolution
+/// entirely. `args` are the command-line arguments to pass, split honoring
+/// double quotes; omit for none.
+pub async fn cmd_run_exe(exe_path: String, args: Option<String>) -> Result<RunOutput> {
+    let parsed_args = args.map(|a| split_run_args(&a)).unwrap_or_default();
+    launch_executable(&exe_path, &parsed_args)?;
+    Ok(RunOutput { project_name: None, exe: exe_path, args: parsed_args })
+}
+
+/// Runs a target identified by file path, dispatching on its extension: a
+/// `.dproj`/`.dpr`/`.dpk` resolves to its managed project (see
+/// [`cmd_run_file`]); a `.exe` runs directly (see [`cmd_run_exe`]). Used by
+/// the CLI/MCP so both share one extension-dispatch rule.
+pub async fn cmd_run_path(path: String, args: Option<String>) -> Result<RunOrAmbiguity> {
+    let lower = path.to_lowercase();
+    if lower.ends_with(".exe") {
+        return Ok(RunOrAmbiguity::Output(cmd_run_exe(path, args).await?));
+    }
+    if lower.ends_with(".dproj") || lower.ends_with(".dpr") || lower.ends_with(".dpk") {
+        return cmd_run_file(path, args).await;
+    }
+    bail!("\"{path}\" is not a recognized project or executable file (expected .dproj/.dpr/.dpk/.exe).");
 }
 
 /// Formats a Delphi source file in-place.

@@ -61,6 +61,10 @@ ddk compile <PATH> --config Release --platform Win64   # ...with build overrides
 ddk compile --show-warnings            # Include warnings verbatim
 ddk compile --show-hints               # Include hints verbatim
 ddk compile --summarize-diagnostics    # Append `<file>: X warn, Y hint` per project
+ddk run                                # Run the active project's executable
+ddk run <ID|NAME>                      # Run a project by ID or name (= -p; lists candidates if ambiguous)
+ddk run <PATH>                         # Run a .exe directly, or a .dproj/.dpr/.dpk's owning project
+ddk run -a "-flag \"value with spaces\""  # Override the project's saved Start Parameters for this run
 ddk env                                # Show active project & compiler info
 ddk info                               # Print the DDK README
 ddk --json <command>                   # Output as JSON
@@ -79,6 +83,15 @@ Compile output for the CLI and the MCP `delphi_compile_project` tool is
 trimmed for AI / token-efficient consumption: the decorative banner box is
 stripped and warning / hint lines are hidden by default. Errors and the final
 status line are always shown.
+
+`ddk run <PATH>` dispatches on the file extension: a `.exe` is launched
+directly; a `.dproj`/`.dpr`/`.dpk` must already belong to a managed project
+(its stored executable is run, same resolution as by name) — it is never
+compiled or run ad-hoc. `--args`/`-a` overrides the project's saved Start
+Parameters (see `Set Start Parameters` below) for that one run; the process
+is launched detached, so the CLI/MCP call returns immediately without
+waiting for it to exit. The same is exposed to AI tooling via the MCP
+`delphi_run_project` and `delphi_run_file` tools.
 
 ## Demos
 
@@ -137,6 +150,7 @@ status line are always shown.
 * `Recreate All in Group Project` - Clean and rebuild all projects in the loaded group project
 * `Cancel Compilation` - Cancel the active compilation (Ctrl+F2)
 * `Run Selected Project` - Execute the selected project (F9)
+* `Set Start Parameters` - Configure command-line arguments passed to the executable when run
 * `Configure/Create .ini` - Create or edit INI configuration files
 * `Set Manual Path` - Manually set the .dproj path for a project
 

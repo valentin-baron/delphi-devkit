@@ -144,6 +144,54 @@ pub struct CompileFileArgs {
 }
 
 #[macros::mcp_tool(
+    name = "delphi_run_project",
+    description = "Runs a Delphi project's built executable directly. Does not compile — \
+        the executable must already exist (call delphi_compile_project first if unsure). \
+        Target it with `project`: either a numeric ID or a project name (e.g. \"be\"). \
+        If a name matches several projects, the tool returns the list of candidates \
+        (with their IDs, workspaces and paths) instead of running — re-call with the \
+        chosen ID. `project_id` is also accepted for an exact numeric target. \
+        Omit both to run the currently active project. \
+        Use delphi_list_projects to discover names/IDs. Always match by project name from the user's request. \
+        `args` overrides the project's saved Start Parameters (see the \"Set Start Parameters\" \
+        project command in the VS Code extension) for this invocation only; omit it to use \
+        whatever the project has saved. \
+        The process is launched detached; this tool returns immediately without waiting for it to exit."
+)]
+#[derive(Debug, Deserialize, Serialize, macros::JsonSchema)]
+pub struct RunProjectArgs {
+    /// Project to run: a numeric ID or a project name. A name matching several
+    /// projects returns the candidate list instead of running. Takes precedence over project_id.
+    pub project: Option<String>,
+    /// Optional exact project ID to run (alternative to `project`). If omitted and
+    /// `project` is also omitted, the currently active project is run.
+    pub project_id: Option<u64>,
+    /// Command-line arguments passed to the executable, overriding the project's
+    /// saved Start Parameters for this invocation only. Optional.
+    pub args: Option<String>,
+}
+
+#[macros::mcp_tool(
+    name = "delphi_run_file",
+    description = "Runs an executable from a path. If the path is a .dproj/.dpr/.dpk, it must \
+        already belong to a managed project — its stored executable is run, identical to \
+        referencing the project by name — and a path shared by several projects returns the \
+        candidate list instead of running. If the path is a .exe, it is launched directly, \
+        bypassing project resolution entirely. Unlike delphi_compile_file, this never compiles \
+        or assembles ad-hoc project state: the target executable must already exist. \
+        `args` are command-line arguments for the process; for a project-file path they override \
+        the project's saved Start Parameters for this invocation only. \
+        The process is launched detached; this tool returns immediately without waiting for it to exit."
+)]
+#[derive(Debug, Deserialize, Serialize, macros::JsonSchema)]
+pub struct RunFileArgs {
+    /// Absolute or relative path to the .dproj/.dpr/.dpk/.exe to run.
+    pub file_path: String,
+    /// Command-line arguments passed to the executable. Optional.
+    pub args: Option<String>,
+}
+
+#[macros::mcp_tool(
     name = "delphi_add_project",
     description = "Adds a Delphi project file (.dproj/.dpr/.dpk) to an existing workspace so it \
         becomes a managed project (listed by delphi_list_projects, compilable by delphi_compile_project). \
@@ -198,6 +246,8 @@ rust_mcp_sdk::tool_box!(DdkTools, [
     SetGroupProjectsCompilerArgs,
     CompileSelectedProjectArgs,
     CompileFileArgs,
+    RunProjectArgs,
+    RunFileArgs,
     AddProjectArgs,
     AddWorkspaceArgs,
     FormatFileArgs,
@@ -240,6 +290,8 @@ impl ServerHandler for DdkMcpHandler {
             "delphi_set_group_projects_compiler" => set_group_projects_compiler(&args).await,
             "delphi_compile_project"          => compile_project(&args).await,
             "delphi_compile_file"             => compile_file(&args).await,
+            "delphi_run_project"              => run_project(&args).await,
+            "delphi_run_file"                 => run_file(&args).await,
             "delphi_add_project"              => add_project(&args).await,
             "delphi_add_workspace"            => add_workspace(&args).await,
             "delphi_format_file"              => format_file(&args).await,
@@ -350,6 +402,38 @@ async fn compile_file(args: &Value) -> String {
     match commands::cmd_compile_file(file_path, compiler, config, platform, rebuild, filter).await {
         Ok(commands::CompileOrAmbiguity::Output(output)) => output.to_string(),
         Ok(commands::CompileOrAmbiguity::Ambiguity(amb)) => amb.to_string(),
+        Err(e) => format!("{e}"),
+    }
+}
+
+async fn run_project(args: &Value) -> String {
+    // `project` (name or id) takes precedence; fall back to a numeric `project_id`.
+    let reference = args
+        .get("project")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            args.get("project_id")
+                .and_then(|v| v.as_u64())
+                .map(|id| id.to_string())
+        });
+    let run_args = args.get("args").and_then(|v| v.as_str()).map(|s| s.to_string());
+    match commands::cmd_run_ref(reference, run_args).await {
+        Ok(commands::RunOrAmbiguity::Output(output)) => output.to_string(),
+        Ok(commands::RunOrAmbiguity::Ambiguity(amb)) => amb.to_string(),
+        Err(e) => format!("{e}"),
+    }
+}
+
+async fn run_file(args: &Value) -> String {
+    let file_path = match args.get("file_path").and_then(|v| v.as_str()) {
+        Some(p) => p.to_string(),
+        _ => return "Missing required parameter: file_path".to_string(),
+    };
+    let run_args = args.get("args").and_then(|v| v.as_str()).map(|s| s.to_string());
+    match commands::cmd_run_path(file_path, run_args).await {
+        Ok(commands::RunOrAmbiguity::Output(output)) => output.to_string(),
+        Ok(commands::RunOrAmbiguity::Ambiguity(amb)) => amb.to_string(),
         Err(e) => format!("{e}"),
     }
 }

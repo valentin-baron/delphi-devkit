@@ -9,6 +9,7 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 ### Added
 
 - **Start Parameters for RunProgram**: new "Set Start Parameters" context menu item on projects lets you configure command-line arguments passed to the executable. Running a project (via the context menu "Run" action or "Run Selected Project" / `F9`) now launches the executable directly with those arguments instead of via the OS shell handler, which previously could not pass arguments at all.
+- **`ddk run` (CLI + MCP)**: run a project's built executable directly, with the same parameter resolution as `ddk compile` — a project ID, a project name (`-p`/`--project`, listing candidates if ambiguous), a `.dproj`/`.dpr`/`.dpk` path (resolved to its owning managed project), or a `.exe` path (launched directly). `--args`/`-a` overrides the project's saved Start Parameters for that one run. Unlike `compile`, `run` never builds or assembles ad-hoc state — the executable must already exist. Exposed to AI tooling via the MCP `delphi_run_project` and `delphi_run_file` tools. The process is launched detached; the command/tool call returns immediately without waiting for it to exit.
 
 ## [2.3.0] - 2026-06-15
 
