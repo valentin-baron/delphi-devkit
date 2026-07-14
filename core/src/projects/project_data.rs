@@ -190,13 +190,7 @@ impl ProjectsData {
                     name: file.file_stem().and_then(|s| s.to_str()).unwrap_or("<name error>").to_string(),
                     directory: file.parent().and_then(|p| p.to_str()).unwrap_or("<directory error>").to_string(),
                     dproj: Some(file_path.clone()),
-                    dpr: None,
-                    dpk: None,
-                    exe: None,
-                    ini: None,
-                    active_configuration: None,
-                    active_platform: None,
-                    start_parameters: None,
+                    ..Default::default()
                 }
             },
             Some(ext) if ext == "dpr" => {
@@ -204,14 +198,8 @@ impl ProjectsData {
                     id: project_id,
                     name: file.file_stem().and_then(|s| s.to_str()).unwrap_or("<name error>").to_string(),
                     directory: file.parent().and_then(|p| p.to_str()).unwrap_or("<directory error>").to_string(),
-                    dproj: None,
                     dpr: Some(file_path.clone()),
-                    dpk: None,
-                    exe: None,
-                    ini: None,
-                    active_configuration: None,
-                    active_platform: None,
-                    start_parameters: None,
+                    ..Default::default()
                 }
             },
             Some(ext) if ext == "dpk" => {
@@ -219,14 +207,8 @@ impl ProjectsData {
                     id: project_id,
                     name: file.file_stem().and_then(|s| s.to_str()).unwrap_or("<name error>").to_string(),
                     directory: file.parent().and_then(|p| p.to_str()).unwrap_or("<directory error>").to_string(),
-                    dproj: None,
-                    dpr: None,
                     dpk: Some(file_path.clone()),
-                    exe: None,
-                    ini: None,
-                    active_configuration: None,
-                    active_platform: None,
-                    start_parameters: None,
+                    ..Default::default()
                 }
             },
             _ => {

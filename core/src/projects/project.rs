@@ -77,6 +77,11 @@ pub struct Project {
     pub active_platform: Option<String>,
     /// Command-line arguments passed to the executable when run via RunProgram.
     pub start_parameters: Option<String>,
+    /// `Debugger_RunParams` read from the dproj's active property group (the
+    /// "Run Parameters" set via Project > Options > Run in the Delphi IDE).
+    /// Refreshed on [`Self::discover_paths`]; used as the fallback when
+    /// `start_parameters` is unset. `None` for bare (dproj-less) projects.
+    pub dproj_run_params: Option<String>,
 }
 
 impl Default for Project {
@@ -93,6 +98,7 @@ impl Default for Project {
             active_configuration: None,
             active_platform: None,
             start_parameters: None,
+            dproj_run_params: None,
         }
     }
 }
@@ -184,12 +190,14 @@ impl Project {
                     self.exe = None;
                     self.ini = None;
                 }
+                self.dproj_run_params = Self::discover_run_params(&dproj_path, config, platform);
             },
             Some(ext) if ext == "dpk" => {
                 self.dpk = Some(main_source.to_string_lossy().to_string());
                 self.dpr = None;
                 self.exe = None;
                 self.ini = None;
+                self.dproj_run_params = None;
             },
             _ => {
                 anyhow::bail!("Cannot discover paths - main source file is not a DPR or DPK for project id: {}", self.id);
@@ -197,6 +205,29 @@ impl Project {
         }
 
         return Ok(());
+    }
+
+    /// Reads `Debugger_RunParams` from the dproj's active property group for
+    /// the given config/platform override (or the dproj's own defaults when
+    /// both are `None`) — the same "Run Parameters" a developer sets via
+    /// Project > Options > Run in the Delphi IDE. Returns `None` on any parse
+    /// failure or when the value is absent/blank.
+    fn discover_run_params(dproj_path: &PathBuf, config: Option<&str>, platform: Option<&str>) -> Option<String> {
+        let dproj = dproj_rs::Dproj::from_file(dproj_path).ok()?;
+        let cfg = config
+            .map(|s| s.to_string())
+            .or_else(|| dproj.active_configuration().ok())
+            .unwrap_or_else(|| "Debug".to_string());
+        let plat = platform
+            .map(|s| s.to_string())
+            .or_else(|| dproj.active_platform().ok())
+            .unwrap_or_else(|| "Win32".to_string());
+        dproj
+            .active_property_group_for(&cfg, &plat)
+            .ok()?
+            .debugger_options
+            .run_params
+            .filter(|s| !s.trim().is_empty())
     }
 
     pub fn get_project_file(&self) -> Result<PathBuf> {

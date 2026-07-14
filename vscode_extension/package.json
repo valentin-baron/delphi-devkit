@@ -737,6 +737,11 @@
           ],
           "description": "Controls where build configurations and target platforms are displayed in the project tree."
         },
+        "ddk.projects.useDebuggerRunParams": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "When running a project, fuse the `.dproj`'s own `Debugger_RunParams` (Project > Options > Run in the Delphi IDE) with the saved `Set Start Parameters` value — dproj first, saved value appended after. Disable to always use only the saved Start Parameters, ignoring the dproj's Run Parameters entirely."
+        },
         "ddk.compiler.resultTimeout": {
           "type": "number",
           "default": 5000,

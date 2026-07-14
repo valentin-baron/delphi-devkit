@@ -39,6 +39,8 @@ export namespace Entities {
     active_configuration?: Option<string>;
     active_platform?: Option<string>;
     start_parameters?: Option<string>;
+    /** `Debugger_RunParams` from the dproj (Project > Options > Run in the Delphi IDE). Read-only, refreshed on discovery. */
+    dproj_run_params?: Option<string>;
   }
 
   export class ProjectLink {

@@ -12,6 +12,7 @@ export namespace PROJECTS {
     }
     export const SortProjects = 'sortProjects';
     export const CONFIG_PLATFORM_DISPLAY = 'configPlatformDisplay';
+    export const USE_DEBUGGER_RUN_PARAMS = 'useDebuggerRunParams';
     export namespace COMPILER {
       export const NS = 'compiler';
       export const CONFIGURATIONS = `${NS}.configurations`;

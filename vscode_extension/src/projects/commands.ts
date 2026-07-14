@@ -1,4 +1,4 @@
-import { commands, Uri, window, Disposable, TreeItem } from 'vscode';
+import { commands, Uri, window, workspace, Disposable, TreeItem } from 'vscode';
 import { dirname, join } from 'path';
 import { promises as fs } from 'fs';
 import { Runtime } from '../runtime';
@@ -7,7 +7,7 @@ import { Coroutine, DelphiProjectTreeItemType } from '../types';
 import { Entities } from './entities';
 import { BaseFileItem } from './trees/items/baseFile';
 import { ProjectItem } from './trees/items/project';
-import { assertError, basenameNoExt, launchExecutable } from '../utils';
+import { assertError, basenameNoExt, fuseStartParameters, launchExecutable } from '../utils';
 import { WorkspaceItem } from './trees/items/workspaceItem';
 import { Change } from '../client';
 import { Option } from '../types';
@@ -15,6 +15,19 @@ import { ConfigurationItem, PlatformItem } from './trees/items/configurationItem
 import { ConfigurationTreeView } from './trees/configurationTreeView';
 
 export namespace ProjectsCommands {
+  /**
+   * The parameters to launch a project's executable with: the dproj's own
+   * `Debugger_RunParams` and the saved Start Parameters are fused together
+   * (dproj first), matching the Delphi IDE's Run button plus whatever extra
+   * parameters were saved on top — unless `ddk.projects.useDebuggerRunParams`
+   * is disabled, in which case only the saved Start Parameters are used.
+   */
+  function resolveEffectiveStartParameters(entity: Entities.Project): Option<string> {
+    const useDebuggerRunParams = workspace.getConfiguration(PROJECTS.CONFIG.KEY).get<boolean>(PROJECTS.CONFIG.USE_DEBUGGER_RUN_PARAMS, true);
+    if (useDebuggerRunParams) return fuseStartParameters(entity.dproj_run_params, entity.start_parameters);
+    return entity.start_parameters;
+  }
+
   export function register() {
     Runtime.extension.subscriptions.push(
       ...[...SelectedProject.registers, ...ContextMenu.registers, ...Compiler.registers, ...ProjectsTreeView.registers, ...Configuration.registers]
@@ -60,7 +73,7 @@ export namespace ProjectsCommands {
           return;
         }
         try {
-          launchExecutable(project.exe, project.start_parameters);
+          launchExecutable(project.exe, resolveEffectiveStartParameters(project));
           window.showInformationMessage(`Running: ${project.exe}`);
         } catch (error) {
           window.showErrorMessage(`Failed to launch executable: ${error}`);
@@ -121,7 +134,7 @@ export namespace ProjectsCommands {
         return;
       }
       try {
-        launchExecutable(item.projectExe.fsPath, item.project.entity.start_parameters);
+        launchExecutable(item.projectExe.fsPath, resolveEffectiveStartParameters(item.project.entity));
         window.showInformationMessage(`Running: ${item.projectExe.fsPath}`);
       } catch (error) {
         window.showErrorMessage(`Failed to launch executable: ${error}`);
@@ -131,10 +144,13 @@ export namespace ProjectsCommands {
     private static async setStartParameters(item: BaseFileItem): Promise<void> {
       if (!assertError(item.projectExe, `No executable for: ${item.label} - cannot set start parameters.`)) return;
       const project = item.project;
+      const dprojDefault = project.entity.dproj_run_params;
       const value = await window.showInputBox({
         title: `Start Parameters – ${project.entity.name}`,
         prompt: 'Command-line arguments passed to the executable when run',
-        placeHolder: 'e.g. -flag "value with spaces"',
+        placeHolder: dprojDefault
+          ? `Appended after the dproj's Run Parameters (${dprojDefault}); leave empty to use only those`
+          : 'e.g. -flag "value with spaces"',
         value: project.entity.start_parameters ?? ''
       });
       if (value === undefined) return;

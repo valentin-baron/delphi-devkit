@@ -1329,6 +1329,20 @@ pub enum RunOrAmbiguity {
     Ambiguity(AmbiguousProjects),
 }
 
+/// Fuses the dproj's `Debugger_RunParams` with the DDK "Start Parameters"
+/// override: both contribute, base first, joined by a space — neither
+/// silently discards the other. Blank/absent values contribute nothing.
+fn fuse_run_params(base: Option<String>, extra: Option<String>) -> Option<String> {
+    let base = base.filter(|s| !s.trim().is_empty());
+    let extra = extra.filter(|s| !s.trim().is_empty());
+    match (base, extra) {
+        (Some(base), Some(extra)) => Some(format!("{base} {extra}")),
+        (Some(base), None) => Some(base),
+        (None, Some(extra)) => Some(extra),
+        (None, None) => None,
+    }
+}
+
 /// Splits a start-parameters string into argv entries, honoring
 /// double-quoted segments (e.g. `-flag "value with spaces"`).
 fn split_run_args(args: &str) -> Vec<String> {
@@ -1357,8 +1371,9 @@ fn launch_executable(exe_path: &str, args: &[String]) -> Result<()> {
 }
 
 /// Runs a project selected by internal id (or the active project when
-/// `None`). `args`, when given, overrides the project's persisted Start
-/// Parameters for this invocation only.
+/// `None`). `args`, when given, overrides the project's run parameters
+/// (dproj `Debugger_RunParams` fused with the saved Start Parameters) for
+/// this invocation only.
 pub async fn cmd_run(project_id: Option<usize>, args: Option<String>) -> Result<RunOutput> {
     let (project_name, exe, start_parameters) = {
         let data = PROJECTS_DATA.read().await;
@@ -1377,7 +1392,13 @@ pub async fn cmd_run(project_id: Option<usize>, args: Option<String>) -> Result<
                 project.name
             ),
         };
-        (project.name.clone(), exe, project.start_parameters.clone())
+        // The dproj's own Debugger_RunParams (Project > Options > Run in the
+        // Delphi IDE) and the DDK "Start Parameters" override are fused
+        // together (dproj first) rather than one replacing the other, so
+        // `run` behaves like pressing Run there plus whatever extra
+        // parameters were saved on top.
+        let start_parameters = fuse_run_params(project.dproj_run_params.clone(), project.start_parameters.clone());
+        (project.name.clone(), exe, start_parameters)
     };
     let raw_args = args.or(start_parameters).unwrap_or_default();
     let parsed_args = split_run_args(&raw_args);
@@ -1485,4 +1506,41 @@ pub async fn cmd_format_file(file_path: String, encoding: Option<String>) -> Res
     std::fs::write(&file_path, &out_bytes)
         .with_context(|| format!("Failed to write file: {file_path}"))?;
     Ok(FormatFileResult { file_path })
+}
+
+#[cfg(test)]
+mod fuse_run_params_tests {
+    use super::fuse_run_params;
+
+    #[test]
+    fn both_present_joins_base_then_extra() {
+        assert_eq!(
+            fuse_run_params(Some("/STANDALONE".to_string()), Some("-extra flag".to_string())),
+            Some("/STANDALONE -extra flag".to_string())
+        );
+    }
+
+    #[test]
+    fn only_base_present() {
+        assert_eq!(fuse_run_params(Some("/STANDALONE".to_string()), None), Some("/STANDALONE".to_string()));
+    }
+
+    #[test]
+    fn only_extra_present() {
+        assert_eq!(fuse_run_params(None, Some("-extra".to_string())), Some("-extra".to_string()));
+    }
+
+    #[test]
+    fn neither_present_is_none() {
+        assert_eq!(fuse_run_params(None, None), None);
+    }
+
+    #[test]
+    fn blank_values_are_treated_as_absent() {
+        assert_eq!(
+            fuse_run_params(Some("   ".to_string()), Some("-extra".to_string())),
+            Some("-extra".to_string())
+        );
+        assert_eq!(fuse_run_params(Some("".to_string()), Some("".to_string())), None);
+    }
 }

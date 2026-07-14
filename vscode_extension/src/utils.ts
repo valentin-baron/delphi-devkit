@@ -32,6 +32,12 @@ export function splitCommandLineArgs(input: string): string[] {
   return args;
 }
 
+// Fuses two start-parameters strings (base first) rather than one replacing the other; blank/absent values contribute nothing.
+export function fuseStartParameters(base?: string | null, extra?: string | null): string | undefined {
+  const parts = [base, extra].filter((s): s is string => !!s && s.trim().length > 0);
+  return parts.length > 0 ? parts.join(' ') : undefined;
+}
+
 export function launchExecutable(exePath: string, startParameters?: string | null): void {
   const args = startParameters ? splitCommandLineArgs(startParameters) : [];
   spawn(exePath, args, { cwd: dirname(exePath), detached: true, stdio: 'ignore' }).unref();

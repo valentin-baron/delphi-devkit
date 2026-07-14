@@ -87,11 +87,21 @@ status line are always shown.
 `ddk run <PATH>` dispatches on the file extension: a `.exe` is launched
 directly; a `.dproj`/`.dpr`/`.dpk` must already belong to a managed project
 (its stored executable is run, same resolution as by name) — it is never
-compiled or run ad-hoc. `--args`/`-a` overrides the project's saved Start
-Parameters (see `Set Start Parameters` below) for that one run; the process
-is launched detached, so the CLI/MCP call returns immediately without
-waiting for it to exit. The same is exposed to AI tooling via the MCP
-`delphi_run_project` and `delphi_run_file` tools.
+compiled or run ad-hoc. `--args`/`-a` overrides the run parameters for that
+one run; the process is launched detached, so the CLI/MCP call returns
+immediately without waiting for it to exit. The same is exposed to AI
+tooling via the MCP `delphi_run_project` and `delphi_run_file` tools.
+
+Without `--args`, a project runs with the `.dproj`'s own `Debugger_RunParams`
+— the Run Parameters set via Project > Options > Run in the Delphi IDE,
+resolved against the project's active configuration/platform — fused with
+the saved Start Parameters (see `Set Start Parameters` below): the dproj
+value comes first, the saved value is appended after, so both take effect
+rather than one silently replacing the other. In the VS Code extension this
+can be turned off with the `ddk.projects.useDebuggerRunParams` setting:
+disable it to always use only the saved Start Parameters, ignoring the
+dproj's Run Parameters entirely. The CLI/MCP always fuse `Debugger_RunParams`
+in, since there is no extension setting for them to consult.
 
 ## Demos
 
@@ -157,6 +167,7 @@ waiting for it to exit. The same is exposed to AI tooling via the MCP
 ## Extension Settings
 
 * `ddk.compiler.encoding`: Character encoding used to decode MSBuild output (`oem` by default, use `utf8` if your paths contain non-ASCII characters).
+* `ddk.projects.useDebuggerRunParams`: When running a project, fuse the `.dproj`'s own `Debugger_RunParams` with the saved Start Parameters, dproj first (`true` by default). Disable to always use only the saved Start Parameters.
 
 ## Compiler Configurations
 
