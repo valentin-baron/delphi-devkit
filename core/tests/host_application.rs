@@ -232,6 +232,42 @@ fn effective_host_application_prefers_override_and_ignores_blanks() {
 }
 
 #[test]
+fn discover_paths_clears_stale_dproj_fields_for_bare_projects() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let dir = tmp_dir.path();
+    std::fs::write(dir.join("standalone.dpr"), "program standalone;\nbegin\nend.\n").unwrap();
+
+    // Simulate a project that previously had a dproj (with discovered values)
+    // and lost it: the dproj-derived fields must not linger.
+    let mut project = Project {
+        id: 1,
+        name: "standalone".to_string(),
+        directory: dir.to_string_lossy().to_string(),
+        dpr: Some(dir.join("standalone.dpr").to_string_lossy().to_string()),
+        dproj_run_params: Some("-stale".to_string()),
+        dproj_host_application: Some("C:\\stale\\Host.exe".to_string()),
+        ..Default::default()
+    };
+    project.discover_paths().unwrap();
+    assert_eq!(project.dproj_run_params, None, "bare .dpr must clear stale run params");
+    assert_eq!(project.dproj_host_application, None, "bare .dpr must clear stale host application");
+
+    let mut package = Project {
+        id: 2,
+        name: "barepkg".to_string(),
+        directory: dir.to_string_lossy().to_string(),
+        dpk: Some(dir.join("barepkg.dpk").to_string_lossy().to_string()),
+        dproj_run_params: Some("-stale".to_string()),
+        dproj_host_application: Some("C:\\stale\\Host.exe".to_string()),
+        ..Default::default()
+    };
+    std::fs::write(dir.join("barepkg.dpk"), "package barepkg;\nend.\n").unwrap();
+    package.discover_paths().unwrap();
+    assert_eq!(package.dproj_run_params, None, "bare .dpk must clear stale run params");
+    assert_eq!(package.dproj_host_application, None, "bare .dpk must clear stale host application");
+}
+
+#[test]
 fn effective_host_application_rejects_unresolved_macros() {
     let project = Project {
         dproj_host_application: Some("$(UNDEFINED_SITE_VAR)\\Win64\\Debug\\Host.exe".to_string()),

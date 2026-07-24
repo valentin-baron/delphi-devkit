@@ -54,7 +54,12 @@ export namespace Entities {
     sort_rank: string;
   }
 
-  const notBlank = (value?: Option<string>) => (value && value.trim().length > 0 ? value : undefined);
+  // Returns the TRIMMED value: a whitespace-padded path would reach spawn()
+  // verbatim and fail to launch.
+  const notBlank = (value?: Option<string>) => {
+    const trimmed = value?.trim();
+    return trimmed && trimmed.length > 0 ? trimmed : undefined;
+  };
 
   /**
    * The configured hosting executable: the DevKit "Set Host Application"

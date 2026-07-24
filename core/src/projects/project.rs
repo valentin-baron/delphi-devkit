@@ -171,15 +171,20 @@ impl Project {
             // No `.dproj`: resolve paths straight from the bare source. A `.dpr`
             // yields an executable (and matching `.ini`) alongside the source;
             // a `.dpk` produces a package with no standalone executable.
+            // Without a dproj there is nothing to source the dproj-derived
+            // fields from: clear them so values from a previously-present
+            // dproj cannot linger and affect run-target resolution.
             if let Some(dpr_path) = &self.dpr {
                 let exe = PathBuf::from(dpr_path).with_extension("exe");
                 self.ini = Some(exe.with_extension("ini").to_string_lossy().to_string());
                 self.exe = Some(exe.to_string_lossy().to_string());
+                self.dproj_run_params = None;
                 self.dproj_host_application = None;
                 return Ok(());
             } else if self.dpk.is_some() {
                 self.exe = None;
                 self.ini = None;
+                self.dproj_run_params = None;
                 self.dproj_host_application = None;
                 return Ok(());
             }

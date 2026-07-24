@@ -149,11 +149,13 @@ pub fn read_raw_property_for(dproj_path: &PathBuf, config: &str, platform: &str,
         }
         for child in group.children().filter(|n| n.is_element()) {
             if child.tag_name().name() == tag {
-                value = Some(child.text().unwrap_or_default().to_string());
+                // Trimmed on capture: surrounding whitespace would otherwise
+                // flow into macro expansion and path resolution.
+                value = Some(child.text().unwrap_or_default().trim().to_string());
             }
         }
     }
-    value.filter(|v| !v.trim().is_empty())
+    value.filter(|v| !v.is_empty())
 }
 
 /// The `Cfg_N` key the dproj assigns to a configuration name, from its
