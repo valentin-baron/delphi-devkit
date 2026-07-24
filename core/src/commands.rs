@@ -401,6 +401,12 @@ impl DiagCounts {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Case-insensitive path equality on normalized forms — used to hide a
+/// Host Application that is just the project's own executable.
+fn paths_equal_ci(a: &str, b: &str) -> bool {
+    normalize_path(a).to_string_lossy().to_lowercase() == normalize_path(b).to_string_lossy().to_lowercase()
+}
+
 /// Find the first `ProjectLink.id` for a given project, searching workspaces
 /// first, then the group project.
 pub fn find_project_link_id(data: &ProjectsData, project_id: usize) -> Option<usize> {
@@ -706,7 +712,11 @@ pub async fn cmd_list_projects() -> Result<ProjectListResult> {
         directory: p.directory.clone(),
         dproj: p.dproj.clone(),
         exe: p.exe.clone(),
-        host: p.effective_host_application(),
+        // A Host Application that is just the project's own exe adds no
+        // information — only surface a host that actually differs.
+        host: p.effective_host_application().filter(|host| {
+            !p.exe.as_deref().is_some_and(|exe| paths_equal_ci(host, exe))
+        }),
         active: Some(p.id) == active_id,
     };
 

@@ -14,6 +14,24 @@ import { fileExists } from '../../../utils';
 import { PROJECTS } from '../../../constants';
 import { DprojMetadata } from '../../../client';
 
+/** Case-insensitive path equality on separator-normalized forms. */
+function isSamePath(a?: string | null, b?: string | null): boolean {
+  if (!a || !b) return false;
+  const normalize = (value: string) => value.replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase();
+  return normalize(a) === normalize(b);
+}
+
+/**
+ * A Host Application that is just the project's own exe adds no information
+ * (e.g. an exe project whose dproj points Debugger_HostApplication at
+ * itself) — only a host that actually differs is worth surfacing.
+ */
+function informativeHostApplication(entity: Entities.Project): string | undefined {
+  const hostApplication = Entities.effectiveHostApplication(entity);
+  if (!hostApplication || isSamePath(hostApplication, entity.exe)) return undefined;
+  return hostApplication;
+}
+
 /**
  * Hover tooltip summarizing how the project runs: its exe, the effective
  * Host Application (with origin — DevKit override vs the dproj's own value)
@@ -38,7 +56,7 @@ function buildProjectTooltip(entity: Entities.Project): MarkdownString {
   appendRow('Exe', entity.exe ?? undefined);
   appendRow(
     'Host',
-    Entities.effectiveHostApplication(entity),
+    informativeHostApplication(entity),
     entity.host_application?.trim() ? 'override' : 'from dproj'
   );
 
@@ -83,8 +101,9 @@ export class ProjectItem extends BaseFileItem implements MainProjectItem {
     this.contextValue = PROJECTS.CONTEXT.PROJECT;
     this.tooltip = buildProjectTooltip(projectEntity);
     // Inline cue that this project runs through a hosting executable (a .dpk
-    // package or DLL): the full path and origin live in the tooltip.
-    const hostApplication = Entities.effectiveHostApplication(projectEntity);
+    // package or DLL): the full path and origin live in the tooltip. A host
+    // that is just the project's own exe is not worth flagging.
+    const hostApplication = informativeHostApplication(projectEntity);
     if (hostApplication)
       this.description = `⇢ ${basename(hostApplication)}`;
     this.setIcon();
