@@ -4,6 +4,50 @@ use std::path::{Path, PathBuf, Component};
 mod document;
 pub use document::*;
 
+/// The custom environment-variable overrides configured in the Delphi IDE
+/// (Tools > Options > IDE > Environment Variables), stored per BDS version at
+/// `HKCU\SOFTWARE\Embarcadero\BDS\<ver>\Environment Variables`. The IDE
+/// injects these into its own process (and thus into IDE-run MSBuild), so
+/// dproj values routinely reference them (e.g. a site-specific `$(VEGADIR)`)
+/// even though they exist in no real environment. Reads the highest installed
+/// BDS version's set; returns an empty list when none exists (or off Windows).
+#[cfg(windows)]
+pub fn ide_environment_overrides() -> Vec<(String, String)> {
+    use winreg::RegKey;
+    use winreg::enums::HKEY_CURRENT_USER;
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let Ok(bds) = hkcu.open_subkey(r"SOFTWARE\Embarcadero\BDS") else {
+        return Vec::new();
+    };
+    let mut versions: Vec<String> = bds.enum_keys().flatten().collect();
+    // Version keys are "20.0", "22.0", "23.0", ... — lexicographic order is
+    // wrong across the 9.x/10.x boundary, so compare numerically.
+    versions.sort_by(|a, b| {
+        let parse = |v: &str| v.split('.').next().and_then(|n| n.parse::<u32>().ok()).unwrap_or(0);
+        parse(a).cmp(&parse(b))
+    });
+    for version in versions.iter().rev() {
+        let Ok(env_key) = bds.open_subkey(format!(r"{version}\Environment Variables")) else {
+            continue;
+        };
+        let overrides: Vec<(String, String)> = env_key
+            .enum_values()
+            .flatten()
+            .map(|(name, value)| (name, value.to_string()))
+            .collect();
+        if !overrides.is_empty() {
+            return overrides;
+        }
+    }
+    Vec::new()
+}
+
+#[cfg(not(windows))]
+pub fn ide_environment_overrides() -> Vec<(String, String)> {
+    Vec::new()
+}
+
 /// Normalise a path by:
 ///   1. Resolving `.` and `..` segments purely (without touching the filesystem).
 ///   2. Stripping the Windows extended-length prefix (`\\?\`) if present.

@@ -351,21 +351,39 @@ fn expand_project_macros(value: &str, project_dir: &str, project_name: &str, con
 lazy_static::lazy_static! {
     static ref MACRO_REGEX: regex::Regex =
         regex::Regex::new(r"\$\((?P<name>[A-Za-z_][A-Za-z0-9_]*)\)").unwrap();
+
+    /// The Delphi IDE's own environment-variable overrides (Tools > Options >
+    /// IDE > Environment Variables), read once per process: dproj values
+    /// reference them (e.g. `$(VEGADIR)`) although they exist in no real
+    /// environment outside the IDE.
+    static ref IDE_ENV_OVERRIDES: Vec<(String, String)> = crate::utils::ide_environment_overrides();
 }
 
-/// Replaces every `$(NAME)` whose `NAME` exists as an environment variable
-/// (case-insensitive, as on Windows) with that variable's value; unknown
-/// names stay verbatim.
-fn expand_environment_macros(value: &str) -> String {
+/// Replaces every `$(NAME)` that `resolver` can answer; unknown names stay
+/// verbatim. Split out so tests can inject a resolver.
+fn expand_macros_with(value: &str, resolver: &dyn Fn(&str) -> Option<String>) -> String {
     MACRO_REGEX
         .replace_all(value, |caps: &regex::Captures| {
-            let name = &caps["name"];
-            std::env::vars()
-                .find(|(key, _)| key.eq_ignore_ascii_case(name))
-                .map(|(_, v)| v)
-                .unwrap_or_else(|| caps[0].to_string())
+            resolver(&caps["name"]).unwrap_or_else(|| caps[0].to_string())
         })
         .to_string()
+}
+
+/// Resolves a `$(NAME)` macro the way the IDE effectively does: the IDE's
+/// configured overrides win, then the process environment. All lookups are
+/// case-insensitive, as on Windows.
+fn expand_environment_macros(value: &str) -> String {
+    expand_macros_with(value, &|name: &str| {
+        IDE_ENV_OVERRIDES
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+            .or_else(|| {
+                std::env::vars()
+                    .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                    .map(|(_, v)| v)
+            })
+    })
 }
 
 fn replace_case_insensitive(haystack: &str, needle: &str, replacement: &str) -> String {
