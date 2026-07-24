@@ -82,6 +82,17 @@ pub struct Project {
     /// Refreshed on [`Self::discover_paths`]; used as the fallback when
     /// `start_parameters` is unset. `None` for bare (dproj-less) projects.
     pub dproj_run_params: Option<String>,
+    /// `Debugger_HostApplication` read from the dproj's active property group
+    /// (the "Host application" set via Project > Options > Debugger in the
+    /// Delphi IDE). Common project macros are expanded and a relative path is
+    /// resolved against the project directory. Refreshed on
+    /// [`Self::discover_paths`]; `None` for bare (dproj-less) projects.
+    pub dproj_host_application: Option<String>,
+    /// DevKit-side Host Application override: the executable RunProgram
+    /// launches to host this project (e.g. the application loading a `.dpk`
+    /// package or a DLL). Takes precedence over
+    /// [`Self::dproj_host_application`].
+    pub host_application: Option<String>,
 }
 
 impl Default for Project {
@@ -99,6 +110,8 @@ impl Default for Project {
             active_platform: None,
             start_parameters: None,
             dproj_run_params: None,
+            dproj_host_application: None,
+            host_application: None,
         }
     }
 }
@@ -115,6 +128,15 @@ impl Project {
             .or_else(|| dproj.active_platform().ok())
             .unwrap_or_else(|| "Win32".to_string());
         (config, platform)
+    }
+
+    /// The executable that hosts this project at run time, when one is
+    /// configured: the DevKit override wins over the dproj's own
+    /// `Debugger_HostApplication`. Blank values count as absent.
+    pub fn effective_host_application(&self) -> Option<String> {
+        self.host_application.clone()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| self.dproj_host_application.clone().filter(|s| !s.trim().is_empty()))
     }
 
     pub fn discover_paths(&mut self) -> Result<()> {
@@ -150,10 +172,12 @@ impl Project {
                 let exe = PathBuf::from(dpr_path).with_extension("exe");
                 self.ini = Some(exe.with_extension("ini").to_string_lossy().to_string());
                 self.exe = Some(exe.to_string_lossy().to_string());
+                self.dproj_host_application = None;
                 return Ok(());
             } else if self.dpk.is_some() {
                 self.exe = None;
                 self.ini = None;
+                self.dproj_host_application = None;
                 return Ok(());
             }
             anyhow::bail!("Cannot discover paths - no dproj, dpr or dpk available for project id: {}", self.id);
@@ -191,13 +215,18 @@ impl Project {
                     self.ini = None;
                 }
                 self.dproj_run_params = Self::discover_run_params(&dproj_path, config, platform);
+                self.dproj_host_application = Self::discover_host_application(&dproj_path, config, platform, &self.directory);
             },
             Some(ext) if ext == "dpk" => {
                 self.dpk = Some(main_source.to_string_lossy().to_string());
                 self.dpr = None;
                 self.exe = None;
                 self.ini = None;
-                self.dproj_run_params = None;
+                // A package has no standalone executable, but its Run
+                // Parameters and Host Application (Project > Options in the
+                // Delphi IDE) drive how RunProgram launches the hosting exe.
+                self.dproj_run_params = Self::discover_run_params(&dproj_path, config, platform);
+                self.dproj_host_application = Self::discover_host_application(&dproj_path, config, platform, &self.directory);
             },
             _ => {
                 anyhow::bail!("Cannot discover paths - main source file is not a DPR or DPK for project id: {}", self.id);
@@ -214,6 +243,54 @@ impl Project {
     /// failure or when the value is absent/blank.
     fn discover_run_params(dproj_path: &PathBuf, config: Option<&str>, platform: Option<&str>) -> Option<String> {
         let dproj = dproj_rs::Dproj::from_file(dproj_path).ok()?;
+        let (cfg, plat) = Self::effective_cfg_plat(&dproj, config, platform);
+        dproj
+            .active_property_group_for(&cfg, &plat)
+            .ok()?
+            .debugger_options
+            .run_params
+            .filter(|s| !s.trim().is_empty())
+    }
+
+    /// Reads `Debugger_HostApplication` from the dproj's active property group
+    /// for the given config/platform override — the "Host application" set via
+    /// Project > Options > Debugger in the Delphi IDE. Common project macros
+    /// (`$(ProjectDir)`, `$(ProjectName)`, `$(Platform)`, `$(Config)`) are
+    /// expanded and a relative path is resolved against the project directory;
+    /// a value still containing unknown macros is kept verbatim. Returns
+    /// `None` on any parse failure or when the value is absent/blank.
+    fn discover_host_application(
+        dproj_path: &PathBuf,
+        config: Option<&str>,
+        platform: Option<&str>,
+        project_directory: &str,
+    ) -> Option<String> {
+        let dproj = dproj_rs::Dproj::from_file(dproj_path).ok()?;
+        let (cfg, plat) = Self::effective_cfg_plat(&dproj, config, platform);
+        let raw = crate::files::dproj::read_raw_property_for(dproj_path, &cfg, &plat, "Debugger_HostApplication")?;
+        let project_name = dproj_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let expanded = expand_project_macros(&raw, project_directory, &project_name, &cfg, &plat);
+        if expanded.contains("$(") {
+            // An unexpanded macro would corrupt path resolution; keep the
+            // value verbatim so the user can still see and fix it.
+            return Some(expanded);
+        }
+        let path = PathBuf::from(&expanded);
+        let absolute = if path.is_relative() {
+            PathBuf::from(project_directory).join(path)
+        } else {
+            path
+        };
+        Some(normalize_path(&absolute).to_string_lossy().to_string())
+    }
+
+    /// Resolve the effective (configuration, platform) from explicit overrides
+    /// falling back to the dproj's own defaults — shared by the dproj property
+    /// discovery helpers.
+    fn effective_cfg_plat(dproj: &dproj_rs::Dproj, config: Option<&str>, platform: Option<&str>) -> (String, String) {
         let cfg = config
             .map(|s| s.to_string())
             .or_else(|| dproj.active_configuration().ok())
@@ -222,12 +299,7 @@ impl Project {
             .map(|s| s.to_string())
             .or_else(|| dproj.active_platform().ok())
             .unwrap_or_else(|| "Win32".to_string());
-        dproj
-            .active_property_group_for(&cfg, &plat)
-            .ok()?
-            .debugger_options
-            .run_params
-            .filter(|s| !s.trim().is_empty())
+        (cfg, plat)
     }
 
     pub fn get_project_file(&self) -> Result<PathBuf> {
@@ -250,5 +322,30 @@ impl Project {
             }
         }
         anyhow::bail!("Cannot get project file - no dproj, dpr or dpk available for project id: {}", self.id);
+    }
+}
+
+/// Expands the dproj macros the IDE commonly uses inside
+/// `Debugger_HostApplication` values (`$(ProjectDir)`, `$(ProjectName)`,
+/// `$(Platform)`, `$(Config)`), case-insensitively. Unknown macros are left
+/// untouched.
+fn expand_project_macros(value: &str, project_dir: &str, project_name: &str, config: &str, platform: &str) -> String {
+    let mut result = value.to_string();
+    for (macro_name, replacement) in [
+        ("$(ProjectDir)", project_dir),
+        ("$(ProjectName)", project_name),
+        ("$(Platform)", platform),
+        ("$(Config)", config),
+    ] {
+        result = replace_case_insensitive(&result, macro_name, replacement);
+    }
+    result
+}
+
+fn replace_case_insensitive(haystack: &str, needle: &str, replacement: &str) -> String {
+    let pattern = regex::escape(needle);
+    match regex::RegexBuilder::new(&pattern).case_insensitive(true).build() {
+        Ok(re) => re.replace_all(haystack, regex::NoExpand(replacement)).to_string(),
+        _ => haystack.replace(needle, replacement),
     }
 }

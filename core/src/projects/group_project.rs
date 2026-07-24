@@ -54,6 +54,8 @@ impl GroupProject {
                     active_platform: None,
                     start_parameters: None,
                     dproj_run_params: None,
+                    dproj_host_application: None,
+                    host_application: None,
                 };
                 project.discover_paths()?;
                 projects_data.projects.push(project);

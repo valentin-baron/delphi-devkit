@@ -10,13 +10,32 @@ import { existsSync } from 'fs';
 import { CompilerOutputDefinitionProvider } from './projects/compiler/language';
 import { PROJECTS } from './constants';
 
+/**
+ * The fields `UpdateProject` accepts server-side — the mirror of Rust's
+ * `ProjectUpdateData` in `core/src/projects/changes.rs`, field-for-field.
+ * Deliberately narrower than `Entities.Project`: read-only/derived fields
+ * (`id`, `dproj_run_params`, `dproj_host_application`, ...) are not updatable
+ * and would be silently dropped by the server.
+ */
+export interface ProjectUpdateData {
+    name?: string;
+    directory?: string;
+    dproj?: string;
+    dpr?: string;
+    dpk?: string;
+    exe?: string;
+    ini?: string;
+    start_parameters?: string;
+    host_application?: string;
+}
+
 export type Change =
     | { type: 'NewProject', file_path: string, workspace_id: number }
     | { type: 'AddProject', project_id: number, workspace_id: number }
     | { type: 'RemoveProject', project_link_id: number }
     | { type: 'MoveProject', project_link_id: number, drop_target: number }
     | { type: 'RefreshProject', project_id: number }
-    | { type: 'UpdateProject', project_id: number, data: Partial<Entities.Project> }
+    | { type: 'UpdateProject', project_id: number, data: ProjectUpdateData }
     | { type: 'SelectProject', project_id: number }
     | { type: 'AddWorkspace', name: string, compiler: string }
     | { type: 'RemoveWorkspace', workspace_id: number }

@@ -31,7 +31,7 @@ export class ProjectItem extends BaseFileItem implements MainProjectItem {
     const uriPath = path.replace(basename(path), projectEntity.name);
     if (selected) {
       Runtime.setContext(PROJECTS.CONTEXT.IS_PROJECT_SELECTED, true);
-      Runtime.setContext(PROJECTS.CONTEXT.DOES_SELECTED_PROJECT_HAVE_EXE, !!projectEntity.exe);
+      Runtime.setContext(PROJECTS.CONTEXT.DOES_SELECTED_PROJECT_HAVE_EXE, !!Entities.resolveRunTarget(projectEntity));
     }
     const resourceUri = selected
         ? Uri.from({ scheme: PROJECTS.SCHEME.SELECTED, path: uriPath })

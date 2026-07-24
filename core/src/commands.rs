@@ -26,6 +26,11 @@ pub struct ProjectSummary {
     pub directory: String,
     pub dproj: Option<String>,
     pub exe: Option<String>,
+    /// Effective Host Application (DevKit override or the dproj's own
+    /// `Debugger_HostApplication`): the executable RunProgram launches to
+    /// host a project with no standalone exe (e.g. a package or DLL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     pub active: bool,
 }
 
@@ -72,6 +77,9 @@ impl fmt::Display for ProjectListResult {
                     if let Some(exe) = &p.exe {
                         writeln!(f, "       exe: {exe}")?;
                     }
+                    if let Some(host) = &p.host {
+                        writeln!(f, "       host: {host}")?;
+                    }
                 }
             }
         }
@@ -86,6 +94,9 @@ impl fmt::Display for ProjectListResult {
                     writeln!(f, "  [{}]{} {} ({})", p.id, marker, p.name, p.directory)?;
                     if let Some(exe) = &p.exe {
                         writeln!(f, "       exe: {exe}")?;
+                    }
+                    if let Some(host) = &p.host {
+                        writeln!(f, "       host: {host}")?;
                     }
                 }
             }
@@ -695,6 +706,7 @@ pub async fn cmd_list_projects() -> Result<ProjectListResult> {
         directory: p.directory.clone(),
         dproj: p.dproj.clone(),
         exe: p.exe.clone(),
+        host: p.effective_host_application(),
         active: Some(p.id) == active_id,
     };
 
@@ -1385,10 +1397,14 @@ pub async fn cmd_run(project_id: Option<usize>, args: Option<String>) -> Result<
             Some(p) => p,
             _ => bail!("Project with ID {target_id} not found."),
         };
-        let exe = match &project.exe {
-            Some(exe) => exe.clone(),
+        // A configured Host Application (Project > Options > Debugger in the
+        // Delphi IDE, or the DevKit "Set Host Application" override) wins over
+        // the project's own executable, matching the IDE's Run behaviour —
+        // it is what makes a `.dpk` package or DLL project runnable at all.
+        let exe = match project.effective_host_application().or_else(|| project.exe.clone()) {
+            Some(target) => target,
             _ => bail!(
-                "Project \"{}\" has no executable. Compile it first, or set its .exe path.",
+                "Project \"{}\" has no executable or Host Application. Compile it first, set its .exe path, or set a Host Application.",
                 project.name
             ),
         };

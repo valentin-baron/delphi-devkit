@@ -41,12 +41,28 @@ export namespace Entities {
     start_parameters?: Option<string>;
     /** `Debugger_RunParams` from the dproj (Project > Options > Run in the Delphi IDE). Read-only, refreshed on discovery. */
     dproj_run_params?: Option<string>;
+    /** `Debugger_HostApplication` from the dproj (Project > Options > Debugger in the Delphi IDE). Read-only, refreshed on discovery. */
+    dproj_host_application?: Option<string>;
+    /** DevKit-side Host Application override: the executable run to host this project (e.g. loading a .dpk/BPL). Wins over dproj_host_application. */
+    host_application?: Option<string>;
   }
 
   export class ProjectLink {
     id: number;
     project_id: number;
     sort_rank: string;
+  }
+
+  /**
+   * The executable RunProgram launches for a project: a configured Host
+   * Application (the DevKit override first, then the dproj's own
+   * `Debugger_HostApplication`) wins over the project's exe, matching the
+   * Delphi IDE's Run behaviour — it is what makes a `.dpk` package or DLL
+   * project runnable at all. Blank values count as absent.
+   */
+  export function resolveRunTarget(entity: Project): string | undefined {
+    const notBlank = (value?: Option<string>) => (value && value.trim().length > 0 ? value : undefined);
+    return notBlank(entity.host_application) ?? notBlank(entity.dproj_host_application) ?? notBlank(entity.exe);
   }
 
   export class CompilerConfiguration {

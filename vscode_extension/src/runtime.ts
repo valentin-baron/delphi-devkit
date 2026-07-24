@@ -55,9 +55,12 @@ export abstract class Runtime {
    *  work even when the tree view is not visible. */
   public static updateProjectContexts(): void {
     const hasSelected = !!this.projectsData?.active_project_id;
-    const hasExe = !!this.activeProject?.exe;
+    const active = this.activeProject;
+    // A configured Host Application makes a project runnable even without an
+    // own executable (e.g. a .dpk package run through its hosting exe).
+    const hasRunTarget = !!(active && Entities.resolveRunTarget(active));
     this.setContext(PROJECTS.CONTEXT.IS_PROJECT_SELECTED, hasSelected);
-    this.setContext(PROJECTS.CONTEXT.DOES_SELECTED_PROJECT_HAVE_EXE, hasExe);
+    this.setContext(PROJECTS.CONTEXT.DOES_SELECTED_PROJECT_HAVE_EXE, hasRunTarget);
   }
 
   public static get groupProjectsCompiler(): Option<Entities.CompilerConfiguration> {

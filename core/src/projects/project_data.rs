@@ -413,6 +413,10 @@ impl ProjectsData {
             let start_parameters = start_parameters.trim().to_string();
             project.start_parameters = if start_parameters.is_empty() { None } else { Some(start_parameters) };
         }
+        if let Some(host_application) = data.host_application {
+            let host_application = host_application.trim().to_string();
+            project.host_application = if host_application.is_empty() { None } else { Some(host_application) };
+        }
         return Ok(());
     }
 

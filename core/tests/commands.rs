@@ -121,6 +121,7 @@ fn project_list_display_with_workspace() {
                 directory: "dir".into(),
                 dproj: None,
                 exe: None,
+                host: None,
                 active: true,
             }],
         }],
