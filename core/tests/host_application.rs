@@ -232,6 +232,60 @@ fn effective_host_application_prefers_override_and_ignores_blanks() {
 }
 
 #[test]
+fn effective_host_application_rejects_unresolved_macros() {
+    let project = Project {
+        dproj_host_application: Some("$(UNDEFINED_SITE_VAR)\\Win64\\Debug\\Host.exe".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(
+        project.effective_host_application(),
+        None,
+        "a path with an unresolved macro is not launchable and must never shadow the exe"
+    );
+}
+
+#[test]
+fn discover_paths_expands_environment_variable_macros() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let dir = tmp_dir.path();
+
+    // A dproj whose host application uses a site-specific environment
+    // variable, the way MSBuild resolves $(NAME) from the environment.
+    unsafe {
+        std::env::set_var("DDK_TEST_HOST_ROOT", dir.to_string_lossy().to_string());
+    }
+    let dproj_xml = package_dproj_xml().replace(
+        "$(ProjectDir)\\hosts\\DebugHost64.exe",
+        "$(DDK_TEST_HOST_ROOT)\\hosts\\DebugHost64.exe",
+    );
+    let dproj_path = dir.join("TestPkg.dproj");
+    std::fs::write(&dproj_path, dproj_xml).unwrap();
+    std::fs::write(dir.join("TestPkg.dpk"), "package TestPkg;\nend.\n").unwrap();
+
+    let mut project = Project {
+        id: 1,
+        name: "TestPkg".to_string(),
+        directory: dir.to_string_lossy().to_string(),
+        dproj: Some(dproj_path.to_string_lossy().to_string()),
+        ..Default::default()
+    };
+    project.discover_paths_for("Debug", "Win64").unwrap();
+
+    let host = project
+        .dproj_host_application
+        .clone()
+        .expect("host application should be discovered");
+    assert!(
+        !host.contains("$("),
+        "$(DDK_TEST_HOST_ROOT) must be expanded from the environment, got: {host}"
+    );
+    assert!(
+        host.to_lowercase().ends_with("debughost64.exe"),
+        "expected the env-var-based host, got: {host}"
+    );
+}
+
+#[test]
 fn update_project_sets_and_clears_host_application() {
     let mut data = ProjectsData::default();
     data.projects.push(Project {

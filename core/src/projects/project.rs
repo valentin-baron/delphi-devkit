@@ -132,11 +132,14 @@ impl Project {
 
     /// The executable that hosts this project at run time, when one is
     /// configured: the DevKit override wins over the dproj's own
-    /// `Debugger_HostApplication`. Blank values count as absent.
+    /// `Debugger_HostApplication`. Blank values count as absent, and so does
+    /// a value still containing an unresolved `$(...)` macro — it is not a
+    /// launchable path, and must never shadow the project's own exe.
     pub fn effective_host_application(&self) -> Option<String> {
+        let usable = |s: &String| !s.trim().is_empty() && !s.contains("$(");
         self.host_application.clone()
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| self.dproj_host_application.clone().filter(|s| !s.trim().is_empty()))
+            .filter(usable)
+            .or_else(|| self.dproj_host_application.clone().filter(usable))
     }
 
     pub fn discover_paths(&mut self) -> Result<()> {
@@ -326,8 +329,11 @@ impl Project {
 }
 
 /// Expands the dproj macros the IDE commonly uses inside
-/// `Debugger_HostApplication` values (`$(ProjectDir)`, `$(ProjectName)`,
-/// `$(Platform)`, `$(Config)`), case-insensitively. Unknown macros are left
+/// `Debugger_HostApplication` values: the project-context macros
+/// (`$(ProjectDir)`, `$(ProjectName)`, `$(Platform)`, `$(Config)`) first,
+/// then any remaining `$(NAME)` as an environment variable — MSBuild treats
+/// environment variables as properties, and real dprojs rely on that (e.g. a
+/// site-specific `$(VEGADIR)`). Macros that resolve to nothing are left
 /// untouched.
 fn expand_project_macros(value: &str, project_dir: &str, project_name: &str, config: &str, platform: &str) -> String {
     let mut result = value.to_string();
@@ -339,7 +345,27 @@ fn expand_project_macros(value: &str, project_dir: &str, project_name: &str, con
     ] {
         result = replace_case_insensitive(&result, macro_name, replacement);
     }
-    result
+    expand_environment_macros(&result)
+}
+
+lazy_static::lazy_static! {
+    static ref MACRO_REGEX: regex::Regex =
+        regex::Regex::new(r"\$\((?P<name>[A-Za-z_][A-Za-z0-9_]*)\)").unwrap();
+}
+
+/// Replaces every `$(NAME)` whose `NAME` exists as an environment variable
+/// (case-insensitive, as on Windows) with that variable's value; unknown
+/// names stay verbatim.
+fn expand_environment_macros(value: &str) -> String {
+    MACRO_REGEX
+        .replace_all(value, |caps: &regex::Captures| {
+            let name = &caps["name"];
+            std::env::vars()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v)
+                .unwrap_or_else(|| caps[0].to_string())
+        })
+        .to_string()
 }
 
 fn replace_case_insensitive(haystack: &str, needle: &str, replacement: &str) -> String {

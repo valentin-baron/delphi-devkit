@@ -59,11 +59,17 @@ export namespace Entities {
   /**
    * The configured hosting executable: the DevKit "Set Host Application"
    * override first, then the dproj's own `Debugger_HostApplication`. Blank
-   * values count as absent. Mirrors `Project::effective_host_application`
+   * values count as absent, and so does a value still containing an
+   * unresolved `$(...)` macro — not a launchable path, and it must never
+   * shadow the project's own exe. Mirrors `Project::effective_host_application`
    * on the Rust side.
    */
   export function effectiveHostApplication(entity: Project): string | undefined {
-    return notBlank(entity.host_application) ?? notBlank(entity.dproj_host_application);
+    const usable = (value?: Option<string>) => {
+      const present = notBlank(value);
+      return present && !present.includes('$(') ? present : undefined;
+    };
+    return usable(entity.host_application) ?? usable(entity.dproj_host_application);
   }
 
   /**
