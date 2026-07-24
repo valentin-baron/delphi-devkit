@@ -7,7 +7,7 @@ import { Coroutine, DelphiProjectTreeItemType } from '../types';
 import { Entities } from './entities';
 import { BaseFileItem } from './trees/items/baseFile';
 import { ProjectItem } from './trees/items/project';
-import { assertError, basenameNoExt, fuseStartParameters, launchExecutable } from '../utils';
+import { assertError, basenameNoExt, launchExecutable } from '../utils';
 import { WorkspaceItem } from './trees/items/workspaceItem';
 import { Change } from '../client';
 import { Option } from '../types';
@@ -24,8 +24,7 @@ export namespace ProjectsCommands {
    */
   function resolveEffectiveStartParameters(entity: Entities.Project): Option<string> {
     const useDebuggerRunParams = workspace.getConfiguration(PROJECTS.CONFIG.KEY).get<boolean>(PROJECTS.CONFIG.USE_DEBUGGER_RUN_PARAMS, true);
-    if (useDebuggerRunParams) return fuseStartParameters(entity.dproj_run_params, entity.start_parameters);
-    return entity.start_parameters;
+    return Entities.resolveEffectiveStartParameters(entity, useDebuggerRunParams);
   }
 
   const resolveRunTarget = Entities.resolveRunTarget;

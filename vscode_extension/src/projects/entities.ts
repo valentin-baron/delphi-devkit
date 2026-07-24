@@ -1,4 +1,5 @@
 import { Option } from '../types';
+import { fuseStartParameters } from '../utils';
 
 export namespace Entities {
   export class ProjectsData {
@@ -53,16 +54,36 @@ export namespace Entities {
     sort_rank: string;
   }
 
+  const notBlank = (value?: Option<string>) => (value && value.trim().length > 0 ? value : undefined);
+
+  /**
+   * The configured hosting executable: the DevKit "Set Host Application"
+   * override first, then the dproj's own `Debugger_HostApplication`. Blank
+   * values count as absent. Mirrors `Project::effective_host_application`
+   * on the Rust side.
+   */
+  export function effectiveHostApplication(entity: Project): string | undefined {
+    return notBlank(entity.host_application) ?? notBlank(entity.dproj_host_application);
+  }
+
   /**
    * The executable RunProgram launches for a project: a configured Host
-   * Application (the DevKit override first, then the dproj's own
-   * `Debugger_HostApplication`) wins over the project's exe, matching the
-   * Delphi IDE's Run behaviour — it is what makes a `.dpk` package or DLL
-   * project runnable at all. Blank values count as absent.
+   * Application wins over the project's exe, matching the Delphi IDE's Run
+   * behaviour — it is what makes a `.dpk` package or DLL project runnable
+   * at all.
    */
   export function resolveRunTarget(entity: Project): string | undefined {
-    const notBlank = (value?: Option<string>) => (value && value.trim().length > 0 ? value : undefined);
-    return notBlank(entity.host_application) ?? notBlank(entity.dproj_host_application) ?? notBlank(entity.exe);
+    return effectiveHostApplication(entity) ?? notBlank(entity.exe);
+  }
+
+  /**
+   * The effective command-line parameters RunProgram passes: the dproj's
+   * `Debugger_RunParams` fused with the saved Start Parameters (dproj first)
+   * when `useDprojRunParams` is enabled, otherwise only the saved value.
+   */
+  export function resolveEffectiveStartParameters(entity: Project, useDprojRunParams: boolean): string | undefined {
+    if (useDprojRunParams) return fuseStartParameters(entity.dproj_run_params, entity.start_parameters);
+    return entity.start_parameters ?? undefined;
   }
 
   export class CompilerConfiguration {

@@ -9,6 +9,7 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 ### Added
 
 - **Host Application support for packages and DLLs**: a project without an own executable (e.g. a `.dpk` runtime package) is now runnable. DevKit reads the `Debugger_HostApplication` set via Project > Options > Debugger in the Delphi IDE from the project's active `.dproj` property group (resolved for the effective configuration/platform, with `$(ProjectDir)`/`$(ProjectName)`/`$(Platform)`/`$(Config)` expanded and relative paths resolved against the project directory), and a new **"Set Host Application"** project context-menu command stores a DevKit-side override that wins over the dproj value. Running such a project (context menu "Run", "Run Selected Project" / `F9`, `ddk run`, or the MCP run tools) launches the host executable with the project's usual run parameters — matching the Delphi IDE, where Run on a package starts its Host Application. A package's `Debugger_RunParams` are now discovered too, and `ddk project list` / `delphi_list_projects` show the effective host next to the exe.
+- **Run-target visibility in the project tree**: hovering a project now shows a tooltip with its exe, the effective Host Application (marking whether it comes from the DevKit override or the dproj) and the effective run parameters (saved Start Parameters, the dproj's `Debugger_RunParams`, or both fused). A project that runs through a hosting executable also shows an inline `⇢ HostApp.exe` hint next to its name.
 
 ## [2.4.0] - 2026-07-14
 
