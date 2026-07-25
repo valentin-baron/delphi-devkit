@@ -4,6 +4,13 @@ All notable changes to the "delphi-devkit" extension will be documented in this 
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [Unreleased]
+
+### Added
+
+- **DelphiLSP settings generation** (`ddk delphilsp-config`, MCP `delphi_generate_delphilsp_config`, LSP `delphilsp/generate`): write the `<project>.delphilsp.json` settings file Embarcadero's DelphiLSP VS Code extension needs for code insight, without ever opening RAD Studio. The file is reconstructed from the project's `.dproj` (evaluated for the effective configuration/platform), the compiler's `rsvars.bat`, and the IDE's global Library Path / Browsing Path / environment-variable overrides read from the registry. Works on managed projects (ID/name) and ad-hoc `.dproj` paths (`-c` picks the compiler, `-o` overrides the destination). Files DDK writes carry a `"generatedBy": "delphi-devkit"` marker; IDE-generated files are never touched.
+- **DelphiLSP auto-sync (VS Code)**: when the DelphiLSP extension is installed, DDK keeps its `delphiLsp.settingsFile` pointed at the DDK active project — generating the settings file on the fly when missing (or stale and DDK-owned) — and re-validates every open Delphi file under the new project context after each switch (something DelphiLSP's own *Select project settings* command does not do). New **Generate DelphiLSP Config** project context-menu action, and `ddk.delphilsp.autoSync` / `ddk.delphilsp.revalidateOpenFilesOnSwitch` settings (both on by default). Nothing appears when DelphiLSP is not installed.
+
 ## [2.4.0] - 2026-07-14
 
 ### Added
