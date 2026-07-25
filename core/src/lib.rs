@@ -1,4 +1,5 @@
 pub mod commands;
+pub mod delphilsp;
 pub mod projects;
 pub mod lexorank;
 pub mod lsp_types;

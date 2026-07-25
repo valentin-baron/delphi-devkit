@@ -1484,6 +1484,201 @@ pub async fn cmd_run_path(path: String, args: Option<String>) -> Result<RunOrAmb
     bail!("\"{path}\" is not a recognized project or executable file (expected .dproj/.dpr/.dpk/.exe).");
 }
 
+// ---------------------------------------------------------------------------
+// DelphiLSP settings file
+// ---------------------------------------------------------------------------
+
+/// Result of generating a `.delphilsp.json`: either the written file's summary,
+/// or the candidate list when the project reference was ambiguous.
+#[derive(Debug, Clone)]
+pub enum DelphiLspOrAmbiguity {
+    Output(crate::delphilsp::DelphiLspConfigResult),
+    Ambiguity(AmbiguousProjects),
+}
+
+/// The compiler configuration a managed project builds with: its workspace's,
+/// or the group project's when the project only lives there.
+async fn compiler_for_project(
+    data: &ProjectsData,
+    project_id: usize,
+) -> Option<CompilerConfiguration> {
+    for workspace in &data.workspaces {
+        if workspace.project_links.iter().any(|l| l.project_id == project_id) {
+            return Some(workspace.compiler().await);
+        }
+    }
+    let group_project = data.group_project.as_ref()?;
+    group_project
+        .project_links
+        .iter()
+        .any(|l| l.project_id == project_id)
+        .then_some(())?;
+    Some(data.group_projects_compiler().await)
+}
+
+/// Build the generation request for a project already managed by DDK.
+async fn delphilsp_request_for_project(
+    project_id: usize,
+    out: Option<String>,
+) -> Result<crate::delphilsp::GenerationRequest> {
+    use std::path::PathBuf;
+
+    let data = PROJECTS_DATA.read().await;
+    let project = match data.get_project(project_id) {
+        Some(p) => p,
+        _ => bail!("Project with ID {project_id} not found."),
+    };
+    let compiler = match compiler_for_project(&data, project_id).await {
+        Some(c) => c,
+        _ => bail!(
+            "Project \"{}\" is not linked to a workspace or the group project, so no compiler can be determined.",
+            project.name
+        ),
+    };
+    let dproj_path = project.dproj.as_ref().map(PathBuf::from);
+    let main_source = project
+        .dpr
+        .as_ref()
+        .or(project.dpk.as_ref())
+        .map(PathBuf::from)
+        .or_else(|| dproj_path.as_ref().and_then(|p| crate::files::dproj::get_main_source(p).ok()));
+    let main_source = match main_source {
+        Some(path) => path,
+        _ => bail!(
+            "Project \"{}\" has no .dpr/.dpk main source to describe.",
+            project.name
+        ),
+    };
+    Ok(crate::delphilsp::GenerationRequest {
+        dproj_path,
+        main_source,
+        configuration: project.active_configuration.clone(),
+        platform: project.active_platform.clone(),
+        installation_path: PathBuf::from(&compiler.installation_path),
+        compiler_name: compiler.product_name.clone(),
+        out_path: out.map(PathBuf::from),
+    })
+}
+
+/// Build the generation request for a project file that belongs to no
+/// workspace — the ad-hoc counterpart of [`cmd_compile_file`]'s ad-hoc mode.
+/// Nothing is added to (or read from) the persisted project state.
+async fn delphilsp_request_for_path(
+    file_path: &str,
+    compiler: Option<String>,
+    out: Option<String>,
+) -> Result<crate::delphilsp::GenerationRequest> {
+    use crate::files::dproj::{find_dproj_file, get_main_source};
+    use std::path::PathBuf;
+
+    let path = normalize_path(file_path);
+    if !path.exists() {
+        bail!("File not found: {file_path}");
+    }
+    let is_dproj = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("dproj"))
+        .unwrap_or(false);
+    let (dproj_path, main_source) = if is_dproj {
+        (Some(path.clone()), get_main_source(&path)?)
+    } else {
+        (find_dproj_file(&path).ok(), path.clone())
+    };
+
+    let compiler_key = resolve_compiler_key(compiler).await?;
+    let configs = COMPILER_CONFIGURATIONS.read().await;
+    let config = match configs.get(&compiler_key) {
+        Some(c) => c,
+        _ => bail!("Compiler configuration \"{compiler_key}\" disappeared."),
+    };
+    Ok(crate::delphilsp::GenerationRequest {
+        dproj_path,
+        main_source,
+        configuration: None,
+        platform: None,
+        installation_path: PathBuf::from(&config.installation_path),
+        compiler_name: config.product_name.clone(),
+        out_path: out.map(PathBuf::from),
+    })
+}
+
+/// Generates the `.delphilsp.json` settings file Embarcadero's DelphiLSP VS
+/// Code extension needs for code insight, so search paths, defines and unit
+/// scope names are correct without ever opening the RAD Studio IDE.
+///
+/// `target` resolves exactly like the compile commands: `None` uses the active
+/// project; a project id or name resolves against the managed projects (an
+/// ambiguous name returns the candidate list instead of writing anything); a
+/// path to a `.dproj`/`.dpr`/`.dpk` that belongs to a managed project is
+/// treated as that project, and one owned by no project is handled **ad-hoc**
+/// against the compiler chosen by `compiler` (default: the newest installed).
+///
+/// The file is written next to the project's main source as
+/// `<stem>.delphilsp.json` unless `out` overrides the destination.
+pub async fn cmd_delphilsp_config(
+    target: Option<String>,
+    compiler: Option<String>,
+    out: Option<String>,
+) -> Result<DelphiLspOrAmbiguity> {
+    let is_project_file = |value: &str| {
+        let lower = value.to_lowercase();
+        lower.ends_with(".dproj") || lower.ends_with(".dpr") || lower.ends_with(".dpk")
+    };
+
+    let request = match target {
+        None => {
+            let active_id = {
+                let data = PROJECTS_DATA.read().await;
+                data.active_project_id
+            };
+            match active_id {
+                Some(id) => delphilsp_request_for_project(id, out).await?,
+                _ => bail!("No active project selected."),
+            }
+        }
+        Some(reference) if is_project_file(&reference) => {
+            let managed_id = {
+                let data = PROJECTS_DATA.read().await;
+                match resolve_project_by_path(&data, &reference) {
+                    ProjectResolution::Single(id) => Some(id),
+                    ProjectResolution::Ambiguous(matches) => {
+                        return Ok(DelphiLspOrAmbiguity::Ambiguity(AmbiguousProjects {
+                            reference,
+                            matches,
+                        }));
+                    }
+                    ProjectResolution::NotFound => None,
+                }
+            };
+            match managed_id {
+                Some(id) => delphilsp_request_for_project(id, out).await?,
+                _ => delphilsp_request_for_path(&reference, compiler, out).await?,
+            }
+        }
+        Some(reference) => {
+            let resolved = {
+                let data = PROJECTS_DATA.read().await;
+                resolve_project_reference(&data, &reference)
+            };
+            match resolved {
+                ProjectResolution::Single(id) => delphilsp_request_for_project(id, out).await?,
+                ProjectResolution::Ambiguous(matches) => {
+                    return Ok(DelphiLspOrAmbiguity::Ambiguity(AmbiguousProjects {
+                        reference,
+                        matches,
+                    }));
+                }
+                ProjectResolution::NotFound => bail!(
+                    "No project matches \"{reference}\". Use `list` to see available projects."
+                ),
+            }
+        }
+    };
+
+    Ok(DelphiLspOrAmbiguity::Output(crate::delphilsp::generate(&request)?))
+}
+
 /// Formats a Delphi source file in-place.
 ///
 /// Reads the file at `file_path`, decodes it with `encoding` (e.g. `"utf-8"`,
