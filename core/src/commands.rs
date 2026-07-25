@@ -1474,14 +1474,26 @@ pub async fn cmd_run_exe(exe_path: String, args: Option<String>) -> Result<RunOu
 /// [`cmd_run_file`]); a `.exe` runs directly (see [`cmd_run_exe`]). Used by
 /// the CLI/MCP so both share one extension-dispatch rule.
 pub async fn cmd_run_path(path: String, args: Option<String>) -> Result<RunOrAmbiguity> {
-    let lower = path.to_lowercase();
-    if lower.ends_with(".exe") {
+    if has_extension(&path, &["exe"]) {
         return Ok(RunOrAmbiguity::Output(cmd_run_exe(path, args).await?));
     }
-    if lower.ends_with(".dproj") || lower.ends_with(".dpr") || lower.ends_with(".dpk") {
+    if is_delphi_project_path(&path) {
         return cmd_run_file(path, args).await;
     }
     bail!("\"{path}\" is not a recognized project or executable file (expected .dproj/.dpr/.dpk/.exe).");
+}
+
+/// Whether `value` names a Delphi project source (`.dproj`/`.dpr`/`.dpk`),
+/// case-insensitively and without allocating.
+fn is_delphi_project_path(value: &str) -> bool {
+    has_extension(value, &["dproj", "dpr", "dpk"])
+}
+
+fn has_extension(value: &str, extensions: &[&str]) -> bool {
+    std::path::Path::new(value)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| extensions.iter().any(|known| ext.eq_ignore_ascii_case(known)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1621,11 +1633,6 @@ pub async fn cmd_delphilsp_config(
     compiler: Option<String>,
     out: Option<String>,
 ) -> Result<DelphiLspOrAmbiguity> {
-    let is_project_file = |value: &str| {
-        let lower = value.to_lowercase();
-        lower.ends_with(".dproj") || lower.ends_with(".dpr") || lower.ends_with(".dpk")
-    };
-
     let request = match target {
         None => {
             let active_id = {
@@ -1637,7 +1644,7 @@ pub async fn cmd_delphilsp_config(
                 _ => bail!("No active project selected."),
             }
         }
-        Some(reference) if is_project_file(&reference) => {
+        Some(reference) if is_delphi_project_path(&reference) => {
             let managed_id = {
                 let data = PROJECTS_DATA.read().await;
                 match resolve_project_by_path(&data, &reference) {

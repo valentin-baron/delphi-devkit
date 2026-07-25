@@ -238,6 +238,11 @@ pub fn path_to_file_uri(path: &Path) -> String {
             encoded.push_str(&format!("%{byte:02X}"));
         }
     }
+    if normalized.starts_with("//") {
+        // UNC path: \\server\share\file → file://server/share/file (the
+        // server is the URI authority, so exactly two slashes after `file:`).
+        return format!("file:{encoded}");
+    }
     format!("file:///{}", encoded.trim_start_matches('/'))
 }
 
@@ -365,7 +370,8 @@ pub fn build_dcc_options(input: &DccOptionsInput) -> String {
         parts.push(format!("-U{include_and_unit}"));
     }
     if let Some(description) = input.description.as_ref().filter(|d| !d.trim().is_empty()) {
-        parts.push(format!("--description:\"{description}\""));
+        // Escape embedded quotes so the quoted payload cannot break the option syntax.
+        parts.push(format!("--description:\"{}\"", description.replace('"', "\\\"")));
     }
     if !input.required_packages.is_empty() {
         parts.push(format!("-LU{};", input.required_packages.join(";")));
@@ -947,6 +953,14 @@ mod tests {
     }
 
     #[test]
+    fn unc_paths_keep_the_server_as_uri_authority() {
+        assert_eq!(
+            path_to_file_uri(Path::new(r"\\server\share\src\App.dpr")),
+            "file://server/share/src/App.dpr"
+        );
+    }
+
+    #[test]
     fn directory_uris_end_with_a_slash() {
         assert_eq!(dir_to_file_uri(Path::new(r"C:\a\ObjRepos")), "file:///C%3A/a/ObjRepos/");
         assert_eq!(dir_to_file_uri(Path::new(r"C:\a\ObjRepos\")), "file:///C%3A/a/ObjRepos/");
@@ -1024,6 +1038,19 @@ mod tests {
     fn emits_description_and_required_packages_last() {
         let options = build_dcc_options(&package_input());
         assert!(options.ends_with(r#"--description:"Hydra About Menu" -LUlibStdFormsD29;"#), "{options}");
+    }
+
+    #[test]
+    fn escapes_quotes_inside_the_description() {
+        let input = DccOptionsInput {
+            description: Some(r#"Hydra "About" Menu"#.to_string()),
+            ..package_input()
+        };
+        assert!(
+            build_dcc_options(&input).contains(r#"--description:"Hydra \"About\" Menu""#),
+            "{}",
+            build_dcc_options(&input)
+        );
     }
 
     #[test]

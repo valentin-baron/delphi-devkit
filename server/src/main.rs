@@ -105,9 +105,12 @@ impl DelphiLsp {
             }
             Err(error) => {
                 lsp_error!(self.client, "Failed to generate DelphiLSP settings: {}", error);
-                Err(jsonrpc::Error::invalid_params(format!(
-                    "Failed to generate DelphiLSP settings: {error}"
-                )))
+                // Internal failure, not a caller mistake — report it as such.
+                Err(jsonrpc::Error {
+                    code: jsonrpc::ErrorCode::InternalError,
+                    message: format!("Failed to generate DelphiLSP settings: {error}").into(),
+                    data: None,
+                })
             }
         }
     }

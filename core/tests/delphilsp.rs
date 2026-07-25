@@ -204,6 +204,9 @@ fn regenerating_over_a_ddk_file_keeps_the_marker() {
     assert_eq!(written_file(&fixture)["generatedBy"], "delphi-devkit");
 }
 
+// The drive-letter assertions (`%3A`, no literal `:`) only hold for Windows
+// temp paths; on other platforms temp dirs have no drive prefix.
+#[cfg(windows)]
 #[test]
 fn project_uri_points_at_the_main_source_not_the_dproj() {
     let fixture = fixture(None, None);

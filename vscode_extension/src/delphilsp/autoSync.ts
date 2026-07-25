@@ -1,4 +1,4 @@
-import { existsSync, promises as fs } from 'fs';
+import { promises as fs } from 'fs';
 import { basename, dirname, join } from 'path';
 import { ConfigurationTarget, languages, Uri, window, workspace } from 'vscode';
 import { Runtime } from '../runtime';
@@ -34,6 +34,17 @@ export namespace DelphiLspAutoSync {
     return join(dirname(mainSource), `${basenameNoExt(mainSource)}.delphilsp.json`);
   }
 
+  /** Non-blocking existence check — `existsSync` would stall the extension
+   *  host on slow or network filesystems during every project switch. */
+  async function fileExists(filePath: string): Promise<boolean> {
+    try {
+      await fs.access(filePath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   async function readGeneratedByMarker(filePath: string): Promise<Option<string>> {
     try {
       const content = await fs.readFile(filePath, 'utf8');
@@ -65,7 +76,7 @@ export namespace DelphiLspAutoSync {
     const filePath = expectedSettingsFilePath(project);
     if (!filePath) return undefined;
 
-    let needsGeneration = !existsSync(filePath);
+    let needsGeneration = !(await fileExists(filePath));
     if (!needsGeneration) {
       const marker = await readGeneratedByMarker(filePath);
       if (marker === DELPHILSP.GENERATED_BY_MARKER)

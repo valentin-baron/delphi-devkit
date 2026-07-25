@@ -304,7 +304,7 @@
         "command": "ddk.projects.generateDelphiLspConfig",
         "title": "Generate DelphiLSP Config",
         "icon": "$(json)",
-        "when": "ddk:delphiLspAvailable == true",
+        "enablement": "ddk:delphiLspAvailable == true",
         "category": "DDK"
       }
     ],
@@ -450,7 +450,7 @@
         },
         {
           "command": "ddk.projects.generateDelphiLspConfig",
-          "when": "false"
+          "when": "ddk:delphiLspAvailable == true"
         }
       ],
       "view/title": [

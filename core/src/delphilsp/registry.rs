@@ -28,6 +28,7 @@ mod imp {
     use super::IdeLibrarySettings;
     use winreg::RegKey;
     use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, REG_EXPAND_SZ, REG_SZ};
+    use winreg::types::FromRegValue;
 
     fn bds_key(bds_version: &str, sub_key: &str) -> Option<RegKey> {
         let path = format!("SOFTWARE\\Embarcadero\\BDS\\{bds_version}\\{sub_key}");
@@ -65,7 +66,8 @@ mod imp {
             // Only string values define a usable `$(NAME)` macro.
             .filter(|(_, value)| matches!(value.vtype, REG_SZ | REG_EXPAND_SZ))
             .filter_map(|(name, value)| {
-                let text = value.to_string().trim().to_string();
+                // Proper registry decoding — `RegValue`'s Display is debug formatting.
+                let text = String::from_reg_value(&value).ok()?.trim().to_string();
                 (!name.trim().is_empty() && !text.is_empty()).then_some((name, text))
             })
             .collect()
