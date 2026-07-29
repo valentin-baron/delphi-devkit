@@ -4,6 +4,7 @@ import { Runtime } from '../runtime';
 import { DELPHILSP } from '../constants';
 import { DelphiLspCommands } from './commands';
 import { DelphiLspAutoSync } from './autoSync';
+import { MergedDiagnostics } from './mergedDiagnostics';
 
 /**
  * Integrates DDK with Embarcadero's DelphiLSP VS Code extension: generates
@@ -25,6 +26,9 @@ export class DelphiLspFeature implements Feature {
   }
 
   public async initialize(): Promise<void> {
+    // Always initialized: it is the rendering route for the server's compile
+    // diagnostics; the dedup against DelphiLSP is gated internally.
+    MergedDiagnostics.initialize();
     this.updateAvailability();
     Runtime.extension.subscriptions.push(
       ...DelphiLspCommands.registers,

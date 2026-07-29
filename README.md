@@ -138,6 +138,19 @@ an invisible language-mode round-trip that re-emits `didOpen` — tabs, focus,
 cursor, dirty state and undo history are untouched
 (`ddk.delphilsp.revalidateOpenFilesOnSwitch`, on by default).
 
+With both extensions active the **Problems** view would otherwise show the same
+error twice — once from DDK's last compile and once from DelphiLSP's live
+analysis — and DDK's copy would go stale the moment the code is fixed, since it
+only refreshes on the next compile. DDK therefore merges the two: whenever
+DelphiLSP reports live diagnostics for a file, every DDK compile diagnostic
+matching one of them (same line, same `Exxxx` code) is removed, leaving only
+the live entry with its precise token range — and when DelphiLSP later clears
+that entry because the error was fixed in the editor (even without
+recompiling), no stale compile copy resurfaces. Compile diagnostics DelphiLSP
+knows nothing about (files it has not validated, link errors) keep their normal
+lifetime, and without DelphiLSP installed nothing is ever removed
+(`ddk.delphilsp.mergeDiagnostics`, on by default).
+
 Without `--args`, a project runs with the `.dproj`'s own `Debugger_RunParams`
 — the Run Parameters set via Project > Options > Run in the Delphi IDE,
 resolved against the project's active configuration/platform — fused with

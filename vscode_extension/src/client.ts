@@ -8,6 +8,7 @@ import { UUID } from 'crypto';
 import { join } from 'path';
 import { existsSync } from 'fs';
 import { CompilerOutputDefinitionProvider } from './projects/compiler/language';
+import { MergedDiagnostics } from './delphilsp/mergedDiagnostics';
 import { PROJECTS } from './constants';
 
 export type Change =
@@ -125,6 +126,12 @@ export class DDK_Client {
         const clientOptions: LanguageClientOptions = {
             initializationOptions: {
                 encoding: workspace.getConfiguration(PROJECTS.SETTINGS.SECTION).get<string>(PROJECTS.SETTINGS.COMPILER_ENCODING, 'oem')
+            },
+            middleware: {
+                // Route the server's compile diagnostics into a collection DDK
+                // owns, so single entries can be dropped when DelphiLSP reports
+                // the same error live (see MergedDiagnostics).
+                handleDiagnostics: (uri, diagnostics) => MergedDiagnostics.publish(uri, diagnostics)
             }
         };
         // we can't set the documentSelector until we implement the actual LSP

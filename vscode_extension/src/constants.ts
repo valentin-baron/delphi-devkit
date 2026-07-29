@@ -141,6 +141,7 @@ export namespace DELPHILSP {
     export const KEY = 'ddk.delphilsp';
     export const AUTO_SYNC = 'autoSync';
     export const REVALIDATE_ON_SWITCH = 'revalidateOpenFilesOnSwitch';
+    export const MERGE_DIAGNOSTICS = 'mergeDiagnostics';
   }
 
   export namespace COMMAND {
