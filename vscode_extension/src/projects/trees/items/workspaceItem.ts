@@ -13,6 +13,5 @@ export class WorkspaceItem extends TreeItem {
       const treeItem = ProjectItem.fromData(link);
       this.projects.push(treeItem);
     }
-    this.projects = this.projects.sort((a, b) => a.link.sort_rank.localeCompare(b.link.sort_rank));
   }
 }

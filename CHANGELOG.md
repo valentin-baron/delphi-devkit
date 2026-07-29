@@ -4,6 +4,12 @@ All notable changes to the "delphi-devkit" extension will be documented in this 
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [Unreleased]
+
+### Changed
+
+- **Simplified project/workspace ordering (internal)**: the ordering of workspaces and project links is now derived solely from their position in the persisted list, removing the per-item `sort_rank` (LexoRank) field that previously encoded it. The list order was already authoritative — every reorder operation rewrote the ranks to match it — so the field was redundant. The LexoRank module and its now-unused `substring` dependency were removed. No user-facing behavior change; existing saved data with leftover `sort_rank` values still loads (the unknown field is ignored).
+
 ## [2.4.0] - 2026-07-14
 
 ### Added

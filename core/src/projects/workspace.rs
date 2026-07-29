@@ -1,6 +1,4 @@
 use serde::{Serialize, Deserialize};
-use crate::lexorank::HasLexoRank;
-use crate::lexorank::LexoRank;
 use super::*;
 
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
@@ -10,7 +8,6 @@ pub struct Workspace {
     pub name: String,
     pub compiler_id: String,
     pub project_links: Vec<ProjectLink>,
-    pub sort_rank: LexoRank,
     /// Workspace-level configuration override.  When set, all linked projects
     /// inherit this value (unless individually overridden).
     pub active_configuration: Option<String>,
@@ -25,7 +22,6 @@ impl Default for Workspace {
             name: String::new(),
             compiler_id: String::from("12.0"),
             project_links: Vec::new(),
-            sort_rank: LexoRank::default(),
             active_configuration: None,
             active_platform: None,
         }
@@ -33,13 +29,12 @@ impl Default for Workspace {
 }
 
 impl Workspace {
-    pub fn new(id: usize, name: String, compiler_id: String, lexo_rank: LexoRank) -> Self {
+    pub fn new(id: usize, name: String, compiler_id: String) -> Self {
         Workspace {
             id,
             name,
             compiler_id,
             project_links: Vec::new(),
-            sort_rank: lexo_rank,
             active_configuration: None,
             active_platform: None,
         }
@@ -56,15 +51,6 @@ impl Workspace {
                 "Compiler with id {} not found; should not be possible.",
                 self.compiler_id).as_str())
             .clone();
-    }
-}
-
-impl HasLexoRank for Workspace {
-    fn get_lexorank(&self) -> &LexoRank {
-        &self.sort_rank
-    }
-    fn set_lexorank(&mut self, lexorank: LexoRank) {
-        self.sort_rank = lexorank;
     }
 }
 

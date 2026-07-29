@@ -1,2 +1,0 @@
-The code in the current directory is a copy paste of the code from the `lexorank` crate repository. I required to add Serde support for serializing and deserializing LexoRank values.
-Consider supporting the original creator at https://github.com/Kayron013/lexorank-rust.

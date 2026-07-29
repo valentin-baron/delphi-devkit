@@ -1,6 +1,5 @@
 use ddk_core::commands::*;
 use ddk_core::projects::*;
-use ddk_core::lexorank::LexoRank;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  find_project_link_id
@@ -38,10 +37,8 @@ fn make_data() -> ProjectsData {
                 ProjectLink {
                     id: 5,
                     project_id: 1,
-                    sort_rank: LexoRank::default(),
                 },
             ],
-            sort_rank: LexoRank::default(),
             ..Default::default()
         }],
         group_project: Some(GroupProject {
@@ -51,7 +48,6 @@ fn make_data() -> ProjectsData {
                 ProjectLink {
                     id: 6,
                     project_id: 2,
-                    sort_rank: LexoRank::default(),
                 },
             ],
             ..Default::default()
@@ -88,7 +84,6 @@ fn find_link_prefers_workspace_over_group() {
     data.workspaces[0].project_links.push(ProjectLink {
         id: 7,
         project_id: 2,
-        sort_rank: LexoRank::default(),
     });
     assert_eq!(find_project_link_id(&data, 2), Some(7)); // workspace link, not 6
 }

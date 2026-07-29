@@ -1,6 +1,5 @@
 pub mod commands;
 pub mod projects;
-pub mod lexorank;
 pub mod lsp_types;
 pub mod files;
 pub mod utils;
