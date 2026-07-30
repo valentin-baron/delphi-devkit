@@ -12,65 +12,7 @@ use ddk_core::delphilsp::{DccOptionsInput, GenerationRequest, build_dcc_options,
 
 /// Minimal but realistic `.dproj`: two configurations, a platform-specific
 /// group, and the `;$(DCC_…)` inheritance tokens Delphi writes.
-const DPROJ: &str = r#"<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
-    <PropertyGroup>
-        <MainSource>App.dpr</MainSource>
-        <Base>True</Base>
-        <Config Condition="'$(Config)'==''">Debug</Config>
-        <Platform Condition="'$(Platform)'==''">Win64</Platform>
-        <ProjectName Condition="'$(ProjectName)'==''">App</ProjectName>
-        <AppType>Application</AppType>
-    </PropertyGroup>
-    <PropertyGroup Condition="'$(Config)'=='Base' or '$(Base)'!=''">
-        <Base>true</Base>
-    </PropertyGroup>
-    <PropertyGroup Condition="('$(Platform)'=='Win64' and '$(Base)'=='true') or '$(Base_Win64)'!=''">
-        <Base_Win64>true</Base_Win64>
-        <CfgParent>Base</CfgParent>
-        <Base>true</Base>
-    </PropertyGroup>
-    <PropertyGroup Condition="'$(Config)'=='Release' or '$(Cfg_1)'!=''">
-        <Cfg_1>true</Cfg_1>
-        <CfgParent>Base</CfgParent>
-        <Base>true</Base>
-    </PropertyGroup>
-    <PropertyGroup Condition="'$(Config)'=='Debug' or '$(Cfg_2)'!=''">
-        <Cfg_2>true</Cfg_2>
-        <CfgParent>Base</CfgParent>
-        <Base>true</Base>
-    </PropertyGroup>
-    <PropertyGroup Condition="'$(Base)'!=''">
-        <DCC_UnitSearchPath>.\$(Platform)\$(Config);..\shared;$(DCC_UnitSearchPath)</DCC_UnitSearchPath>
-        <DCC_ExeOutput>.\$(Platform)\$(Config)</DCC_ExeOutput>
-        <DCC_DcuOutput>.\$(Platform)\$(Config)</DCC_DcuOutput>
-        <DCC_Namespace>System;Vcl;$(DCC_Namespace)</DCC_Namespace>
-        <DCC_Define>APPWIDE;$(DCC_Define)</DCC_Define>
-        <DCC_Optimize>false</DCC_Optimize>
-        <DCC_RangeChecking>true</DCC_RangeChecking>
-        <DCC_GenerateStackFrames>true</DCC_GenerateStackFrames>
-    </PropertyGroup>
-    <PropertyGroup Condition="'$(Base_Win64)'!=''">
-        <DCC_Namespace>Winapi;$(DCC_Namespace)</DCC_Namespace>
-    </PropertyGroup>
-    <PropertyGroup Condition="'$(Cfg_1)'!=''">
-        <DCC_Define>RELEASE;$(DCC_Define)</DCC_Define>
-        <DCC_Optimize>true</DCC_Optimize>
-    </PropertyGroup>
-    <PropertyGroup Condition="'$(Cfg_2)'!=''">
-        <DCC_Define>DEBUG;$(DCC_Define)</DCC_Define>
-        <DCC_Inlining>off</DCC_Inlining>
-        <DCC_DebugDCUs>true</DCC_DebugDCUs>
-    </PropertyGroup>
-    <ItemGroup>
-        <DelphiCompile Include="$(MainSource)"><MainSource>MainSource</MainSource></DelphiCompile>
-        <DCCReference Include="rtl.dcp"/>
-        <DCCReference Include="Unit1.pas"/>
-        <BuildConfiguration Include="Base"><Key>Base</Key></BuildConfiguration>
-        <BuildConfiguration Include="Release"><Key>Cfg_1</Key><CfgParent>Base</CfgParent></BuildConfiguration>
-        <BuildConfiguration Include="Debug"><Key>Cfg_2</Key><CfgParent>Base</CfgParent></BuildConfiguration>
-    </ItemGroup>
-</Project>
-"#;
+const DPROJ: &str = include_str!("fixtures/App.dproj");
 
 /// A directory tree that looks enough like a Delphi install for the generator:
 /// `bin\rsvars.bat` plus the two Windows compiler DLLs.
