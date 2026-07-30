@@ -461,6 +461,8 @@ impl Compiler {
                     .arg(format!("/p:Config={}", eff_config))
                     .arg(format!("/p:Configuration={}", eff_config))
                     .arg(format!("/p:Platform={}", eff_platform))
+                    // prevent MSB60002/MSB60003 (32000-character command line limit
+                    .arg("/p:DCC_UseMSBuildExternally=true")
                     // User passthrough last so a `/p:` override wins.
                     .args(&self.extra_msbuild_args);
                 command
