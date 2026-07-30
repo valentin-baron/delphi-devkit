@@ -1,0 +1,126 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+	<PropertyGroup>
+		<ProjectGuid>{B2C3D4E5-1234-4A35-9406-1EFE6D0F8F77}</ProjectGuid>
+		<MainSource>TestPkg.dpk</MainSource>
+		<Base>True</Base>
+		<Config Condition="'$(Config)'==''">Debug</Config>
+		<TargetedPlatforms>3</TargetedPlatforms>
+		<AppType>Package</AppType>
+		<FrameworkType>None</FrameworkType>
+		<ProjectVersion>20.3</ProjectVersion>
+		<Platform Condition="'$(Platform)'==''">Win64</Platform>
+		<ProjectName Condition="'$(ProjectName)'==''">TestPkg64</ProjectName>
+	</PropertyGroup>
+	<PropertyGroup Condition="'$(Config)'=='Base' or '$(Base)'!=''">
+		<Base>true</Base>
+	</PropertyGroup>
+	<PropertyGroup Condition="('$(Platform)'=='Win32' and '$(Base)'=='true') or '$(Base_Win32)'!=''">
+		<Base_Win32>true</Base_Win32>
+		<CfgParent>Base</CfgParent>
+		<Base>true</Base>
+	</PropertyGroup>
+	<PropertyGroup Condition="('$(Platform)'=='Win64' and '$(Base)'=='true') or '$(Base_Win64)'!=''">
+		<Base_Win64>true</Base_Win64>
+		<CfgParent>Base</CfgParent>
+		<Base>true</Base>
+	</PropertyGroup>
+	<PropertyGroup Condition="'$(Config)'=='Release' or '$(Cfg_1)'!=''">
+		<Cfg_1>true</Cfg_1>
+		<CfgParent>Base</CfgParent>
+		<Base>true</Base>
+	</PropertyGroup>
+	<PropertyGroup Condition="'$(Config)'=='Debug' or '$(Cfg_2)'!=''">
+		<Cfg_2>true</Cfg_2>
+		<CfgParent>Base</CfgParent>
+		<Base>true</Base>
+	</PropertyGroup>
+	<PropertyGroup Condition="('$(Platform)'=='Win32' and '$(Cfg_2)'=='true') or '$(Cfg_2_Win32)'!=''">
+		<Cfg_2_Win32>true</Cfg_2_Win32>
+		<CfgParent>Cfg_2</CfgParent>
+		<Cfg_2>true</Cfg_2>
+		<Base>true</Base>
+	</PropertyGroup>
+	<PropertyGroup Condition="('$(Platform)'=='Win64' and '$(Cfg_2)'=='true') or '$(Cfg_2_Win64)'!=''">
+		<Cfg_2_Win64>true</Cfg_2_Win64>
+		<CfgParent>Cfg_2</CfgParent>
+		<Cfg_2>true</Cfg_2>
+		<Base>true</Base>
+	</PropertyGroup>
+	<PropertyGroup Condition="'$(Base)'!=''">
+		<DCC_UnitSearchPath>.\$(Platform)\$(Config);$(DCC_UnitSearchPath)</DCC_UnitSearchPath>
+		<DCC_ExeOutput>.\$(Platform)\$(Config)</DCC_ExeOutput>
+		<DCC_DcuOutput>.\$(Platform)\$(Config)</DCC_DcuOutput>
+		<SanitizedProjectName>TestPkg64</SanitizedProjectName>
+		<DCC_ImageBase>00400000</DCC_ImageBase>
+		<RuntimeOnlyPackage>true</RuntimeOnlyPackage>
+		<GenPackage>true</GenPackage>
+		<GenDll>true</GenDll>
+		<VerInfo_Locale>1040</VerInfo_Locale>
+		<VerInfo_Keys>CompanyName=;FileDescription=;FileVersion=1.0.0.0;InternalName=;LegalCopyright=;LegalTrademarks=;OriginalFilename=;ProductName=;ProductVersion=1.0.0.0;Comments=;CFBundleName=</VerInfo_Keys>
+	</PropertyGroup>
+	<PropertyGroup Condition="'$(Base_Win32)'!=''">
+		<VerInfo_IncludeVerInfo>true</VerInfo_IncludeVerInfo>
+		<BT_BuildType>Debug</BT_BuildType>
+		<VerInfo_Locale>1033</VerInfo_Locale>
+	</PropertyGroup>
+	<PropertyGroup Condition="'$(Base_Win64)'!=''">
+		<BT_BuildType>Debug</BT_BuildType>
+		<VerInfo_IncludeVerInfo>true</VerInfo_IncludeVerInfo>
+		<VerInfo_Locale>1033</VerInfo_Locale>
+	</PropertyGroup>
+	<PropertyGroup Condition="'$(Cfg_1)'!=''">
+		<DCC_LocalDebugSymbols>false</DCC_LocalDebugSymbols>
+		<DCC_SymbolReferenceInfo>0</DCC_SymbolReferenceInfo>
+		<DCC_Define>RELEASE;$(DCC_Define)</DCC_Define>
+		<DCC_DebugInformation>0</DCC_DebugInformation>
+	</PropertyGroup>
+	<PropertyGroup Condition="'$(Cfg_2)'!=''">
+		<DCC_MapFile>3</DCC_MapFile>
+		<DCC_DebugInfoInExe>true</DCC_DebugInfoInExe>
+		<DCC_DebugDCUs>true</DCC_DebugDCUs>
+		<DCC_Optimize>false</DCC_Optimize>
+		<DCC_Define>DEBUG;$(DCC_Define)</DCC_Define>
+		<DCC_RemoteDebug>true</DCC_RemoteDebug>
+		<Debugger_HostApplication>$(ProjectDir)\hosts\DebugHost.exe</Debugger_HostApplication>
+		<Debugger_RunParams>-flag1</Debugger_RunParams>
+	</PropertyGroup>
+	<PropertyGroup Condition="'$(Cfg_2_Win64)'!=''">
+		<Debugger_HostApplication>$(VEGADIR)\FieldHost64.exe</Debugger_HostApplication>
+	</PropertyGroup>
+	<ItemGroup>
+		<DelphiCompile Include="$(MainSource)">
+			<MainSource>MainSource</MainSource>
+		</DelphiCompile>
+		<DCCReference Include="TestUnit.pas"/>
+		<BuildConfiguration Include="Base">
+			<Key>Base</Key>
+		</BuildConfiguration>
+		<BuildConfiguration Include="Release">
+			<Key>Cfg_1</Key>
+			<CfgParent>Base</CfgParent>
+		</BuildConfiguration>
+		<BuildConfiguration Include="Debug">
+			<Key>Cfg_2</Key>
+			<CfgParent>Base</CfgParent>
+		</BuildConfiguration>
+	</ItemGroup>
+	<ProjectExtensions>
+		<Borland.Personality>Delphi.Personality.12</Borland.Personality>
+		<Borland.ProjectType>Package</Borland.ProjectType>
+		<BorlandProject>
+			<Delphi.Personality>
+				<Source>
+					<Source Name="MainSource">TestPkg.dpk</Source>
+				</Source>
+			</Delphi.Personality>
+			<Platforms>
+				<Platform value="Win32">True</Platform>
+				<Platform value="Win64">True</Platform>
+			</Platforms>
+		</BorlandProject>
+		<ProjectFileVersion>12</ProjectFileVersion>
+	</ProjectExtensions>
+	<Import Project="$(BDS)\Bin\CodeGear.Delphi.Targets" Condition="Exists('$(BDS)\Bin\CodeGear.Delphi.Targets')"/>
+	<Import Project="$(APPDATA)\Embarcadero\$(BDSAPPDATABASEDIR)\$(PRODUCTVERSION)\UserTools.proj" Condition="Exists('$(APPDATA)\Embarcadero\$(BDSAPPDATABASEDIR)\$(PRODUCTVERSION)\UserTools.proj')"/>
+	<Import Project="$(MSBuildProjectName).deployproj" Condition="Exists('$(MSBuildProjectName).deployproj')"/>
+</Project>

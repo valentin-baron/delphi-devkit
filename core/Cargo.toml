@@ -36,3 +36,4 @@ dproj-rs = "0.3.0"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_NetworkManagement_WNet"] }
+winreg = "0.52"

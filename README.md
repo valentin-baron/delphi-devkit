@@ -95,7 +95,11 @@ status line are always shown.
 `ddk run <PATH>` dispatches on the file extension: a `.exe` is launched
 directly; a `.dproj`/`.dpr`/`.dpk` must already belong to a managed project
 (its stored executable is run, same resolution as by name) — it is never
-compiled or run ad-hoc. `--args`/`-a` overrides the run parameters for that
+compiled or run ad-hoc. A project with a configured **Host Application**
+(the `Debugger_HostApplication` from Project > Options > Debugger in the
+Delphi IDE, or the DevKit `Set Host Application` override, which wins) runs
+that host executable instead — matching the IDE, and making a `.dpk`
+package project runnable at all. `--args`/`-a` overrides the run parameters for that
 one run; the process is launched detached, so the CLI/MCP call returns
 immediately without waiting for it to exit. The same is exposed to AI
 tooling via the MCP `delphi_run_project` and `delphi_run_file` tools.
@@ -169,6 +173,7 @@ in, since there is no extension setting for them to consult.
 * `Cancel Compilation` - Cancel the active compilation (Ctrl+F2)
 * `Run Selected Project` - Execute the selected project (F9)
 * `Set Start Parameters` - Configure command-line arguments passed to the executable when run
+* `Set Host Application` - Configure the executable that hosts the project when run (e.g. the application loading a .dpk package); overrides the dproj's own `Debugger_HostApplication`
 * `Configure/Create .ini` - Create or edit INI configuration files
 * `Set Manual Path` - Manually set the .dproj path for a project
 

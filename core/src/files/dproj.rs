@@ -108,3 +108,4 @@ pub fn get_active_configuration(dproj: &Dproj) -> Option<String> {
 pub fn get_active_platform(dproj: &Dproj) -> Option<String> {
     dproj.active_platform().ok()
 }
+

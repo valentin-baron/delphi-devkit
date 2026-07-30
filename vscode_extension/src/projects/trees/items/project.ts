@@ -1,4 +1,4 @@
-import { TreeItemCollapsibleState, ThemeIcon, Uri } from 'vscode';
+import { TreeItemCollapsibleState, ThemeIcon, Uri, MarkdownString, workspace } from 'vscode';
 import { BaseFileItem, MainProjectItem } from './baseFile';
 import { DelphiProjectTreeItemType } from '../../../types';
 import { DprojFileItem } from './dprojFile';
@@ -13,6 +13,65 @@ import { Runtime } from '../../../runtime';
 import { fileExists } from '../../../utils';
 import { PROJECTS } from '../../../constants';
 import { DprojMetadata } from '../../../client';
+
+/** Case-insensitive path equality on separator-normalized forms. */
+function isSamePath(a?: string | null, b?: string | null): boolean {
+  if (!a || !b) return false;
+  const normalize = (value: string) => value.replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase();
+  return normalize(a) === normalize(b);
+}
+
+/**
+ * A Host Application that is just the project's own exe adds no information
+ * (e.g. an exe project whose dproj points Debugger_HostApplication at
+ * itself) — only a host that actually differs is worth surfacing.
+ */
+function informativeHostApplication(entity: Entities.Project): string | undefined {
+  const hostApplication = Entities.effectiveHostApplication(entity);
+  if (!hostApplication || isSamePath(hostApplication, entity.exe)) return undefined;
+  return hostApplication;
+}
+
+/**
+ * Hover tooltip summarizing how the project runs: its exe, the effective
+ * Host Application (with origin — DevKit override vs the dproj's own value)
+ * and the effective run parameters (with origin — saved Start Parameters,
+ * the dproj's Debugger_RunParams, or both fused).
+ */
+function buildProjectTooltip(entity: Entities.Project): MarkdownString {
+  const useDprojRunParams = workspace.getConfiguration(PROJECTS.CONFIG.KEY).get<boolean>(PROJECTS.CONFIG.USE_DEBUGGER_RUN_PARAMS, true);
+  const markdown = new MarkdownString();
+  markdown.appendMarkdown(`**${entity.name}**`);
+  const overrides = [entity.active_configuration, entity.active_platform].filter(Boolean).join(' · ');
+  if (overrides)
+    markdown.appendMarkdown(` (${overrides})`);
+
+  const appendRow = (label: string, value?: string, origin?: string) => {
+    if (!value) return;
+    markdown.appendMarkdown(`\n\n${label}: \`${value}\``);
+    if (origin)
+      markdown.appendMarkdown(` — ${origin}`);
+  };
+
+  appendRow('Exe', entity.exe ?? undefined);
+  appendRow(
+    'Host',
+    informativeHostApplication(entity),
+    entity.host_application?.trim() ? 'override' : 'from dproj'
+  );
+
+  const runParamsOrigin = () => {
+    const hasSaved = !!entity.start_parameters?.trim();
+    const hasDproj = !!entity.dproj_run_params?.trim() && useDprojRunParams;
+    if (hasSaved && hasDproj) return 'dproj + saved';
+    if (hasSaved) return 'saved';
+    if (hasDproj) return 'from dproj';
+    return undefined;
+  };
+  appendRow('Run params', Entities.resolveEffectiveStartParameters(entity, useDprojRunParams), runParamsOrigin());
+
+  return markdown;
+}
 
 export class ProjectItem extends BaseFileItem implements MainProjectItem {
   public entity: Entities.Project;
@@ -31,7 +90,7 @@ export class ProjectItem extends BaseFileItem implements MainProjectItem {
     const uriPath = path.replace(basename(path), projectEntity.name);
     if (selected) {
       Runtime.setContext(PROJECTS.CONTEXT.IS_PROJECT_SELECTED, true);
-      Runtime.setContext(PROJECTS.CONTEXT.DOES_SELECTED_PROJECT_HAVE_EXE, !!projectEntity.exe);
+      Runtime.setContext(PROJECTS.CONTEXT.DOES_SELECTED_PROJECT_HAVE_EXE, !!Entities.resolveRunTarget(projectEntity));
     }
     const resourceUri = selected
         ? Uri.from({ scheme: PROJECTS.SCHEME.SELECTED, path: uriPath })
@@ -40,6 +99,13 @@ export class ProjectItem extends BaseFileItem implements MainProjectItem {
     this.entity = projectEntity;
     this.project = this;
     this.contextValue = PROJECTS.CONTEXT.PROJECT;
+    this.tooltip = buildProjectTooltip(projectEntity);
+    // Inline cue that this project runs through a hosting executable (a .dpk
+    // package or DLL): the full path and origin live in the tooltip. A host
+    // that is just the project's own exe is not worth flagging.
+    const hostApplication = informativeHostApplication(projectEntity);
+    if (hostApplication)
+      this.description = `⇢ ${basename(hostApplication)}`;
     this.setIcon();
     this.updateCollapsibleState();
   }
