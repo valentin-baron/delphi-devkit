@@ -6,15 +6,6 @@ use std::sync::Mutex;
 
 use crate::utils::normalize_path;
 
-lazy_static::lazy_static! {
-    /// Matches the plain dproj option-group condition form `'$(Ident)'!=''`
-    /// (the groups that carry DCC_/Debugger_ option values). The compound
-    /// flag-defining conditions (`'$(Config)'=='Debug' or '$(Cfg_1)'!=''`)
-    /// deliberately do not match: they only set the Base/Cfg_N flags.
-    static ref CONDITION_IDENT_REGEX: regex::Regex =
-        regex::Regex::new(r"^\s*'\$\((?P<ident>[A-Za-z0-9_]+)\)'\s*!=\s*''\s*$").unwrap();
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Dproj Cache
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -118,82 +109,3 @@ pub fn get_active_platform(dproj: &Dproj) -> Option<String> {
     dproj.active_platform().ok()
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Raw property access
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Reads the raw text of a single property (e.g. `Debugger_HostApplication`)
-/// from a `.dproj`, resolved for an effective (configuration, platform) pair.
-///
-/// This complements `dproj-rs`, which only surfaces a fixed set of known
-/// properties: the dproj's `PropertyGroup` convention is re-applied here for
-/// one arbitrary tag. A group applies when it has no `Condition` (project
-/// defaults) or when its condition is of the plain option-group form
-/// `'$(Ident)'!=''` with `Ident` one of `Base`, `Base_<platform>`,
-/// `<CfgKey>`, `<CfgKey>_<platform>` — where `<CfgKey>` is the
-/// `<BuildConfiguration Include="<config>"><Key>Cfg_N</Key>` mapping declared
-/// in the dproj itself. Applying groups are evaluated in document order
-/// (later wins), mirroring MSBuild. Returns the raw, unexpanded value; blank
-/// values count as absent.
-pub fn read_raw_property_for(dproj_path: &PathBuf, config: &str, platform: &str, tag: &str) -> Option<String> {
-    let xml = std::fs::read_to_string(dproj_path).ok()?;
-    let doc = roxmltree::Document::parse(&xml).ok()?;
-
-    let config_key = find_build_configuration_key(&doc, config);
-    let accepted = accepted_condition_idents(&config_key, platform);
-
-    let mut value: Option<String> = None;
-    for group in doc.descendants().filter(|n| n.has_tag_name("PropertyGroup")) {
-        if !property_group_applies(&group, &accepted) {
-            continue;
-        }
-        for child in group.children().filter(|n| n.is_element()) {
-            if child.tag_name().name() == tag {
-                // Trimmed on capture: surrounding whitespace would otherwise
-                // flow into macro expansion and path resolution.
-                value = Some(child.text().unwrap_or_default().trim().to_string());
-            }
-        }
-    }
-    value.filter(|v| !v.is_empty())
-}
-
-/// The `Cfg_N` key the dproj assigns to a configuration name, from its
-/// `<BuildConfiguration Include="..."><Key>...</Key>` item group.
-fn find_build_configuration_key(doc: &roxmltree::Document, config: &str) -> Option<String> {
-    for build_configuration in doc.descendants().filter(|n| n.has_tag_name("BuildConfiguration")) {
-        let include = build_configuration.attribute("Include").unwrap_or_default();
-        if !include.eq_ignore_ascii_case(config) {
-            continue;
-        }
-        for key in build_configuration.children().filter(|n| n.has_tag_name("Key")) {
-            return key.text().map(|s| s.trim().to_string());
-        }
-    }
-    None
-}
-
-/// The condition identifiers that select property groups applying to the
-/// given (configuration key, platform) pair, from least to most specific.
-fn accepted_condition_idents(config_key: &Option<String>, platform: &str) -> Vec<String> {
-    let mut idents = vec!["Base".to_string(), format!("Base_{platform}")];
-    if let Some(key) = config_key {
-        idents.push(key.clone());
-        idents.push(format!("{key}_{platform}"));
-    }
-    idents
-}
-
-fn property_group_applies(group: &roxmltree::Node, accepted: &[String]) -> bool {
-    let Some(condition) = group.attribute("Condition") else {
-        // Unconditional group: project-level defaults.
-        return true;
-    };
-    let Some(caps) = CONDITION_IDENT_REGEX.captures(condition) else {
-        // A condition form this reader does not understand (e.g. the
-        // compound flag-defining conditions): not an option group.
-        return false;
-    };
-    let ident = &caps["ident"];
-    accepted.iter().any(|accepted_ident| accepted_ident.eq_ignore_ascii_case(ident))
-}

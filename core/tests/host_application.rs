@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::PathBuf;
-use ddk_core::files::dproj::read_raw_property_for;
 use ddk_core::projects::{Project, ProjectUpdateData, ProjectsData};
 
 /// Minimal package .dproj modeled on a real IDE-generated one: flag-defining
@@ -8,75 +7,7 @@ use ddk_core::projects::{Project, ProjectUpdateData, ProjectsData};
 /// `'$(X)'!=''` form, and the BuildConfiguration key mapping (Release=Cfg_1,
 /// Debug=Cfg_2 — the order the IDE actually emits).
 fn package_dproj_xml() -> &'static str {
-    r#"<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
-    <PropertyGroup>
-        <ProjectGuid>{00000000-0000-0000-0000-000000000002}</ProjectGuid>
-        <MainSource>TestPkg.dpk</MainSource>
-        <ProjectVersion>20.3</ProjectVersion>
-        <FrameworkType>VCL</FrameworkType>
-        <Base>True</Base>
-        <Config Condition="'$(Config)'==''">Debug</Config>
-        <Platform Condition="'$(Platform)'==''">Win64</Platform>
-        <TargetedPlatforms>3</TargetedPlatforms>
-        <AppType>Package</AppType>
-    </PropertyGroup>
-    <PropertyGroup Condition="'$(Config)'=='Base' or '$(Base)'!=''">
-        <Base>true</Base>
-    </PropertyGroup>
-    <PropertyGroup Condition="'$(Config)'=='Release' or '$(Cfg_1)'!=''">
-        <Cfg_1>true</Cfg_1>
-        <CfgParent>Base</CfgParent>
-        <Base>true</Base>
-    </PropertyGroup>
-    <PropertyGroup Condition="'$(Config)'=='Debug' or '$(Cfg_2)'!=''">
-        <Cfg_2>true</Cfg_2>
-        <CfgParent>Base</CfgParent>
-        <Base>true</Base>
-    </PropertyGroup>
-    <PropertyGroup Condition="'$(Base)'!=''">
-        <DCC_BplOutput>.\$(Platform)\$(Config)</DCC_BplOutput>
-        <Debugger_HostApplication>$(ProjectDir)\hosts\BaseHost.exe</Debugger_HostApplication>
-    </PropertyGroup>
-    <PropertyGroup Condition="'$(Cfg_2)'!=''">
-        <Debugger_HostApplication>hosts\DebugHost.exe</Debugger_HostApplication>
-        <Debugger_RunParams>-testflag</Debugger_RunParams>
-    </PropertyGroup>
-    <PropertyGroup Condition="'$(Cfg_2_Win64)'!=''">
-        <Debugger_HostApplication>$(ProjectDir)\hosts\DebugHost64.exe</Debugger_HostApplication>
-    </PropertyGroup>
-    <ProjectExtensions>
-        <Borland.Personality>Delphi.Personality.12</Borland.Personality>
-        <Borland.ProjectType>Package</Borland.ProjectType>
-        <BorlandProject>
-            <Delphi.Personality>
-                <Source>
-                    <Source Name="MainSource">TestPkg.dpk</Source>
-                </Source>
-            </Delphi.Personality>
-            <Platforms>
-                <Platform value="Win32">True</Platform>
-                <Platform value="Win64">True</Platform>
-            </Platforms>
-        </BorlandProject>
-    </ProjectExtensions>
-    <Import Project="$(BDS)\Bin\CodeGear.Delphi.Targets"/>
-    <ItemGroup>
-        <DelphiCompile Include="$(MainSource)">
-            <MainSource>MainSource</MainSource>
-        </DelphiCompile>
-        <BuildConfiguration Include="Base">
-            <Key>Base</Key>
-        </BuildConfiguration>
-        <BuildConfiguration Include="Release">
-            <Key>Cfg_1</Key>
-            <CfgParent>Base</CfgParent>
-        </BuildConfiguration>
-        <BuildConfiguration Include="Debug">
-            <Key>Cfg_2</Key>
-            <CfgParent>Base</CfgParent>
-        </BuildConfiguration>
-    </ItemGroup>
-</Project>"#
+    include_str!("fixtures/TestPkg.dproj")
 }
 
 fn write_package_fixture(dir: &std::path::Path) -> PathBuf {
@@ -86,42 +17,67 @@ fn write_package_fixture(dir: &std::path::Path) -> PathBuf {
     dproj_path
 }
 
-// ─── read_raw_property_for ───────────────────────────────────────────────────
+// ─── property-group selection (via dproj-rs) ─────────────────────────────────
 
-#[test]
-fn read_raw_property_prefers_most_specific_group() {
-    let tmp_dir = tempfile::tempdir().unwrap();
-    let dproj_path = write_package_fixture(tmp_dir.path());
-
-    let value = read_raw_property_for(&dproj_path, "Debug", "Win64", "Debugger_HostApplication");
-    assert_eq!(value.as_deref(), Some("$(ProjectDir)\\hosts\\DebugHost64.exe"));
+fn discover_for(dir: &std::path::Path, dproj_path: &std::path::Path, config: &str, platform: &str) -> Project {
+    let mut project = Project {
+        id: 1,
+        name: "TestPkg".to_string(),
+        directory: dir.to_string_lossy().to_string(),
+        dproj: Some(dproj_path.to_string_lossy().to_string()),
+        ..Default::default()
+    };
+    project.discover_paths_for(config, platform).unwrap();
+    project
 }
 
 #[test]
-fn read_raw_property_uses_config_group_when_no_platform_group_matches() {
+fn discover_prefers_most_specific_group() {
     let tmp_dir = tempfile::tempdir().unwrap();
     let dproj_path = write_package_fixture(tmp_dir.path());
 
-    let value = read_raw_property_for(&dproj_path, "Debug", "Win32", "Debugger_HostApplication");
-    assert_eq!(value.as_deref(), Some("hosts\\DebugHost.exe"));
+    let project = discover_for(tmp_dir.path(), &dproj_path, "Debug", "Win64");
+    let host = project.dproj_host_application.expect("host application should be discovered");
+    assert!(
+        host.to_lowercase().ends_with("hosts\\debughost64.exe"),
+        "the Cfg_2_Win64 group must win over Cfg_2 and Base, got: {host}"
+    );
 }
 
 #[test]
-fn read_raw_property_falls_back_to_base_group() {
+fn discover_uses_config_group_when_no_platform_group_matches() {
     let tmp_dir = tempfile::tempdir().unwrap();
     let dproj_path = write_package_fixture(tmp_dir.path());
 
-    let value = read_raw_property_for(&dproj_path, "Release", "Win64", "Debugger_HostApplication");
-    assert_eq!(value.as_deref(), Some("$(ProjectDir)\\hosts\\BaseHost.exe"));
+    let project = discover_for(tmp_dir.path(), &dproj_path, "Debug", "Win32");
+    let host = project.dproj_host_application.expect("host application should be discovered");
+    assert!(
+        host.to_lowercase().ends_with("hosts\\debughost.exe"),
+        "the Cfg_2 group must win over Base for Debug/Win32, got: {host}"
+    );
 }
 
 #[test]
-fn read_raw_property_missing_tag_is_none() {
+fn discover_falls_back_to_base_group() {
     let tmp_dir = tempfile::tempdir().unwrap();
     let dproj_path = write_package_fixture(tmp_dir.path());
 
-    let value = read_raw_property_for(&dproj_path, "Debug", "Win64", "Debugger_DoesNotExist");
-    assert_eq!(value, None);
+    let project = discover_for(tmp_dir.path(), &dproj_path, "Release", "Win64");
+    let host = project.dproj_host_application.expect("host application should be discovered");
+    assert!(
+        host.to_lowercase().ends_with("hosts\\basehost.exe"),
+        "Release must fall back to the Base group's host, got: {host}"
+    );
+}
+
+#[test]
+fn discover_missing_value_is_none() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let dproj_path = write_package_fixture(tmp_dir.path());
+
+    // Debugger_RunParams is only defined in the Cfg_2 (Debug) group.
+    let project = discover_for(tmp_dir.path(), &dproj_path, "Release", "Win64");
+    assert_eq!(project.dproj_run_params, None, "Release defines no run params");
 }
 
 // ─── discover_paths ──────────────────────────────────────────────────────────

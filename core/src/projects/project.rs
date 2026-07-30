@@ -222,8 +222,8 @@ impl Project {
                     self.exe = None;
                     self.ini = None;
                 }
-                self.dproj_run_params = Self::discover_run_params(&dproj_path, config, platform);
-                self.dproj_host_application = Self::discover_host_application(&dproj_path, config, platform, &self.directory);
+                (self.dproj_run_params, self.dproj_host_application) =
+                    Self::discover_debugger_settings(&dproj_path, config, platform, &self.directory);
             },
             Some(ext) if ext == "dpk" => {
                 self.dpk = Some(main_source.to_string_lossy().to_string());
@@ -233,8 +233,8 @@ impl Project {
                 // A package has no standalone executable, but its Run
                 // Parameters and Host Application (Project > Options in the
                 // Delphi IDE) drive how RunProgram launches the hosting exe.
-                self.dproj_run_params = Self::discover_run_params(&dproj_path, config, platform);
-                self.dproj_host_application = Self::discover_host_application(&dproj_path, config, platform, &self.directory);
+                (self.dproj_run_params, self.dproj_host_application) =
+                    Self::discover_debugger_settings(&dproj_path, config, platform, &self.directory);
             },
             _ => {
                 anyhow::bail!("Cannot discover paths - main source file is not a DPR or DPK for project id: {}", self.id);
@@ -244,55 +244,70 @@ impl Project {
         return Ok(());
     }
 
-    /// Reads `Debugger_RunParams` from the dproj's active property group for
-    /// the given config/platform override (or the dproj's own defaults when
-    /// both are `None`) — the same "Run Parameters" a developer sets via
-    /// Project > Options > Run in the Delphi IDE. Returns `None` on any parse
-    /// failure or when the value is absent/blank.
-    fn discover_run_params(dproj_path: &PathBuf, config: Option<&str>, platform: Option<&str>) -> Option<String> {
-        let dproj = dproj_rs::Dproj::from_file(dproj_path).ok()?;
-        let (cfg, plat) = Self::effective_cfg_plat(&dproj, config, platform);
-        dproj
-            .active_property_group_for(&cfg, &plat)
-            .ok()?
-            .debugger_options
-            .run_params
-            .filter(|s| !s.trim().is_empty())
-    }
-
-    /// Reads `Debugger_HostApplication` from the dproj's active property group
-    /// for the given config/platform override — the "Host application" set via
-    /// Project > Options > Debugger in the Delphi IDE. Common project macros
-    /// (`$(ProjectDir)`, `$(ProjectName)`, `$(Platform)`, `$(Config)`) are
-    /// expanded and a relative path is resolved against the project directory;
-    /// a value still containing unknown macros is kept verbatim. Returns
-    /// `None` on any parse failure or when the value is absent/blank.
-    fn discover_host_application(
+    /// Reads the debugger-related settings from the dproj's active property
+    /// group for the given config/platform override (or the dproj's own
+    /// defaults when both are `None`): `Debugger_RunParams` (Project >
+    /// Options > Run in the Delphi IDE) and `Debugger_HostApplication`
+    /// (Project > Options > Debugger). `$(NAME)` references are expanded by
+    /// dproj-rs the way the IDE-launched MSBuild would resolve them — see
+    /// [`Self::load_dproj_with_ide_environment`] — and a relative host path
+    /// is resolved against the project directory. Blank values count as
+    /// absent; both values are `None` on any parse failure.
+    fn discover_debugger_settings(
         dproj_path: &PathBuf,
         config: Option<&str>,
         platform: Option<&str>,
         project_directory: &str,
-    ) -> Option<String> {
-        let dproj = dproj_rs::Dproj::from_file(dproj_path).ok()?;
+    ) -> (Option<String>, Option<String>) {
+        let Some(dproj) = Self::load_dproj_with_ide_environment(dproj_path, project_directory) else {
+            return (None, None);
+        };
         let (cfg, plat) = Self::effective_cfg_plat(&dproj, config, platform);
-        let raw = crate::files::dproj::read_raw_property_for(dproj_path, &cfg, &plat, "Debugger_HostApplication")?;
+        let Ok(group) = dproj.active_property_group_for(&cfg, &plat) else {
+            return (None, None);
+        };
+        let run_params = group.debugger_options.run_params.clone().filter(|s| !s.trim().is_empty());
+        let host_application = group
+            .other
+            .get("Debugger_HostApplication")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|host| Self::absolutize_host_application(host, project_directory));
+        (run_params, host_application)
+    }
+
+    /// Parse a `.dproj` seeding the `$(NAME)` expansion map with everything
+    /// the IDE-launched MSBuild would see: the process environment first,
+    /// overridden by the Delphi IDE's own environment-variable overrides
+    /// (Tools > Options > IDE > Environment Variables — they exist only
+    /// inside the IDE's process, so they are read back from the registry),
+    /// plus the project-context properties (`ProjectDir`, `ProjectName`)
+    /// that dproj-rs cannot derive on its own. Names that resolve to nothing
+    /// expand to an empty string, matching MSBuild semantics.
+    fn load_dproj_with_ide_environment(dproj_path: &PathBuf, project_directory: &str) -> Option<dproj_rs::Dproj> {
+        let mut env: std::collections::HashMap<String, String> = std::env::vars().collect();
+        for (name, value) in IDE_ENV_OVERRIDES.iter() {
+            env.insert(name.clone(), value.clone());
+        }
         let project_name = dproj_path
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
-        let expanded = expand_project_macros(&raw, project_directory, &project_name, &cfg, &plat);
-        if expanded.contains("$(") {
-            // An unexpanded macro would corrupt path resolution; keep the
-            // value verbatim so the user can still see and fix it.
-            return Some(expanded);
-        }
-        let path = PathBuf::from(&expanded);
+        env.insert("ProjectDir".to_string(), project_directory.to_string());
+        env.insert("ProjectName".to_string(), project_name);
+        dproj_rs::DprojBuilder::new().env(env).from_file(dproj_path).ok()
+    }
+
+    /// Resolve a discovered host-application path against the project
+    /// directory when relative, then normalise it.
+    fn absolutize_host_application(host: &str, project_directory: &str) -> String {
+        let path = PathBuf::from(host);
         let absolute = if path.is_relative() {
             PathBuf::from(project_directory).join(path)
         } else {
             path
         };
-        Some(normalize_path(&absolute).to_string_lossy().to_string())
+        normalize_path(&absolute).to_string_lossy().to_string()
     }
 
     /// Resolve the effective (configuration, platform) from explicit overrides
@@ -333,68 +348,10 @@ impl Project {
     }
 }
 
-/// Expands the dproj macros the IDE commonly uses inside
-/// `Debugger_HostApplication` values: the project-context macros
-/// (`$(ProjectDir)`, `$(ProjectName)`, `$(Platform)`, `$(Config)`) first,
-/// then any remaining `$(NAME)` as an environment variable — MSBuild treats
-/// environment variables as properties, and real dprojs rely on that (e.g. a
-/// site-specific `$(VEGADIR)`). Macros that resolve to nothing are left
-/// untouched.
-fn expand_project_macros(value: &str, project_dir: &str, project_name: &str, config: &str, platform: &str) -> String {
-    let mut result = value.to_string();
-    for (macro_name, replacement) in [
-        ("$(ProjectDir)", project_dir),
-        ("$(ProjectName)", project_name),
-        ("$(Platform)", platform),
-        ("$(Config)", config),
-    ] {
-        result = replace_case_insensitive(&result, macro_name, replacement);
-    }
-    expand_environment_macros(&result)
-}
-
 lazy_static::lazy_static! {
-    static ref MACRO_REGEX: regex::Regex =
-        regex::Regex::new(r"\$\((?P<name>[A-Za-z_][A-Za-z0-9_]*)\)").unwrap();
-
     /// The Delphi IDE's own environment-variable overrides (Tools > Options >
     /// IDE > Environment Variables), read once per process: dproj values
     /// reference them (e.g. `$(VEGADIR)`) although they exist in no real
     /// environment outside the IDE.
     static ref IDE_ENV_OVERRIDES: Vec<(String, String)> = crate::utils::ide_environment_overrides();
-}
-
-/// Replaces every `$(NAME)` that `resolver` can answer; unknown names stay
-/// verbatim. Split out so tests can inject a resolver.
-fn expand_macros_with(value: &str, resolver: &dyn Fn(&str) -> Option<String>) -> String {
-    MACRO_REGEX
-        .replace_all(value, |caps: &regex::Captures| {
-            resolver(&caps["name"]).unwrap_or_else(|| caps[0].to_string())
-        })
-        .to_string()
-}
-
-/// Resolves a `$(NAME)` macro the way the IDE effectively does: the IDE's
-/// configured overrides win, then the process environment. All lookups are
-/// case-insensitive, as on Windows.
-fn expand_environment_macros(value: &str) -> String {
-    expand_macros_with(value, &|name: &str| {
-        IDE_ENV_OVERRIDES
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.clone())
-            .or_else(|| {
-                std::env::vars()
-                    .find(|(key, _)| key.eq_ignore_ascii_case(name))
-                    .map(|(_, v)| v)
-            })
-    })
-}
-
-fn replace_case_insensitive(haystack: &str, needle: &str, replacement: &str) -> String {
-    let pattern = regex::escape(needle);
-    match regex::RegexBuilder::new(&pattern).case_insensitive(true).build() {
-        Ok(re) => re.replace_all(haystack, regex::NoExpand(replacement)).to_string(),
-        _ => haystack.replace(needle, replacement),
-    }
 }
