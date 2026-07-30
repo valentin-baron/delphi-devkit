@@ -99,6 +99,13 @@ enum Commands {
         /// warnings/hints that were not shown verbatim.
         #[arg(long)]
         summarize_diagnostics: bool,
+
+        /// Extra arguments passed verbatim to MSBuild, after `--`
+        /// (e.g. `ddk compile be -- /p:DCC_Define=FOO /m`). Appended after the
+        /// built-in Config/Platform args, so a `/p:` override here wins. Ignored
+        /// for a bare .dpr/.dpk TARGET, which is compiled with dcc, not MSBuild.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        msbuild_args: Vec<String>,
     },
 
     /// Run a project's built executable directly. Runs the active project by
@@ -272,6 +279,7 @@ async fn main() -> Result<()> {
             show_warnings,
             show_hints,
             summarize_diagnostics,
+            msbuild_args,
         } => {
             let filter = CompileFilterOptions {
                 trim_banners: true,
@@ -291,10 +299,14 @@ async fn main() -> Result<()> {
             if cli.json {
                 let result = match file_path {
                     Some(p) => {
-                        commands::cmd_compile_file(p, compiler, config, platform, rebuild, filter)
-                            .await?
+                        commands::cmd_compile_file(
+                            p, compiler, config, platform, rebuild, filter, msbuild_args,
+                        )
+                        .await?
                     }
-                    _ => commands::cmd_compile_ref(rebuild, project_ref, filter).await?,
+                    _ => {
+                        commands::cmd_compile_ref(rebuild, project_ref, filter, msbuild_args).await?
+                    }
                 };
                 match result {
                     CompileOrAmbiguity::Output(o) => {
@@ -315,13 +327,14 @@ async fn main() -> Result<()> {
                 let result = match file_path {
                     Some(p) => {
                         commands::cmd_compile_file_with_progress(
-                            p, compiler, config, platform, rebuild, filter, Some(on_progress),
+                            p, compiler, config, platform, rebuild, filter, msbuild_args,
+                            Some(on_progress),
                         )
                         .await?
                     }
                     _ => {
                         commands::cmd_compile_ref_with_progress(
-                            rebuild, project_ref, filter, Some(on_progress),
+                            rebuild, project_ref, filter, msbuild_args, Some(on_progress),
                         )
                         .await?
                     }

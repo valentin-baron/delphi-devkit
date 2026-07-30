@@ -61,6 +61,7 @@ ddk compile <PATH> --config Release --platform Win64   # ...with build overrides
 ddk compile --show-warnings            # Include warnings verbatim
 ddk compile --show-hints               # Include hints verbatim
 ddk compile --summarize-diagnostics    # Append `<file>: X warn, Y hint` per project
+ddk compile <ID|NAME> -- /p:Foo=Bar    # Pass extra arguments verbatim to MSBuild (after `--`)
 ddk run                                # Run the active project's executable
 ddk run <ID|NAME>                      # Run a project by ID or name (= -p; lists candidates if ambiguous)
 ddk run <PATH>                         # Run a .exe directly, or a .dproj/.dpr/.dpk's owning project
@@ -78,6 +79,13 @@ builds). For the ad-hoc case `--compiler`/`-c` selects the compiler by exact key
 (`12.0`) or product name (`Delphi 12`), defaulting to the newest installed
 compiler. The same is exposed to AI tooling via the MCP `delphi_compile_file`,
 `delphi_add_project`, and `delphi_add_workspace` tools.
+
+Anything after a `--` separator on `ddk compile` is passed verbatim to MSBuild
+(e.g. `ddk compile be -- /p:DCC_Define=FOO /m`). These extra arguments are
+appended after DDK's own `/p:Config`/`/p:Platform` args, so a `/p:` override
+here wins (MSBuild takes the last value). They have no effect on a bare
+`.dpr`/`.dpk` target, which is compiled with the command-line compiler (`dcc`)
+rather than MSBuild — DDK prints a note when they are ignored.
 
 Compile output for the CLI and the MCP `delphi_compile_project` tool is
 trimmed for AI / token-efficient consumption: the decorative banner box is

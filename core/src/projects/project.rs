@@ -1,7 +1,6 @@
 use serde::{Serialize, Deserialize};
 use anyhow::Result;
 use std::path::PathBuf;
-use crate::lexorank::{LexoRank, HasLexoRank};
 use crate::projects::*;
 use crate::files::dproj::{find_dproj_file, get_main_source, get_exe_path, get_exe_path_for};
 use crate::utils::normalize_path;
@@ -21,7 +20,6 @@ pub const BARE_DEFAULT_PLATFORM: &str = "Win32";
 pub struct ProjectLink {
     pub id: usize,
     pub project_id: usize,
-    pub sort_rank: LexoRank,
 }
 
 impl ProjectLink {
@@ -46,15 +44,6 @@ impl ProjectLink {
             }
         }
         return None;
-    }
-}
-
-impl HasLexoRank for ProjectLink {
-    fn get_lexorank(&self) -> &LexoRank {
-        &self.sort_rank
-    }
-    fn set_lexorank(&mut self, lexorank: LexoRank) {
-        self.sort_rank = lexorank;
     }
 }
 

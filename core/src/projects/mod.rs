@@ -10,7 +10,7 @@ mod compiler;
 
 use anyhow::Result;
 use serde_json::Value;
-use crate::{EventDone, lexorank::{HasLexoRank, LexoRank}, state::{COMPILER_CONFIGURATIONS, PROJECTS_DATA}};
+use crate::{EventDone, state::{COMPILER_CONFIGURATIONS, PROJECTS_DATA}};
 use crate::state::*;
 
 pub use compiler_config::*;
@@ -32,17 +32,8 @@ pub trait ProjectLinkContainer: Named {
     fn get_project_links_mut(&mut self) -> &mut Vec<ProjectLink>;
 
     fn new_project_link(&mut self, id: usize, project_id: usize) {
-        let links = self.get_project_links_mut();
-        let last_rank = if let Some(last_link) = links.last() {
-            last_link.sort_rank.clone()
-        } else {
-            LexoRank::default()
-        };
-        links.push(ProjectLink {
-            id,
-            project_id,
-            sort_rank: last_rank.next(),
-        });
+        // Order is defined by position in the Vec; new links append to the end.
+        self.get_project_links_mut().push(ProjectLink { id, project_id });
     }
 
     fn index_of(&self, project_link_id: usize) -> Option<usize> {
@@ -85,13 +76,7 @@ pub trait ProjectLinkContainer: Named {
             anyhow::bail!("Target index {} out of bounds", target_index);
         }
         self.get_project_links_mut().insert(target_index, project_link);
-        self.reorder_links();
         Ok(())
-    }
-
-    fn reorder_links(&mut self) {
-        let mut items: Vec<&mut dyn HasLexoRank> = self.get_project_links_mut().iter_mut().map(|link| link as &mut dyn HasLexoRank).collect();
-        LexoRank::apply(&mut items);
     }
 }
 

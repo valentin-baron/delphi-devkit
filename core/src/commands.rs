@@ -1008,7 +1008,7 @@ pub async fn cmd_compile(
     project_id: Option<usize>,
     filter: CompileFilterOptions,
 ) -> Result<CompileOutput> {
-    cmd_compile_with_progress(rebuild, project_id, filter, None).await
+    cmd_compile_with_progress(rebuild, project_id, filter, Vec::new(), None).await
 }
 
 /// Compiles a project selected by a reference (project name or numeric id).
@@ -1021,8 +1021,9 @@ pub async fn cmd_compile_ref(
     rebuild: bool,
     project: Option<String>,
     filter: CompileFilterOptions,
+    extra_msbuild_args: Vec<String>,
 ) -> Result<CompileOrAmbiguity> {
-    cmd_compile_ref_with_progress(rebuild, project, filter, None).await
+    cmd_compile_ref_with_progress(rebuild, project, filter, extra_msbuild_args, None).await
 }
 
 /// Like [`cmd_compile_ref`] but streams each compiler output line to
@@ -1031,6 +1032,7 @@ pub async fn cmd_compile_ref_with_progress(
     rebuild: bool,
     project: Option<String>,
     filter: CompileFilterOptions,
+    extra_msbuild_args: Vec<String>,
     on_progress: Option<CompileProgressCallback>,
 ) -> Result<CompileOrAmbiguity> {
     let project_id: Option<usize> = match project {
@@ -1051,7 +1053,9 @@ pub async fn cmd_compile_ref_with_progress(
             }
         }
     };
-    let output = cmd_compile_with_progress(rebuild, project_id, filter, on_progress).await?;
+    let output =
+        cmd_compile_with_progress(rebuild, project_id, filter, extra_msbuild_args, on_progress)
+            .await?;
     Ok(CompileOrAmbiguity::Output(output))
 }
 
@@ -1061,6 +1065,7 @@ pub async fn cmd_compile_with_progress(
     rebuild: bool,
     project_id: Option<usize>,
     filter: CompileFilterOptions,
+    extra_msbuild_args: Vec<String>,
     on_progress: Option<CompileProgressCallback>,
 ) -> Result<CompileOutput> {
     let (project_name, resolved_id, link_id) = {
@@ -1091,7 +1096,9 @@ pub async fn cmd_compile_with_progress(
         event_id: "cmd-compile".to_string(),
     };
 
-    let compiler = Compiler::new_standalone(&params).await;
+    let compiler = Compiler::new_standalone(&params)
+        .await
+        .with_extra_msbuild_args(extra_msbuild_args);
     run_compile_collecting(compiler, project_name, filter, on_progress).await
 }
 
@@ -1118,9 +1125,19 @@ pub async fn cmd_compile_file(
     platform: Option<String>,
     rebuild: bool,
     filter: CompileFilterOptions,
+    extra_msbuild_args: Vec<String>,
 ) -> Result<CompileOrAmbiguity> {
-    cmd_compile_file_with_progress(file_path, compiler, config, platform, rebuild, filter, None)
-        .await
+    cmd_compile_file_with_progress(
+        file_path,
+        compiler,
+        config,
+        platform,
+        rebuild,
+        filter,
+        extra_msbuild_args,
+        None,
+    )
+    .await
 }
 
 /// Like [`cmd_compile_file`] but invokes `on_progress` for each emitted
@@ -1132,6 +1149,7 @@ pub async fn cmd_compile_file_with_progress(
     platform: Option<String>,
     rebuild: bool,
     filter: CompileFilterOptions,
+    extra_msbuild_args: Vec<String>,
     on_progress: Option<CompileProgressCallback>,
 ) -> Result<CompileOrAmbiguity> {
     // Prefer a managed project that owns this file: compile it like a named
@@ -1150,7 +1168,9 @@ pub async fn cmd_compile_file_with_progress(
         }
     };
     if let Some(id) = managed_id {
-        let output = cmd_compile_with_progress(rebuild, Some(id), filter, on_progress).await?;
+        let output =
+            cmd_compile_with_progress(rebuild, Some(id), filter, extra_msbuild_args, on_progress)
+                .await?;
         return Ok(CompileOrAmbiguity::Output(output));
     }
 
@@ -1188,7 +1208,9 @@ pub async fn cmd_compile_file_with_progress(
         event_id: "cmd-compile-file".to_string(),
     };
 
-    let compiler = Compiler::new_standalone_with_data(&params, data).await;
+    let compiler = Compiler::new_standalone_with_data(&params, data)
+        .await
+        .with_extra_msbuild_args(extra_msbuild_args);
     let output = run_compile_collecting(compiler, project_name, filter, on_progress).await?;
     Ok(CompileOrAmbiguity::Output(output))
 }

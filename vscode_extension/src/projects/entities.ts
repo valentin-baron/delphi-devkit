@@ -15,7 +15,6 @@ export namespace Entities {
     name: string;
     compiler_id: string;
     project_links: ProjectLink[];
-    sort_rank: string;
     active_configuration?: Option<string>;
     active_platform?: Option<string>;
   }
@@ -51,7 +50,6 @@ export namespace Entities {
   export class ProjectLink {
     id: number;
     project_id: number;
-    sort_rank: string;
   }
 
   // Returns the TRIMMED value: a whitespace-padded path would reach spawn()

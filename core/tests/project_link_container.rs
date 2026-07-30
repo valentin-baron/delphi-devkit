@@ -1,16 +1,11 @@
 use ddk_core::projects::*;
-use ddk_core::lexorank::LexoRank;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Helper: build a Workspace with links for testing ProjectLinkContainer
 // ═══════════════════════════════════════════════════════════════════════════════
 
-fn make_link(id: usize, project_id: usize, rank: &str) -> ProjectLink {
-    ProjectLink {
-        id,
-        project_id,
-        sort_rank: LexoRank::from_string(rank).unwrap_or_default(),
-    }
+fn make_link(id: usize, project_id: usize) -> ProjectLink {
+    ProjectLink { id, project_id }
 }
 
 fn make_workspace_with_links(links: Vec<ProjectLink>) -> Workspace {
@@ -19,7 +14,6 @@ fn make_workspace_with_links(links: Vec<ProjectLink>) -> Workspace {
         name: "TestWS".to_string(),
         compiler_id: "12.0".to_string(),
         project_links: links,
-        sort_rank: LexoRank::default(),
         ..Default::default()
     }
 }
@@ -38,14 +32,15 @@ fn new_project_link_on_empty_container() {
 }
 
 #[test]
-fn new_project_link_appends_with_higher_rank() {
+fn new_project_link_appends_at_end() {
     let mut ws = make_workspace_with_links(vec![
-        make_link(1, 10, "1|a"),
+        make_link(1, 10),
     ]);
     ws.new_project_link(2, 20);
     assert_eq!(ws.project_links.len(), 2);
-    // New link should have a rank greater than existing
-    assert!(ws.project_links[1].sort_rank > ws.project_links[0].sort_rank);
+    // New link appends after the existing one.
+    assert_eq!(ws.project_links[0].id, 1);
+    assert_eq!(ws.project_links[1].id, 2);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -55,8 +50,8 @@ fn new_project_link_appends_with_higher_rank() {
 #[test]
 fn index_of_found() {
     let ws = make_workspace_with_links(vec![
-        make_link(10, 1, "1|a"),
-        make_link(20, 2, "1|h"),
+        make_link(10, 1),
+        make_link(20, 2),
     ]);
     assert_eq!(ws.index_of(10), Some(0));
     assert_eq!(ws.index_of(20), Some(1));
@@ -75,8 +70,8 @@ fn index_of_not_found() {
 #[test]
 fn export_removes_link() {
     let mut ws = make_workspace_with_links(vec![
-        make_link(10, 1, "1|a"),
-        make_link(20, 2, "1|h"),
+        make_link(10, 1),
+        make_link(20, 2),
     ]);
     let exported = ws.export_project_link(10).unwrap();
     assert_eq!(exported.id, 10);
@@ -87,7 +82,7 @@ fn export_removes_link() {
 #[test]
 fn export_nonexistent_link_fails() {
     let mut ws = make_workspace_with_links(vec![
-        make_link(10, 1, "1|a"),
+        make_link(10, 1),
     ]);
     assert!(ws.export_project_link(999).is_err());
 }
@@ -99,9 +94,9 @@ fn export_nonexistent_link_fails() {
 #[test]
 fn import_at_end() {
     let mut ws = make_workspace_with_links(vec![
-        make_link(10, 1, "1|a"),
+        make_link(10, 1),
     ]);
-    let new_link = make_link(20, 2, "1|z");
+    let new_link = make_link(20, 2);
     ws.import_project_link(new_link, None).unwrap();
     assert_eq!(ws.project_links.len(), 2);
     assert_eq!(ws.project_links[1].id, 20);
@@ -110,10 +105,10 @@ fn import_at_end() {
 #[test]
 fn import_at_position() {
     let mut ws = make_workspace_with_links(vec![
-        make_link(10, 1, "1|a"),
-        make_link(30, 3, "1|z"),
+        make_link(10, 1),
+        make_link(30, 3),
     ]);
-    let new_link = make_link(20, 2, "1|h");
+    let new_link = make_link(20, 2);
     // Import before link 30 (at index of link 30)
     ws.import_project_link(new_link, Some(30)).unwrap();
     assert_eq!(ws.project_links.len(), 3);
@@ -122,17 +117,16 @@ fn import_at_position() {
 }
 
 #[test]
-fn import_reorders_ranks() {
+fn import_preserves_vec_order() {
     let mut ws = make_workspace_with_links(vec![
-        make_link(10, 1, "1|a"),
-        make_link(20, 2, "1|h"),
+        make_link(10, 1),
+        make_link(20, 2),
     ]);
-    let new_link = make_link(30, 3, "1|z");
+    let new_link = make_link(30, 3);
     ws.import_project_link(new_link, None).unwrap();
-    // After import, all ranks should be strictly ordered
-    for w in ws.project_links.windows(2) {
-        assert!(w[0].sort_rank < w[1].sort_rank);
-    }
+    // Import at end appends; Vec order defines the sequence.
+    let ids: Vec<usize> = ws.project_links.iter().map(|l| l.id).collect();
+    assert_eq!(ids, vec![10, 20, 30]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -142,24 +136,22 @@ fn import_reorders_ranks() {
 #[test]
 fn move_link_to_different_position() {
     let mut ws = make_workspace_with_links(vec![
-        make_link(10, 1, "1|a"),
-        make_link(20, 2, "1|h"),
-        make_link(30, 3, "1|z"),
+        make_link(10, 1),
+        make_link(20, 2),
+        make_link(30, 3),
     ]);
     // Move link 10 to the position of link 30
     ws.move_project_link(10, Some(30)).unwrap();
-    // Link 10 should now be at index of link 30 (after removal and insertion)
-    // Verify all ranks are ordered after the move
-    for w in ws.project_links.windows(2) {
-        assert!(w[0].sort_rank < w[1].sort_rank);
-    }
+    // After removing 10 -> [20,30], inserting 10 at index_of(30)=1 -> [20,10,30].
+    let ids: Vec<usize> = ws.project_links.iter().map(|l| l.id).collect();
+    assert_eq!(ids, vec![20, 10, 30]);
 }
 
 #[test]
 fn move_link_to_end() {
     let mut ws = make_workspace_with_links(vec![
-        make_link(10, 1, "1|a"),
-        make_link(20, 2, "1|h"),
+        make_link(10, 1),
+        make_link(20, 2),
     ]);
     ws.move_project_link(10, None).unwrap();
     assert_eq!(ws.project_links.last().unwrap().id, 10);
@@ -168,26 +160,9 @@ fn move_link_to_end() {
 #[test]
 fn move_nonexistent_link_fails() {
     let mut ws = make_workspace_with_links(vec![
-        make_link(10, 1, "1|a"),
+        make_link(10, 1),
     ]);
     assert!(ws.move_project_link(999, None).is_err());
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  reorder_links
-// ═══════════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn reorder_links_produces_strictly_ordered_ranks() {
-    let mut ws = make_workspace_with_links(vec![
-        make_link(10, 1, "1|z"), // intentionally out of order rank
-        make_link(20, 2, "1|a"),
-        make_link(30, 3, "1|a"),
-    ]);
-    ws.reorder_links();
-    for w in ws.project_links.windows(2) {
-        assert!(w[0].sort_rank < w[1].sort_rank);
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

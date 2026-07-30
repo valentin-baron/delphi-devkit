@@ -4,12 +4,19 @@ All notable changes to the "delphi-devkit" extension will be documented in this 
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
-## [Unreleased]
+## [2.5.0] - 2026-07-30
 
 ### Added
 
+- **Extra MSBuild arguments for `ddk compile`**: anything after a `--` separator on the `ddk compile` command line is now passed verbatim to MSBuild, e.g. `ddk compile be -- /p:DCC_Define=FOO /m`. The extra arguments are appended after DDK's built-in `/p:Config`/`/p:Configuration`/`/p:Platform` args, so a `/p:` override supplied this way wins (MSBuild takes the last value for a duplicated property). They have no effect on a bare `.dpr`/`.dpk` target — which is compiled with the command-line compiler (`dcc32`/`dcc64`) rather than MSBuild — and DDK prints a note listing the ignored arguments in that case. The MCP compile tools are unchanged.
 - **Host Application support for packages and DLLs**: a project without an own executable (e.g. a `.dpk` runtime package) is now runnable. DevKit reads the `Debugger_HostApplication` set via Project > Options > Debugger in the Delphi IDE from the project's active `.dproj` property group (resolved for the effective configuration/platform, with `$(ProjectDir)`/`$(ProjectName)`/`$(Platform)`/`$(Config)` expanded and relative paths resolved against the project directory), and a new **"Set Host Application"** project context-menu command stores a DevKit-side override that wins over the dproj value. Running such a project (context menu "Run", "Run Selected Project" / `F9`, `ddk run`, or the MCP run tools) launches the host executable with the project's usual run parameters — matching the Delphi IDE, where Run on a package starts its Host Application. A package's `Debugger_RunParams` are now discovered too, and `ddk project list` / `delphi_list_projects` show the effective host next to the exe.
 - **Run-target visibility in the project tree**: hovering a project now shows a tooltip with its exe, the effective Host Application (marking whether it comes from the DevKit override or the dproj) and the effective run parameters (saved Start Parameters, the dproj's `Debugger_RunParams`, or both fused). A project that runs through a hosting executable also shows an inline `⇢ HostApp.exe` hint next to its name.
+
+## [2.4.1] - 2026-07-29
+
+### Changed
+
+- **Simplified project/workspace ordering (internal)**: the ordering of workspaces and project links is now derived solely from their position in the persisted list, removing the per-item `sort_rank` (LexoRank) field that previously encoded it. The list order was already authoritative — every reorder operation rewrote the ranks to match it — so the field was redundant. The LexoRank module and its now-unused `substring` dependency were removed. No user-facing behavior change; existing saved data with leftover `sort_rank` values still loads (the unknown field is ignored).
 
 ## [2.4.0] - 2026-07-14
 
