@@ -218,7 +218,6 @@ impl ProjectsData {
         workspace.project_links.push(ProjectLink {
             id: link_id,
             project_id: project.id,
-            sort_rank: LexoRank::default(),
         });
         self.projects.push(project);
         self.next_id(); // for project_id
@@ -246,7 +245,6 @@ impl ProjectsData {
         workspace.project_links.push(ProjectLink {
             id,
             project_id,
-            sort_rank: LexoRank::default(),
         });
         self.next_id();
         return Ok(());
@@ -430,12 +428,8 @@ impl ProjectsData {
            anyhow::bail!("Compiler not found: {}", compiler);
         }
         let workspace_id = self.next_id();
-        let lexo_rank = if let Some(last_ws) = self.workspaces.last() {
-            &last_ws.sort_rank
-        } else {
-            &LexoRank::default()
-        };
-        let workspace = Workspace::new(workspace_id, name.clone(), compiler.clone(), lexo_rank.next());
+        // Order is defined by position in the Vec; new workspaces append to the end.
+        let workspace = Workspace::new(workspace_id, name.clone(), compiler.clone());
         self.workspaces.push(workspace);
         return Ok(());
     }
@@ -488,8 +482,6 @@ impl ProjectsData {
             }
             _ => anyhow::bail!("Invalid drop target with id {}.", drop_target_id),
         }
-        let mut workspaces: Vec<&mut dyn HasLexoRank> = self.workspaces.iter_mut().map(|ws| ws as &mut dyn HasLexoRank).collect();
-        LexoRank::apply(&mut workspaces);
         return Ok(());
     }
 
@@ -565,16 +557,6 @@ impl ProjectsData {
 
     pub fn find_project_by_dproj(&self, dproj: &String) -> Option<&Project> {
         return self.projects.iter().find(|proj| proj.dproj.as_ref().map_or(false, |p| p == dproj));
-    }
-
-    pub fn sort(&mut self) {
-        self.workspaces.sort_by(|a: &Workspace, b: &Workspace| a.sort_rank.cmp(&b.sort_rank));
-        for workspace in &mut self.workspaces {
-            workspace.project_links.sort_by(|a: &ProjectLink, b: &ProjectLink| a.sort_rank.cmp(&b.sort_rank));
-        }
-        if let Some(group_project) = &mut self.group_project {
-            group_project.project_links.sort_by(|a: &ProjectLink, b: &ProjectLink| a.sort_rank.cmp(&b.sort_rank));
-        }
     }
 
     pub fn active_project(&self) -> Option<&Project> {

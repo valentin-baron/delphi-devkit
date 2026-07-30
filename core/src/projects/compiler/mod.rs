@@ -24,6 +24,11 @@ pub struct Compiler {
     client: Option<tower_lsp::Client>,
     params: CompileProjectParams,
     projects_data: ProjectsData,
+    /// Additional free-form arguments appended to the MSBuild command line
+    /// (from the CLI `-- <args...>` passthrough). Ignored for bare
+    /// `.dpr`/`.dpk` compiles, which use the command-line compiler (dcc)
+    /// rather than MSBuild.
+    extra_msbuild_args: Vec<String>,
 }
 
 impl Compiler {
@@ -33,6 +38,7 @@ impl Compiler {
             client: Some(client),
             params: params.clone(),
             projects_data: PROJECTS_DATA.read().await.clone(),
+            extra_msbuild_args: Vec::new(),
         }
     }
 
@@ -44,7 +50,17 @@ impl Compiler {
             client: None,
             params: params.clone(),
             projects_data: PROJECTS_DATA.read().await.clone(),
+            extra_msbuild_args: Vec::new(),
         }
+    }
+
+    /// Append additional free-form arguments to the MSBuild invocation. These
+    /// are placed **after** the built-in `/p:Config`/`/p:Platform` args so a
+    /// user-supplied `/p:` override wins (MSBuild takes the last value). Has no
+    /// effect on bare `.dpr`/`.dpk` compiles (which do not use MSBuild).
+    pub fn with_extra_msbuild_args(mut self, args: Vec<String>) -> Self {
+        self.extra_msbuild_args = args;
+        self
     }
 
     /// Create a standalone compiler operating on an explicit, caller-supplied
@@ -60,6 +76,7 @@ impl Compiler {
             client: None,
             params: params.clone(),
             projects_data,
+            extra_msbuild_args: Vec::new(),
         }
     }
 
@@ -444,16 +461,21 @@ impl Compiler {
                     .arg(format!("/p:Config={}", eff_config))
                     .arg(format!("/p:Configuration={}", eff_config))
                     .arg(format!("/p:Platform={}", eff_platform))
-                    // Have the Delphi targets hand the search/include/output
-                    // paths to the DCC task through the project's .cmds file
-                    // instead of the command line — the same mode the IDE
-                    // uses. Without it, machines with a large Library Path
-                    // exceed the 32000-character command-line limit and every
-                    // build dies with MSB6002/MSB6003. Targets that predate
-                    // the property simply ignore it.
-                    .arg("/p:DCC_UseMSBuildExternally=true");
+                    // prevent MSB60002/MSB60003 (32000-character command line limit
+                    .arg("/p:DCC_UseMSBuildExternally=true")
+                    // User passthrough last so a `/p:` override wins.
+                    .args(&self.extra_msbuild_args);
                 command
             } else {
+                if !self.extra_msbuild_args.is_empty() {
+                    CompilerProgress::notify_stdout(
+                        self.client.as_ref(),
+                        format!(
+                            "Ignoring extra build arguments ({}): a bare .dpr/.dpk is compiled with dcc, not MSBuild.",
+                            self.extra_msbuild_args.join(" ")
+                        ),
+                    ).await;
+                }
                 let dcc_path = find_dcc(&parameters.configuration.installation_path, &eff_platform)?;
                 let mut command = Command::new(dcc_path);
                 command

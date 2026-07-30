@@ -4,6 +4,18 @@ All notable changes to the "delphi-devkit" extension will be documented in this 
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [2.5.0] - 2026-07-30
+
+### Added
+
+- **Extra MSBuild arguments for `ddk compile`**: anything after a `--` separator on the `ddk compile` command line is now passed verbatim to MSBuild, e.g. `ddk compile be -- /p:DCC_Define=FOO /m`. The extra arguments are appended after DDK's built-in `/p:Config`/`/p:Configuration`/`/p:Platform` args, so a `/p:` override supplied this way wins (MSBuild takes the last value for a duplicated property). They have no effect on a bare `.dpr`/`.dpk` target — which is compiled with the command-line compiler (`dcc32`/`dcc64`) rather than MSBuild — and DDK prints a note listing the ignored arguments in that case. The MCP compile tools are unchanged.
+
+## [2.4.1] - 2026-07-29
+
+### Changed
+
+- **Simplified project/workspace ordering (internal)**: the ordering of workspaces and project links is now derived solely from their position in the persisted list, removing the per-item `sort_rank` (LexoRank) field that previously encoded it. The list order was already authoritative — every reorder operation rewrote the ranks to match it — so the field was redundant. The LexoRank module and its now-unused `substring` dependency were removed. No user-facing behavior change; existing saved data with leftover `sort_rank` values still loads (the unknown field is ignored).
+
 ## [2.4.0] - 2026-07-14
 
 ### Added

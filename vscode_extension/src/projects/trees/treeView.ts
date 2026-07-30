@@ -166,7 +166,6 @@ export class WorkspacesTreeView extends DelphiProjectsTreeView {
     let data = Runtime.projectsData;
     Runtime.updateProjectContexts();
     this.workspaceItems = data?.workspaces.map((ws) => new WorkspaceItem(ws)) || [];
-    this.workspaceItems = this.workspaceItems.sort((a, b) => a.workspace.sort_rank.localeCompare(b.workspace.sort_rank));
     this.projects = this.workspaceItems.flatMap((ws) => ws.projects);
     return this.workspaceItems;
   }

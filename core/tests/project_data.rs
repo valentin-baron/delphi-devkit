@@ -1,5 +1,4 @@
 use ddk_core::projects::*;
-use ddk_core::lexorank::LexoRank;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Helper: build a minimal ProjectsData for testing
@@ -15,21 +14,16 @@ fn make_project(id: usize, name: &str) -> Project {
     }
 }
 
-fn make_link(id: usize, project_id: usize, rank: &str) -> ProjectLink {
-    ProjectLink {
-        id,
-        project_id,
-        sort_rank: LexoRank::from_string(rank).unwrap_or_default(),
-    }
+fn make_link(id: usize, project_id: usize) -> ProjectLink {
+    ProjectLink { id, project_id }
 }
 
-fn make_workspace(id: usize, name: &str, links: Vec<ProjectLink>, rank: &str) -> Workspace {
+fn make_workspace(id: usize, name: &str, links: Vec<ProjectLink>) -> Workspace {
     Workspace {
         id,
         name: name.to_string(),
         compiler_id: "12.0".to_string(),
         project_links: links,
-        sort_rank: LexoRank::from_string(rank).unwrap_or_default(),
         ..Default::default()
     }
 }
@@ -45,12 +39,12 @@ fn sample_data() -> ProjectsData {
         ],
         workspaces: vec![
             make_workspace(4, "WS-A", vec![
-                make_link(5, 1, "1|d"),
-                make_link(6, 2, "1|h"),
-            ], "1|a"),
+                make_link(5, 1),
+                make_link(6, 2),
+            ]),
             make_workspace(7, "WS-B", vec![
-                make_link(8, 3, "1|h"),
-            ], "1|h"),
+                make_link(8, 3),
+            ]),
         ],
         group_project: None,
         group_project_compiler_id: "12.0".to_string(),
@@ -64,8 +58,8 @@ fn sample_data_with_group() -> ProjectsData {
         name: "MyGroup".to_string(),
         path: "C:\\Groups\\MyGroup.groupproj".to_string(),
         project_links: vec![
-            make_link(9, 1, "1|d"),
-            make_link(10, 2, "1|h"),
+            make_link(9, 1),
+            make_link(10, 2),
         ],
         ..Default::default()
     });
@@ -253,41 +247,6 @@ fn remove_group_project_keeps_workspace_linked_projects() {
     // Projects 1 and 2 are still in WS-A, so they should be kept
     assert!(data.get_project(1).is_some());
     assert!(data.get_project(2).is_some());
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  sort
-// ═══════════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn sort_orders_workspaces_by_rank() {
-    let mut data = ProjectsData {
-        workspaces: vec![
-            make_workspace(2, "Second", vec![], "1|h"),
-            make_workspace(1, "First", vec![], "1|a"),
-        ],
-        ..Default::default()
-    };
-    data.sort();
-    assert_eq!(data.workspaces[0].name, "First");
-    assert_eq!(data.workspaces[1].name, "Second");
-}
-
-#[test]
-fn sort_orders_links_within_workspace() {
-    let mut data = ProjectsData {
-        projects: vec![make_project(1, "A"), make_project(2, "B")],
-        workspaces: vec![
-            make_workspace(10, "WS", vec![
-                make_link(12, 2, "1|h"),
-                make_link(11, 1, "1|a"),
-            ], "1|h"),
-        ],
-        ..Default::default()
-    };
-    data.sort();
-    assert_eq!(data.workspaces[0].project_links[0].id, 11); // "1|a" first
-    assert_eq!(data.workspaces[0].project_links[1].id, 12); // "1|h" second
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
