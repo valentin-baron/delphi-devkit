@@ -443,7 +443,15 @@ impl Compiler {
                     .args(args.split_whitespace())
                     .arg(format!("/p:Config={}", eff_config))
                     .arg(format!("/p:Configuration={}", eff_config))
-                    .arg(format!("/p:Platform={}", eff_platform));
+                    .arg(format!("/p:Platform={}", eff_platform))
+                    // Have the Delphi targets hand the search/include/output
+                    // paths to the DCC task through the project's .cmds file
+                    // instead of the command line — the same mode the IDE
+                    // uses. Without it, machines with a large Library Path
+                    // exceed the 32000-character command-line limit and every
+                    // build dies with MSB6002/MSB6003. Targets that predate
+                    // the property simply ignore it.
+                    .arg("/p:DCC_UseMSBuildExternally=true");
                 command
             } else {
                 let dcc_path = find_dcc(&parameters.configuration.installation_path, &eff_platform)?;
