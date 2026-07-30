@@ -374,7 +374,7 @@ async fn compile_project(args: &Value) -> String {
                 .and_then(|v| v.as_u64())
                 .map(|id| id.to_string())
         });
-    match commands::cmd_compile_ref(rebuild, reference, filter).await {
+    match commands::cmd_compile_ref(rebuild, reference, filter, Vec::new()).await {
         Ok(commands::CompileOrAmbiguity::Output(output)) => output.to_string(),
         Ok(commands::CompileOrAmbiguity::Ambiguity(amb)) => amb.to_string(),
         Err(e) => format!("{e}"),
@@ -399,7 +399,7 @@ async fn compile_file(args: &Value) -> String {
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
     };
-    match commands::cmd_compile_file(file_path, compiler, config, platform, rebuild, filter).await {
+    match commands::cmd_compile_file(file_path, compiler, config, platform, rebuild, filter, Vec::new()).await {
         Ok(commands::CompileOrAmbiguity::Output(output)) => output.to_string(),
         Ok(commands::CompileOrAmbiguity::Ambiguity(amb)) => amb.to_string(),
         Err(e) => format!("{e}"),
