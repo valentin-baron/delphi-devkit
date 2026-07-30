@@ -30,7 +30,7 @@ impl Default for GroupProject {
 }
 
 impl GroupProject {
-    pub fn fill(&mut self, projects_data: &mut ProjectsData) -> Result<()> {
+    pub fn fill(&mut self, projects_data: &mut ProjectsData, ide_env: &[(String, String)]) -> Result<()> {
         let project_paths = parse_groupproj(PathBuf::from(&self.path))?;
         for project_path in project_paths {
             let project_path = normalize_path(&project_path);
@@ -57,7 +57,7 @@ impl GroupProject {
                     dproj_host_application: None,
                     host_application: None,
                 };
-                project.discover_paths()?;
+                project.discover_paths(ide_env)?;
                 projects_data.projects.push(project);
                 self.new_project_link(projects_data.next_id(), project_id);
             }

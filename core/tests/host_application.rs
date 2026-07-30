@@ -27,7 +27,7 @@ fn discover_for(dir: &std::path::Path, dproj_path: &std::path::Path, config: &st
         dproj: Some(dproj_path.to_string_lossy().to_string()),
         ..Default::default()
     };
-    project.discover_paths_for(config, platform).unwrap();
+    project.discover_paths_for(config, platform, &[]).unwrap();
     project
 }
 
@@ -96,7 +96,7 @@ fn discover_paths_reads_host_application_and_run_params_for_dpk() {
         ..Default::default()
     };
 
-    project.discover_paths_for("Debug", "Win64").unwrap();
+    project.discover_paths_for("Debug", "Win64", &[]).unwrap();
 
     assert!(project.dpk.is_some(), "package main source should be discovered");
     assert!(project.exe.is_none(), "a package has no executable");
@@ -140,7 +140,7 @@ fn discover_paths_absolutizes_relative_host_application() {
     };
 
     // Debug/Win32 selects the relative "hosts\DebugHost.exe" value.
-    project.discover_paths_for("Debug", "Win32").unwrap();
+    project.discover_paths_for("Debug", "Win32", &[]).unwrap();
 
     let host = project
         .dproj_host_application
@@ -204,7 +204,7 @@ fn discover_paths_clears_stale_dproj_fields_for_bare_projects() {
         dproj_host_application: Some("C:\\stale\\Host.exe".to_string()),
         ..Default::default()
     };
-    project.discover_paths().unwrap();
+    project.discover_paths(&[]).unwrap();
     assert_eq!(project.dproj_run_params, None, "bare .dpr must clear stale run params");
     assert_eq!(project.dproj_host_application, None, "bare .dpr must clear stale host application");
 
@@ -218,7 +218,7 @@ fn discover_paths_clears_stale_dproj_fields_for_bare_projects() {
         ..Default::default()
     };
     std::fs::write(dir.join("barepkg.dpk"), "package barepkg;\nend.\n").unwrap();
-    package.discover_paths().unwrap();
+    package.discover_paths(&[]).unwrap();
     assert_eq!(package.dproj_run_params, None, "bare .dpk must clear stale run params");
     assert_eq!(package.dproj_host_application, None, "bare .dpk must clear stale host application");
 }
@@ -261,7 +261,7 @@ fn discover_paths_expands_environment_variable_macros() {
         dproj: Some(dproj_path.to_string_lossy().to_string()),
         ..Default::default()
     };
-    project.discover_paths_for("Debug", "Win64").unwrap();
+    project.discover_paths_for("Debug", "Win64", &[]).unwrap();
 
     let host = project
         .dproj_host_application
@@ -314,4 +314,27 @@ fn update_project_sets_and_clears_host_application() {
     // A blank value clears the override.
     data.update_project(7, update(Some("   "))).unwrap();
     assert_eq!(data.get_project(7).unwrap().host_application, None);
+}
+
+#[test]
+fn discover_win64_default_platform_resolves_platform_specific_host() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let dir = tmp_dir.path();
+    let dproj_path = dir.join("TestPkg64.dproj");
+    fs::write(&dproj_path, include_str!("fixtures/TestPkg64.dproj")).unwrap();
+    fs::write(dir.join("TestPkg.dpk"), "package TestPkg;\nend.\n").unwrap();
+
+    let mut project = Project {
+        id: 1,
+        name: "TestPkg64".to_string(),
+        directory: dir.to_string_lossy().to_string(),
+        dproj: Some(dproj_path.to_string_lossy().to_string()),
+        ..Default::default()
+    };
+    let ide_env = vec![("VEGADIR".to_string(), r"c:\Athens\hydra_2".to_string())];
+    project.discover_paths(&ide_env).unwrap();
+
+    assert_eq!(project.dproj_run_params.as_deref(), Some("-flag1"));
+    let host = project.dproj_host_application.clone().expect("host should be discovered for Win64 default platform");
+    assert_eq!(host.to_lowercase(), r"c:\athens\hydra_2\fieldhost64.exe");
 }

@@ -147,7 +147,8 @@ impl Change {
 
     async fn new_project(file_path: String, workspace_id: usize) -> Result<()> {
         let mut projects_data = PROJECTS_DATA.write().await;
-        projects_data.new_project(&file_path, workspace_id)?;
+        let ide_env = projects_data.ide_environment_for_workspace(workspace_id).await;
+        projects_data.new_project(&file_path, workspace_id, &ide_env)?;
         return projects_data.save().await;
     }
 
@@ -171,7 +172,8 @@ impl Change {
 
     async fn refresh_project(project_id: usize) -> Result<()> {
         let mut projects_data = PROJECTS_DATA.write().await;
-        projects_data.refresh_project_paths(project_id)?;
+        let ide_env = projects_data.ide_environment_for_project(project_id).await;
+        projects_data.refresh_project_paths(project_id, &ide_env)?;
         return projects_data.save().await;
     }
 
@@ -237,7 +239,8 @@ impl Change {
 
     async fn set_group_project(groupproj_path: String) -> Result<()> {
         let mut projects_data = PROJECTS_DATA.write().await;
-        projects_data.set_group_project(&groupproj_path)?;
+        let ide_env = projects_data.group_projects_compiler().await.ide_environment_overrides();
+        projects_data.set_group_project(&groupproj_path, &ide_env)?;
         return projects_data.save().await;
     }
 
@@ -263,19 +266,21 @@ impl Change {
 
     async fn set_project_configuration(project_id: usize, config: Option<String>) -> Result<()> {
         let mut projects_data = PROJECTS_DATA.write().await;
+        let ide_env = projects_data.ide_environment_for_project(project_id).await;
         let project = projects_data.get_project_mut(project_id)
             .ok_or_else(|| anyhow::anyhow!("Project with id {} not found", project_id))?;
         project.active_configuration = config;
-        let _ = project.discover_paths();
+        let _ = project.discover_paths(&ide_env);
         return projects_data.save().await;
     }
 
     async fn set_project_platform(project_id: usize, platform: Option<String>) -> Result<()> {
         let mut projects_data = PROJECTS_DATA.write().await;
+        let ide_env = projects_data.ide_environment_for_project(project_id).await;
         let project = projects_data.get_project_mut(project_id)
             .ok_or_else(|| anyhow::anyhow!("Project with id {} not found", project_id))?;
         project.active_platform = platform;
-        let _ = project.discover_paths();
+        let _ = project.discover_paths(&ide_env);
         return projects_data.save().await;
     }
 
@@ -288,11 +293,12 @@ impl Change {
             workspace.active_configuration = config.clone();
             workspace.project_links.iter().map(|link| link.project_id).collect()
         };
+        let ide_env = projects_data.ide_environment_for_workspace(workspace_id).await;
         // Cascade to all linked projects
         for pid in linked_project_ids {
             if let Some(project) = projects_data.get_project_mut(pid) {
                 project.active_configuration = config.clone();
-                let _ = project.discover_paths();
+                let _ = project.discover_paths(&ide_env);
             }
         }
         return projects_data.save().await;
@@ -306,10 +312,11 @@ impl Change {
             workspace.active_platform = platform.clone();
             workspace.project_links.iter().map(|link| link.project_id).collect()
         };
+        let ide_env = projects_data.ide_environment_for_workspace(workspace_id).await;
         for pid in linked_project_ids {
             if let Some(project) = projects_data.get_project_mut(pid) {
                 project.active_platform = platform.clone();
-                let _ = project.discover_paths();
+                let _ = project.discover_paths(&ide_env);
             }
         }
         return projects_data.save().await;
@@ -323,10 +330,11 @@ impl Change {
             gp.active_configuration = config.clone();
             gp.project_links.iter().map(|link| link.project_id).collect()
         };
+        let ide_env = projects_data.group_projects_compiler().await.ide_environment_overrides();
         for pid in linked_project_ids {
             if let Some(project) = projects_data.get_project_mut(pid) {
                 project.active_configuration = config.clone();
-                let _ = project.discover_paths();
+                let _ = project.discover_paths(&ide_env);
             }
         }
         return projects_data.save().await;
@@ -358,10 +366,11 @@ impl Change {
             gp.active_platform = platform.clone();
             gp.project_links.iter().map(|link| link.project_id).collect()
         };
+        let ide_env = projects_data.group_projects_compiler().await.ide_environment_overrides();
         for pid in linked_project_ids {
             if let Some(project) = projects_data.get_project_mut(pid) {
                 project.active_platform = platform.clone();
-                let _ = project.discover_paths();
+                let _ = project.discover_paths(&ide_env);
             }
         }
         return projects_data.save().await;

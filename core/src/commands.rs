@@ -1164,7 +1164,8 @@ pub async fn cmd_compile_file_with_progress(
     let mut data = ProjectsData::default();
     data.new_workspace(&"ad-hoc".to_string(), &compiler_key).await?;
     let workspace_id = data.workspaces[0].id;
-    data.new_project(&file_path, workspace_id)?;
+    let ide_env = data.ide_environment_for_workspace(workspace_id).await;
+    data.new_project(&file_path, workspace_id, &ide_env)?;
     let project = data
         .projects
         .last_mut()

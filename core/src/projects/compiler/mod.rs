@@ -558,9 +558,10 @@ impl Compiler {
                 let exe_missing = project.exe.as_deref()
                     .map_or(true, |p| p.is_empty() || !PathBuf::from(p).exists());
                 if exe_missing {
+                    let ide_env = parameters.configuration.ide_environment_overrides();
                     let mut projects_data = PROJECTS_DATA.write().await;
                     if let Some(project) = projects_data.get_project_mut(project.id) &&
-                       let Ok(_) = project.discover_paths()
+                       let Ok(_) = project.discover_paths(&ide_env)
                     {
                         let _ = projects_data.save().await;
                     }

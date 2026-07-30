@@ -65,6 +65,34 @@ impl ProjectsData {
             .clone();
     }
 
+    /// The IDE environment-variable overrides applying to a workspace's
+    /// projects: those of the workspace's compiler configuration.
+    pub async fn ide_environment_for_workspace(&self, workspace_id: usize) -> Vec<(String, String)> {
+        match self.workspaces.iter().find(|ws| ws.id == workspace_id) {
+            Some(workspace) => workspace.compiler().await.ide_environment_overrides(),
+            _ => crate::utils::ide_environment_overrides(),
+        }
+    }
+
+    /// The IDE environment-variable overrides applying to a project: those of
+    /// the compiler configuration of the first workspace containing it, else
+    /// the group project's compiler when it is a group-project member, else
+    /// (no owning context to pick a configuration from) the fallback set of
+    /// the highest installed BDS version.
+    pub async fn ide_environment_for_project(&self, project_id: usize) -> Vec<(String, String)> {
+        for workspace in &self.workspaces {
+            if workspace.project_links.iter().any(|link| link.project_id == project_id) {
+                return workspace.compiler().await.ide_environment_overrides();
+            }
+        }
+        if let Some(group_project) = &self.group_project {
+            if group_project.project_links.iter().any(|link| link.project_id == project_id) {
+                return self.group_projects_compiler().await.ide_environment_overrides();
+            }
+        }
+        crate::utils::ide_environment_overrides()
+    }
+
     async fn validate_compilers(&self) -> Result<()> {
         for workspace in &self.workspaces {
             if !compiler_exists(&workspace.compiler_id).await {
@@ -174,7 +202,7 @@ impl ProjectsData {
         return false;
     }
 
-    pub fn new_project(&mut self, file_path: &String, workspace_id: usize) -> Result<()> {
+    pub fn new_project(&mut self, file_path: &String, workspace_id: usize, ide_env: &[(String, String)]) -> Result<()> {
         let (project_id, link_id) = (self.id_counter + 1, self.id_counter + 2);
         let workspace = match self.workspaces.iter_mut().find(|ws| ws.id == workspace_id) {
             Some(ws) => ws,
@@ -227,7 +255,7 @@ impl ProjectsData {
         // Discover exe/ini paths from the dproj right away so they are
         // populated even when the executable hasn't been built yet.
         if let Some(proj) = self.projects.last_mut() {
-            let _ = proj.discover_paths();
+            let _ = proj.discover_paths(ide_env);
         }
 
         return Ok(());
@@ -351,12 +379,12 @@ impl ProjectsData {
         return false;
     }
 
-    pub fn refresh_project_paths(&mut self, project_id: usize) -> Result<()> {
+    pub fn refresh_project_paths(&mut self, project_id: usize, ide_env: &[(String, String)]) -> Result<()> {
         let project = match self.get_project_mut(project_id) {
             Some(proj) => proj,
             _ => anyhow::bail!("Project with id {} not found", project_id),
         };
-        return project.discover_paths();
+        return project.discover_paths(ide_env);
     }
 
     pub fn update_project(&mut self, project_id: usize, data: ProjectUpdateData) -> Result<()> {
@@ -514,7 +542,7 @@ impl ProjectsData {
         return Ok(());
     }
 
-    pub fn set_group_project(&mut self, groupproj_path: &String) -> Result<()> {
+    pub fn set_group_project(&mut self, groupproj_path: &String, ide_env: &[(String, String)]) -> Result<()> {
         let path = PathBuf::from(groupproj_path);
         if !path.exists() {
             anyhow::bail!("Group project file does not exist: {}", groupproj_path);
@@ -526,7 +554,7 @@ impl ProjectsData {
             active_configuration: None,
             active_platform: None,
         };
-        group_project.fill(self)?;
+        group_project.fill(self, ide_env)?;
         self.group_project = Some(group_project);
         return Ok(());
     }

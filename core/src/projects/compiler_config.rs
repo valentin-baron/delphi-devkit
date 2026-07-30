@@ -34,6 +34,15 @@ pub struct CompilerConfiguration {
 }
 
 impl CompilerConfiguration {
+    /// The Delphi IDE environment-variable overrides (Tools > Options > IDE >
+    /// Environment Variables) belonging to THIS installation, read at runtime
+    /// from its own BDS registry hive — `product_version` is the BDS major
+    /// version (`23` for Delphi 12 Athens). Never persisted: the registry is
+    /// the source of truth and the IDE can change it at any time.
+    pub fn ide_environment_overrides(&self) -> Vec<(String, String)> {
+        crate::utils::bds_environment_overrides(self.product_version)
+    }
+
     pub fn update(&mut self, partial: &PartialCompilerConfiguration) {
         if let Some(condition) = &partial.condition {
             self.condition = condition.clone();

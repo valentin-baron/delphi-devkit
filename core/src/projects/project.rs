@@ -142,18 +142,23 @@ impl Project {
             .or_else(|| self.dproj_host_application.clone().filter(usable))
     }
 
-    pub fn discover_paths(&mut self) -> Result<()> {
+    /// `ide_env` is the set of IDE environment-variable overrides of the
+    /// compiler configuration this project builds with — see
+    /// [`CompilerConfiguration::ide_environment_overrides`]; callers that
+    /// have no compiler context pass the fallback
+    /// [`crate::utils::ide_environment_overrides`].
+    pub fn discover_paths(&mut self, ide_env: &[(String, String)]) -> Result<()> {
         let config = self.active_configuration.clone();
         let platform = self.active_platform.clone();
-        self.discover_paths_inner(config.as_deref(), platform.as_deref())
+        self.discover_paths_inner(config.as_deref(), platform.as_deref(), ide_env)
     }
 
     /// Discover paths using an explicit config/platform override.
-    pub fn discover_paths_for(&mut self, config: &str, platform: &str) -> Result<()> {
-        self.discover_paths_inner(Some(config), Some(platform))
+    pub fn discover_paths_for(&mut self, config: &str, platform: &str, ide_env: &[(String, String)]) -> Result<()> {
+        self.discover_paths_inner(Some(config), Some(platform), ide_env)
     }
 
-    fn discover_paths_inner(&mut self, config: Option<&str>, platform: Option<&str>) -> Result<()> {
+    fn discover_paths_inner(&mut self, config: Option<&str>, platform: Option<&str>, ide_env: &[(String, String)]) -> Result<()> {
         if self.dproj.is_none() {
             // A sibling `.dproj` may exist next to the main source; adopt it if so.
             // Its absence is not an error: a bare `.dpr`/`.dpk` is a valid project.
@@ -223,7 +228,7 @@ impl Project {
                     self.ini = None;
                 }
                 (self.dproj_run_params, self.dproj_host_application) =
-                    Self::discover_debugger_settings(&dproj_path, config, platform, &self.directory);
+                    Self::discover_debugger_settings(&dproj_path, config, platform, &self.directory, ide_env);
             },
             Some(ext) if ext == "dpk" => {
                 self.dpk = Some(main_source.to_string_lossy().to_string());
@@ -234,7 +239,7 @@ impl Project {
                 // Parameters and Host Application (Project > Options in the
                 // Delphi IDE) drive how RunProgram launches the hosting exe.
                 (self.dproj_run_params, self.dproj_host_application) =
-                    Self::discover_debugger_settings(&dproj_path, config, platform, &self.directory);
+                    Self::discover_debugger_settings(&dproj_path, config, platform, &self.directory, ide_env);
             },
             _ => {
                 anyhow::bail!("Cannot discover paths - main source file is not a DPR or DPK for project id: {}", self.id);
@@ -258,8 +263,9 @@ impl Project {
         config: Option<&str>,
         platform: Option<&str>,
         project_directory: &str,
+        ide_env: &[(String, String)],
     ) -> (Option<String>, Option<String>) {
-        let Some(dproj) = Self::load_dproj_with_ide_environment(dproj_path, project_directory) else {
+        let Some(dproj) = Self::load_dproj_with_ide_environment(dproj_path, project_directory, ide_env) else {
             return (None, None);
         };
         let (cfg, plat) = Self::effective_cfg_plat(&dproj, config, platform);
@@ -279,14 +285,18 @@ impl Project {
     /// Parse a `.dproj` seeding the `$(NAME)` expansion map with everything
     /// the IDE-launched MSBuild would see: the process environment first,
     /// overridden by the Delphi IDE's own environment-variable overrides
-    /// (Tools > Options > IDE > Environment Variables — they exist only
-    /// inside the IDE's process, so they are read back from the registry),
+    /// (`ide_env` — they exist only inside the IDE's process, so they are
+    /// read back from the registry of the relevant compiler configuration),
     /// plus the project-context properties (`ProjectDir`, `ProjectName`)
     /// that dproj-rs cannot derive on its own. Names that resolve to nothing
     /// expand to an empty string, matching MSBuild semantics.
-    fn load_dproj_with_ide_environment(dproj_path: &PathBuf, project_directory: &str) -> Option<dproj_rs::Dproj> {
+    fn load_dproj_with_ide_environment(
+        dproj_path: &PathBuf,
+        project_directory: &str,
+        ide_env: &[(String, String)],
+    ) -> Option<dproj_rs::Dproj> {
         let mut env: std::collections::HashMap<String, String> = std::env::vars().collect();
-        for (name, value) in IDE_ENV_OVERRIDES.iter() {
+        for (name, value) in ide_env {
             env.insert(name.clone(), value.clone());
         }
         let project_name = dproj_path
@@ -348,10 +358,3 @@ impl Project {
     }
 }
 
-lazy_static::lazy_static! {
-    /// The Delphi IDE's own environment-variable overrides (Tools > Options >
-    /// IDE > Environment Variables), read once per process: dproj values
-    /// reference them (e.g. `$(VEGADIR)`) although they exist in no real
-    /// environment outside the IDE.
-    static ref IDE_ENV_OVERRIDES: Vec<(String, String)> = crate::utils::ide_environment_overrides();
-}
