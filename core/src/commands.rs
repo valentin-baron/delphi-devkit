@@ -248,8 +248,10 @@ pub struct CompileDiagnostic {
 
 /// Compiler diagnostics grouped by severity.
 ///
-/// Always fully populated regardless of the `show_warnings` / `show_hints`
-/// output filters — those only affect the human-readable `lines`.
+/// Subject to the same `show_warnings` / `show_hints` filters as `lines`:
+/// errors always appear, warnings only with `show_warnings`, hints only with
+/// `show_hints`. The filters slim the output for machine consumers, so they
+/// gate the structured data and the human-readable lines uniformly.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CompileDiagnostics {
     pub errors: Vec<CompileDiagnostic>,
@@ -266,7 +268,8 @@ pub struct CompileOutput {
     pub code: i32,
     /// Human-readable, filter-respecting output lines (backwards compatible).
     pub lines: Vec<String>,
-    /// Structured diagnostics grouped by severity; always complete.
+    /// Structured diagnostics grouped by severity, subject to the same
+    /// `show_warnings` / `show_hints` filters as `lines`.
     #[serde(default)]
     pub diagnostics: CompileDiagnostics,
 }
@@ -354,13 +357,8 @@ fn trim_banner_lines(lines: Vec<String>) -> Vec<String> {
 
 lazy_static::lazy_static! {
     /// Matches the formatted-diagnostic line emitted by
-    /// `CompilerLineDiagnostic::Display`:
+    /// `CompilerLineDiagnostic::Display`, capturing every field:
     ///   `HH:MM:SS.mmm: [KIND][CODE] file:line[:col] - message`
-    static ref FORMATTED_DIAG_REGEX: regex::Regex = regex::Regex::new(
-        r"^\d{2}:\d{2}:\d{2}\.\d+:\s+\[(?P<kind>WARN|HINT|ERROR)\]\[[A-Z]\d+\]\s+(?P<file>.+?):\d+(?::\d+)?\s+-\s"
-    ).unwrap();
-
-    /// Like `FORMATTED_DIAG_REGEX` but captures every field for structured output.
     static ref FORMATTED_DIAG_FULL_REGEX: regex::Regex = regex::Regex::new(
         r"^\d{2}:\d{2}:\d{2}\.\d+:\s+\[(?P<kind>WARN|HINT|ERROR)\]\[(?P<code>[A-Z]\d+)\]\s+(?P<file>.+?):(?P<line>\d+)(?::\d+)?\s+-\s(?P<message>.*)$"
     ).unwrap();
@@ -429,20 +427,6 @@ enum DiagKind {
     Warn,
     Hint,
     Error,
-}
-
-/// Attempt to classify a streamed compiler line as a formatted diagnostic.
-/// Returns `(kind, file_basename_without_extension)` on match.
-fn classify_diagnostic_line(line: &str) -> Option<(DiagKind, String)> {
-    let caps = FORMATTED_DIAG_REGEX.captures(line)?;
-    let kind = match caps.name("kind")?.as_str() {
-        "WARN" => DiagKind::Warn,
-        "HINT" => DiagKind::Hint,
-        "ERROR" => DiagKind::Error,
-        _ => return None,
-    };
-    let file = caps.name("file")?.as_str();
-    Some((kind, diag_file_basename(file)))
 }
 
 /// Extract `<filename without extension>` from a path string.
@@ -1378,17 +1362,11 @@ async fn run_compile_collecting(
                         }
                         CompilerProgressParams::Stdout { line }
                         | CompilerProgressParams::Stderr { line } => {
-                            // Record structured diagnostics unconditionally,
-                            // before any show_warnings/show_hints suppression.
                             if let Some((kind, diag)) = parse_formatted_diagnostic(&line) {
-                                let mut d = diagnostics_clone.lock().unwrap();
-                                match kind {
-                                    DiagKind::Error => d.errors.push(diag),
-                                    DiagKind::Warn => d.warnings.push(diag),
-                                    DiagKind::Hint => d.hints.push(diag),
-                                }
-                            }
-                            if let Some((kind, file)) = classify_diagnostic_line(&line) {
+                                // The show_warnings/show_hints filters slim the
+                                // output for machine consumers, so they gate
+                                // both lines[] and diagnostics[] uniformly:
+                                // a suppressed severity appears in neither.
                                 let suppress = match kind {
                                     DiagKind::Warn => !filter_opts.show_warnings,
                                     DiagKind::Hint => !filter_opts.show_hints,
@@ -1396,9 +1374,15 @@ async fn run_compile_collecting(
                                 };
                                 if suppress {
                                     if filter_opts.summarize_diagnostics {
-                                        counts.add(&file, kind);
+                                        counts.add(&diag_file_basename(&diag.file), kind);
                                     }
                                     continue;
+                                }
+                                let mut d = diagnostics_clone.lock().unwrap();
+                                match kind {
+                                    DiagKind::Error => d.errors.push(diag),
+                                    DiagKind::Warn => d.warnings.push(diag),
+                                    DiagKind::Hint => d.hints.push(diag),
                                 }
                             }
                             emit(&progress_callback, &mut lines, vec![line]);

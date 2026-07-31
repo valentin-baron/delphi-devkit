@@ -91,9 +91,11 @@ rather than MSBuild — DDK prints a note when they are ignored.
 
 For machine consumers, `ddk compile --json` includes a `diagnostics` object
 alongside `lines[]`, grouped into `errors`/`warnings`/`hints` with each entry
-carrying `{code, file, line, message}`. It is always fully populated regardless
-of `--show-warnings`/`--show-hints` (those only affect the human-readable
-`lines[]`). Compiler output is decoded using the active console output codepage
+carrying `{code, file, line, message}`. It obeys the same `--show-warnings` /
+`--show-hints` filters as `lines[]` — errors always appear, warnings only with
+`--show-warnings`, hints only with `--show-hints` — so a slim compile stays slim
+in both views; pass both flags to get every diagnostic. Compiler output is
+decoded using the active console output codepage
 (what `chcp` sets); use `-e`/`--encoding` (or the `DDK_COMPILER_ENCODING`
 environment variable) to force a specific encoding. By default `ddk compile`
 exits 0 even on a failed compile (the result is in the JSON); pass
