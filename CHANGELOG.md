@@ -6,6 +6,8 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ## [Unreleased]
 
+## [2.5.1] - 2026-07-31
+
 ### Added
 
 - **Fully machine-coded `ddk compile --json` (and MCP compile tools)**: the compile result is now entirely structured — the header banner is split into fields (`project`, `project_path`, `compiler`, `config`, `platform`, `action`) and all recognised compiler messages live in a `diagnostics` object grouped into `errors`/`warnings`/`hints`, each entry `{code, file, line, message}` (absolute path, numeric line). Consumers read fields directly instead of scraping log text. Diagnostics obey the `--show-warnings`/`--show-hints` filters (errors always present; warnings/hints only with their flag), so a slimmed compile stays slim. The MCP `delphi_compile_project`/`delphi_compile_file` tools now return this same JSON (previously a human-readable text blob). **Breaking:** the old `--json` shape (`project_name`, free-text `lines[]`, `cancelled`) is replaced — the raw `lines[]` array and the `cancelled` field are gone (a one-shot CLI/MCP compile cannot be cancelled), and `project_name` is now `project`. The human (non-`--json`) output is unchanged.

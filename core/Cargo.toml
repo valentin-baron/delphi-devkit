@@ -1,6 +1,6 @@
 [package]
 name = "ddk-core"
-version = "2.5.0"
+version = "2.5.1"
 edition = "2024"
 authors = ["Valentin Baron"]
 license-file = "../LICENSE"
