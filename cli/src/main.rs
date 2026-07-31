@@ -100,6 +100,13 @@ enum Commands {
         #[arg(long)]
         summarize_diagnostics: bool,
 
+        /// Encoding used to decode compiler output, e.g. "utf-8",
+        /// "windows-1252", "oem". Defaults to "oem", which auto-detects the
+        /// active console output codepage (what `chcp` sets). Overrides the
+        /// DDK_COMPILER_ENCODING environment variable.
+        #[arg(long, short = 'e')]
+        encoding: Option<String>,
+
         /// Extra arguments passed verbatim to MSBuild, after `--`
         /// (e.g. `ddk compile be -- /p:DCC_Define=FOO /m`). Appended after the
         /// built-in Config/Platform args, so a `/p:` override here wins. Ignored
@@ -279,8 +286,18 @@ async fn main() -> Result<()> {
             show_warnings,
             show_hints,
             summarize_diagnostics,
+            encoding,
             msbuild_args,
         } => {
+            // Resolve compiler-output encoding: --encoding wins, then the
+            // DDK_COMPILER_ENCODING env var, else the "oem" default (which
+            // auto-detects the console output codepage at decode time).
+            if let Some(enc) = encoding
+                .or_else(|| std::env::var("DDK_COMPILER_ENCODING").ok())
+                .filter(|e| !e.trim().is_empty())
+            {
+                ddk_core::encoding::set_encoding(&enc);
+            }
             let filter = CompileFilterOptions {
                 trim_banners: true,
                 show_warnings,
