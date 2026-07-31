@@ -61,6 +61,8 @@ ddk compile <PATH> --config Release --platform Win64   # ...with build overrides
 ddk compile --show-warnings            # Include warnings verbatim
 ddk compile --show-hints               # Include hints verbatim
 ddk compile --summarize-diagnostics    # Append `<file>: X warn, Y hint` per project
+ddk compile -e windows-1252            # Decode compiler output with a specific encoding
+ddk compile --fail-on-error            # Exit non-zero when the compile fails
 ddk compile <ID|NAME> -- /p:Foo=Bar    # Pass extra arguments verbatim to MSBuild (after `--`)
 ddk run                                # Run the active project's executable
 ddk run <ID|NAME>                      # Run a project by ID or name (= -p; lists candidates if ambiguous)
@@ -86,6 +88,17 @@ appended after DDK's own `/p:Config`/`/p:Platform` args, so a `/p:` override
 here wins (MSBuild takes the last value). They have no effect on a bare
 `.dpr`/`.dpk` target, which is compiled with the command-line compiler (`dcc`)
 rather than MSBuild — DDK prints a note when they are ignored.
+
+For machine consumers, `ddk compile --json` includes a `diagnostics` object
+alongside `lines[]`, grouped into `errors`/`warnings`/`hints` with each entry
+carrying `{code, file, line, message}`. It is always fully populated regardless
+of `--show-warnings`/`--show-hints` (those only affect the human-readable
+`lines[]`). Compiler output is decoded using the active console output codepage
+(what `chcp` sets); use `-e`/`--encoding` (or the `DDK_COMPILER_ENCODING`
+environment variable) to force a specific encoding. By default `ddk compile`
+exits 0 even on a failed compile (the result is in the JSON); pass
+`--fail-on-error` to exit with the compiler's exit code instead (a cancelled
+compile exits 2).
 
 Compile output for the CLI and the MCP `delphi_compile_project` tool is
 trimmed for AI / token-efficient consumption: the decorative banner box is

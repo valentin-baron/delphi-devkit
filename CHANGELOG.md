@@ -6,8 +6,15 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ## [Unreleased]
 
+### Added
+
+- **Structured diagnostics in `ddk compile --json`**: the JSON output now carries a `diagnostics` object next to the existing `lines[]`, grouped into `errors`/`warnings`/`hints`, with each entry holding `{code, file, line, message}` (absolute file path, numeric line). It is **always** fully populated regardless of `--show-warnings`/`--show-hints` — those flags now only affect the human-readable `lines[]`, so a plain `--json` no longer drops all warnings and hints. Machine consumers can read severity/code/file/line directly instead of regexing formatted strings. `lines[]` is unchanged (backwards compatible).
+- **`-e`/`--encoding` for `ddk compile`**: force the encoding used to decode compiler output (e.g. `windows-1252`, `utf-8`, `oem`), mirroring `ddk format`. The `DDK_COMPILER_ENCODING` environment variable is honoured as a fallback. Defaults to `oem`, which now auto-detects the active console output codepage.
+- **`--fail-on-error` for `ddk compile`**: opt-in flag that makes the process exit with the compiler's exit code when a compile fails (a cancelled compile exits `2`), instead of always exiting `0`. Left off by default so existing callers that only parse the JSON are unaffected; JSON output is unchanged.
+
 ### Fixed
 
+- **Compiler output decoded with the wrong codepage**: `ddk compile` always decoded compiler output as the system OEM codepage (`GetOEMCP`). When the console codepage differed — e.g. under `chcp 1252` or `chcp 65001` — the child compiler wrote its bytes in the console codepage, so non-ASCII characters (umlauts in messages and file paths) were corrupted in the bytes DDK itself wrote to stdout, which a consumer could not repair. DDK now decodes compiler output using the active console output codepage (`GetConsoleOutputCP`, what `chcp` sets), falling back to the system OEM codepage when no console is attached (e.g. a detached LSP server, so its behaviour is unchanged). File reads used by `ddk format` still use the system OEM codepage.
 - **Correct selection (range) formatting**: formatting a selection previously sent only the selected text to the DDK formatter, which formatted it out of context — a fragment is not valid on its own, so the result lost the enclosing indentation and mis-laid-out anything that depends on surrounding blocks. DevKit now formats the **whole document** and maps the selection back onto the formatted result, so a selection formats exactly as it would as part of the full file. The applied edit still touches only the selected code (the rest of the file is left untouched); a selection that starts or ends in whitespace snaps to the enclosing code; the first selected line's indentation is reformatted too (so a mis-indented leading comment is corrected, not left in place); and a whitespace-only selection is a no-op. The mapping is anchored on non-whitespace characters, so formatter changes that only affect whitespace, line endings (LF ↔ CRLF), or letter case never misalign it, and multibyte text (UTF-16 ↔ UTF-8 offsets) is handled correctly.
 
 ## [2.5.0] - 2026-07-30
