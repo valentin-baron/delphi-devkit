@@ -350,6 +350,14 @@ export class DDK_Client {
     }
 }
 
+/** Reply from `custom/document/format`: replace `[start, end)` (UTF-16 offsets
+ *  into the document) with `newText`. */
+interface DocumentFormatEdit {
+    start: number;
+    end: number;
+    newText: string;
+}
+
 class DelphiFormattingProvider implements DocumentFormattingEditProvider, DocumentRangeFormattingEditProvider {
     constructor(private readonly client: LanguageClient) { }
 
@@ -357,29 +365,29 @@ class DelphiFormattingProvider implements DocumentFormattingEditProvider, Docume
         document: TextDocument,
         range: Range,
     ): Promise<TextEdit[]> {
-        return [
-            await this.client.sendRequest('custom/document/format', {
-                content: document.getText(range),
-                range: range,
-            }) as TextEdit
-        ];
+        return this.format(document, range);
     }
 
     async provideDocumentFormattingEdits(
         document: TextDocument,
     ): Promise<TextEdit[]> {
-        const content = document.getText();
-        const range = new Range(
-            document.positionAt(0),
-            document.positionAt(content.length)
-        );
-        const textEdit: TextEdit =
-            await this.client.sendRequest('custom/document/format', {
-                content: content,
-                range: range
-            });
+        return this.format(document, undefined);
+    }
+
+    // Always send the whole document, even for a range request: the formatter
+    // needs full context. The server maps the selection back onto the result.
+    private async format(document: TextDocument, range: Range | undefined): Promise<TextEdit[]> {
+        const edit: DocumentFormatEdit = await this.client.sendRequest('custom/document/format', {
+            content: document.getText(),
+            range: range
+                ? { start: document.offsetAt(range.start), end: document.offsetAt(range.end) }
+                : null,
+        });
         return [
-            new TextEdit(range, textEdit.newText)
+            new TextEdit(
+                new Range(document.positionAt(edit.start), document.positionAt(edit.end)),
+                edit.newText,
+            ),
         ];
     }
 }

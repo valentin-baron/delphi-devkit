@@ -4,6 +4,12 @@ All notable changes to the "delphi-devkit" extension will be documented in this 
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **Correct selection (range) formatting**: formatting a selection previously sent only the selected text to the DDK formatter, which formatted it out of context — a fragment is not valid on its own, so the result lost the enclosing indentation and mis-laid-out anything that depends on surrounding blocks. DevKit now formats the **whole document** and maps the selection back onto the formatted result, so a selection formats exactly as it would as part of the full file. The applied edit still touches only the selected code (the rest of the file is left untouched); a selection that starts or ends in whitespace snaps to the enclosing code; the first selected line's indentation is reformatted too (so a mis-indented leading comment is corrected, not left in place); and a whitespace-only selection is a no-op. The mapping is anchored on non-whitespace characters, so formatter changes that only affect whitespace, line endings (LF ↔ CRLF), or letter case never misalign it, and multibyte text (UTF-16 ↔ UTF-8 offsets) is handled correctly.
+
 ## [2.5.0] - 2026-07-30
 
 ### Added

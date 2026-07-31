@@ -1,3 +1,5 @@
+pub mod range;
+
 use std::path::PathBuf;
 use anyhow::{Result, Context};
 use scopeguard::defer;
