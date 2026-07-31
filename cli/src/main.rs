@@ -108,8 +108,8 @@ enum Commands {
         encoding: Option<String>,
 
         /// Exit with a non-zero process code when the compile fails (mirrors
-        /// the JSON `code`; a cancelled compile exits 2). Off by default so
-        /// existing callers that only parse JSON keep working.
+        /// the JSON `code`). Off by default so existing callers that only parse
+        /// JSON keep working.
         #[arg(long)]
         fail_on_error: bool,
 
@@ -320,8 +320,8 @@ async fn main() -> Result<()> {
                 None => (None, project),
             };
             use commands::CompileOrAmbiguity;
-            // Captured for --fail-on-error: (success, cancelled, code).
-            let mut outcome: Option<(bool, bool, i32)> = None;
+            // Captured for --fail-on-error: (success, code).
+            let mut outcome: Option<(bool, i32)> = None;
             if cli.json {
                 let result = match file_path {
                     Some(p) => {
@@ -336,7 +336,7 @@ async fn main() -> Result<()> {
                 };
                 match result {
                     CompileOrAmbiguity::Output(o) => {
-                        outcome = Some((o.success, o.cancelled, o.code));
+                        outcome = Some((o.success, o.code));
                         println!("{}", serde_json::to_string_pretty(&o)?)
                     }
                     CompileOrAmbiguity::Ambiguity(a) => {
@@ -368,30 +368,22 @@ async fn main() -> Result<()> {
                 };
                 match result {
                     CompileOrAmbiguity::Output(o) => {
-                        outcome = Some((o.success, o.cancelled, o.code));
-                        if o.lines.is_empty() {
-                            print!("{o}");
-                        }
+                        // Output already streamed live via on_progress; just
+                        // capture the outcome for --fail-on-error.
+                        outcome = Some((o.success, o.code));
                     }
                     CompileOrAmbiguity::Ambiguity(a) => print!("{a}"),
                 }
             }
-            // Opt-in: propagate a failed/cancelled compile to the process exit
-            // code. Default (off) keeps the historical exit 0.
+            // Opt-in: propagate a failed compile to the process exit code.
+            // Default (off) keeps the historical exit 0.
             if fail_on_error {
-                if let Some((success, cancelled, code)) = outcome {
+                if let Some((success, code)) = outcome {
                     if !success {
                         let _ = io::stdout().flush();
-                        // Cancelled → dedicated code 2; otherwise mirror the
-                        // compiler exit code (fall back to 1 if it was 0/-1).
-                        let exit_code = if cancelled {
-                            2
-                        } else if code > 0 {
-                            code
-                        } else {
-                            1
-                        };
-                        std::process::exit(exit_code);
+                        // Mirror the compiler exit code (fall back to 1 if it
+                        // was 0/-1 despite the failure).
+                        std::process::exit(if code > 0 { code } else { 1 });
                     }
                 }
             }

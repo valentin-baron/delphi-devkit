@@ -18,6 +18,23 @@ pub struct CompileResult {
     pub success: bool,
     pub cancelled: bool,
     pub code: i32,
+    /// Structured description of what was compiled, lifted from the banner.
+    pub header: CompileHeader,
+}
+
+/// Structured header metadata for a compile, mirroring the banner fields.
+#[derive(Debug, Clone, Default)]
+pub struct CompileHeader {
+    /// The compiled project/target path (or a description for multi-project runs).
+    pub target: String,
+    /// Product name of the compiler, e.g. "Delphi 12.0 Athens".
+    pub compiler: String,
+    /// Effective build configuration (single-project compiles only).
+    pub config: Option<String>,
+    /// Effective target platform (single-project compiles only).
+    pub platform: Option<String>,
+    /// Whether this was a rebuild (Clean;Build) rather than a compile (Clean;Make).
+    pub rebuild: bool,
 }
 
 pub struct Compiler {
@@ -375,10 +392,18 @@ impl Compiler {
         let cancelled = compiler_state::is_cancelled();
         // Treat cancellation as a non-error outcome so no upstream error is logged
         let result = if cancelled { Ok(()) } else { result };
+        let banner = &parameters.banner;
         let compile_result = CompileResult {
             success: compiler_state::is_success(),
             cancelled,
             code: compiler_state::get_code(),
+            header: CompileHeader {
+                target: banner.target.clone(),
+                compiler: banner.compiler_name.clone(),
+                config: banner.config_platform.as_ref().map(|(c, _)| c.clone()),
+                platform: banner.config_platform.as_ref().map(|(_, p)| p.clone()),
+                rebuild: banner.rebuild,
+            },
         };
         CompilerProgress::notify_completed(
             self.client.as_ref(),

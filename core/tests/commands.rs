@@ -150,48 +150,40 @@ fn project_list_display_empty_workspace() {
 //  Display – CompileOutput
 // ═══════════════════════════════════════════════════════════════════════════════
 
+fn sample_output(success: bool, code: i32) -> CompileOutput {
+    CompileOutput {
+        project: "MyProject".into(),
+        project_path: r"C:\proj\MyProject.dproj".into(),
+        compiler: "Delphi 12.0 Athens".into(),
+        config: Some("Release".into()),
+        platform: Some("Win32".into()),
+        action: "compile".into(),
+        success,
+        code,
+        diagnostics: Default::default(),
+    }
+}
+
 #[test]
 fn compile_output_display_success() {
-    let output = CompileOutput {
-        project_name: "MyProject".into(),
-        success: true,
-        cancelled: false,
-        code: 0,
-        lines: vec![],
-        diagnostics: Default::default(),
-    };
+    let output = sample_output(true, 0);
     let display = format!("{}", output);
     assert!(display.contains("compiled successfully"));
 }
 
 #[test]
 fn compile_output_display_failure() {
-    let output = CompileOutput {
-        project_name: "MyProject".into(),
-        success: false,
-        cancelled: false,
-        code: 1,
-        lines: vec!["error line".into()],
-        diagnostics: Default::default(),
-    };
+    let mut output = sample_output(false, 1);
+    output.diagnostics.errors.push(CompileDiagnostic {
+        code: "E2003".into(),
+        file: r"C:\proj\MyProject.dpr".into(),
+        line: 4,
+        message: "Undeclared identifier".into(),
+    });
     let display = format!("{}", output);
     assert!(display.contains("finished with errors"));
     assert!(display.contains("exit code 1"));
-    assert!(display.contains("error line"));
-}
-
-#[test]
-fn compile_output_display_cancelled() {
-    let output = CompileOutput {
-        project_name: "MyProject".into(),
-        success: false,
-        cancelled: true,
-        code: -1,
-        lines: vec![],
-        diagnostics: Default::default(),
-    };
-    let display = format!("{}", output);
-    assert!(display.contains("cancelled"));
+    assert!(display.contains("1 errors"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -259,17 +259,27 @@ pub struct CompileDiagnostics {
     pub hints: Vec<CompileDiagnostic>,
 }
 
-/// Full compilation output.
+/// Full, machine-coded compilation output. Every field is structured — there
+/// is no raw log text; the header banner is split into fields and all
+/// recognised compiler messages live in `diagnostics`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompileOutput {
-    pub project_name: String,
+    /// Project name.
+    pub project: String,
+    /// Absolute path of the compiled project/target.
+    pub project_path: String,
+    /// Compiler product name, e.g. "Delphi 12.0 Athens".
+    pub compiler: String,
+    /// Effective build configuration (e.g. "Release"), if known.
+    pub config: Option<String>,
+    /// Effective target platform (e.g. "Win32"), if known.
+    pub platform: Option<String>,
+    /// `"compile"` (Clean;Make) or `"rebuild"` (Clean;Build).
+    pub action: String,
     pub success: bool,
-    pub cancelled: bool,
     pub code: i32,
-    /// Human-readable, filter-respecting output lines (backwards compatible).
-    pub lines: Vec<String>,
-    /// Structured diagnostics grouped by severity, subject to the same
-    /// `show_warnings` / `show_hints` filters as `lines`.
+    /// Structured diagnostics grouped by severity, subject to the
+    /// `show_warnings` / `show_hints` filters (errors are always included).
     #[serde(default)]
     pub diagnostics: CompileDiagnostics,
 }
@@ -299,22 +309,24 @@ pub struct CompileFilterOptions {
 
 impl fmt::Display for CompileOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let summary = if self.cancelled {
-            format!("Compilation of \"{}\" was cancelled.", self.project_name)
-        } else if self.success {
-            format!(
-                "Project \"{}\" compiled successfully.",
-                self.project_name
-            )
+        if self.success {
+            write!(f, "Project \"{}\" compiled successfully.", self.project)?;
         } else {
-            format!(
+            write!(
+                f,
                 "Compilation of \"{}\" finished with errors (exit code {}).",
-                self.project_name, self.code
-            )
-        };
-        write!(f, "{summary}")?;
-        if !self.lines.is_empty() {
-            write!(f, "\n\nCompiler output:\n{}", self.lines.join("\n"))?;
+                self.project, self.code
+            )?;
+        }
+        let d = &self.diagnostics;
+        if !d.errors.is_empty() || !d.warnings.is_empty() || !d.hints.is_empty() {
+            write!(
+                f,
+                " ({} errors, {} warnings, {} hints)",
+                d.errors.len(),
+                d.warnings.len(),
+                d.hints.len()
+            )?;
         }
         Ok(())
     }
@@ -1303,11 +1315,10 @@ async fn run_compile_collecting(
     filter: CompileFilterOptions,
     on_progress: Option<CompileProgressCallback>,
 ) -> Result<CompileOutput> {
-    // Collect broadcast messages concurrently with compilation.
-    let collected: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let collected_clone = collected.clone();
-    // Structured diagnostics, accumulated independently of the line filters.
+    // Parse structured diagnostics from the broadcast output concurrently with
+    // compilation, and stream every line to the progress callback for live
+    // (human) output. No raw log text is retained — the JSON is fully
+    // machine-coded (structured header + diagnostics).
     let diagnostics: std::sync::Arc<std::sync::Mutex<CompileDiagnostics>> =
         std::sync::Arc::new(std::sync::Mutex::new(CompileDiagnostics::default()));
     let diagnostics_clone = diagnostics.clone();
@@ -1317,78 +1328,72 @@ async fn run_compile_collecting(
 
     let collect_handle = tokio::spawn(async move {
         let mut counts = DiagCounts::default();
-        let emit = |callback: &Option<CompileProgressCallback>,
-                    lines: &mut Vec<String>,
-                    out: Vec<String>| {
+        let stream = |callback: &Option<CompileProgressCallback>, out: Vec<String>| {
             if let Some(cb) = callback {
                 for line in &out {
                     cb(line.clone());
                 }
             }
-            lines.extend(out);
         };
         loop {
             match receiver.recv().await {
-                Ok(event) => {
-                    let mut lines = collected_clone.lock().unwrap();
-                    match event {
-                        CompilerProgressParams::Start { lines: ls }
-                        | CompilerProgressParams::SingleProjectStarted { lines: ls, .. } => {
-                            let out = if filter_opts.trim_banners {
-                                trim_banner_lines(ls)
-                            } else {
-                                ls
-                            };
-                            emit(&progress_callback, &mut lines, out);
-                        }
-                        CompilerProgressParams::Completed { lines: ls, .. }
-                        | CompilerProgressParams::SingleProjectCompleted { lines: ls, .. } => {
-                            // Drain pending per-project diagnostic summary first
-                            // so it appears immediately before the footer.
-                            if filter_opts.summarize_diagnostics {
-                                let summary = counts.drain_summary_lines();
-                                if !summary.is_empty() {
-                                    emit(&progress_callback, &mut lines, summary);
-                                }
-                            } else {
-                                counts.drain_summary_lines();
-                            }
-                            let out = if filter_opts.trim_banners {
-                                trim_banner_lines(ls)
-                            } else {
-                                ls
-                            };
-                            emit(&progress_callback, &mut lines, out);
-                        }
-                        CompilerProgressParams::Stdout { line }
-                        | CompilerProgressParams::Stderr { line } => {
-                            if let Some((kind, diag)) = parse_formatted_diagnostic(&line) {
-                                // The show_warnings/show_hints filters slim the
-                                // output for machine consumers, so they gate
-                                // both lines[] and diagnostics[] uniformly:
-                                // a suppressed severity appears in neither.
-                                let suppress = match kind {
-                                    DiagKind::Warn => !filter_opts.show_warnings,
-                                    DiagKind::Hint => !filter_opts.show_hints,
-                                    DiagKind::Error => false,
-                                };
-                                if suppress {
-                                    if filter_opts.summarize_diagnostics {
-                                        counts.add(&diag_file_basename(&diag.file), kind);
-                                    }
-                                    continue;
-                                }
-                                let mut d = diagnostics_clone.lock().unwrap();
-                                match kind {
-                                    DiagKind::Error => d.errors.push(diag),
-                                    DiagKind::Warn => d.warnings.push(diag),
-                                    DiagKind::Hint => d.hints.push(diag),
-                                }
-                            }
-                            emit(&progress_callback, &mut lines, vec![line]);
-                        }
+                Ok(event) => match event {
+                    CompilerProgressParams::Start { lines: ls }
+                    | CompilerProgressParams::SingleProjectStarted { lines: ls, .. } => {
+                        let out = if filter_opts.trim_banners {
+                            trim_banner_lines(ls)
+                        } else {
+                            ls
+                        };
+                        stream(&progress_callback, out);
                     }
-                }
+                    CompilerProgressParams::Completed { lines: ls, .. }
+                    | CompilerProgressParams::SingleProjectCompleted { lines: ls, .. } => {
+                        // Drain pending per-project diagnostic summary first
+                        // so it appears immediately before the footer.
+                        if filter_opts.summarize_diagnostics {
+                            let summary = counts.drain_summary_lines();
+                            if !summary.is_empty() {
+                                stream(&progress_callback, summary);
+                            }
+                        } else {
+                            counts.drain_summary_lines();
+                        }
+                        let out = if filter_opts.trim_banners {
+                            trim_banner_lines(ls)
+                        } else {
+                            ls
+                        };
+                        stream(&progress_callback, out);
+                    }
+                    CompilerProgressParams::Stdout { line }
+                    | CompilerProgressParams::Stderr { line } => {
+                        if let Some((kind, diag)) = parse_formatted_diagnostic(&line) {
+                            // The show_warnings/show_hints filters slim the
+                            // output for machine consumers, so they gate the
+                            // structured diagnostics and the streamed lines
+                            // uniformly: a suppressed severity appears in neither.
+                            let suppress = match kind {
+                                DiagKind::Warn => !filter_opts.show_warnings,
+                                DiagKind::Hint => !filter_opts.show_hints,
+                                DiagKind::Error => false,
+                            };
+                            if suppress {
+                                if filter_opts.summarize_diagnostics {
+                                    counts.add(&diag_file_basename(&diag.file), kind);
+                                }
+                                continue;
+                            }
+                            let mut d = diagnostics_clone.lock().unwrap();
+                            match kind {
+                                DiagKind::Error => d.errors.push(diag),
+                                DiagKind::Warn => d.warnings.push(diag),
+                                DiagKind::Hint => d.hints.push(diag),
+                            }
+                        }
+                        stream(&progress_callback, vec![line]);
+                    }
+                },
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
             }
@@ -1402,10 +1407,6 @@ async fn run_compile_collecting(
     collect_handle.abort();
     let _ = collect_handle.await;
 
-    let output_lines = match std::sync::Arc::try_unwrap(collected) {
-        Ok(mutex) => mutex.into_inner().unwrap_or_default(),
-        Err(arc) => arc.lock().unwrap().clone(),
-    };
     let output_diagnostics = match std::sync::Arc::try_unwrap(diagnostics) {
         Ok(mutex) => mutex.into_inner().unwrap_or_default(),
         Err(arc) => arc.lock().unwrap().clone(),
@@ -1413,27 +1414,17 @@ async fn run_compile_collecting(
 
     match compile_result {
         Ok(result) => Ok(CompileOutput {
-            project_name,
+            project: project_name,
+            project_path: result.header.target,
+            compiler: result.header.compiler,
+            config: result.header.config,
+            platform: result.header.platform,
+            action: if result.header.rebuild { "rebuild" } else { "compile" }.to_string(),
             success: result.success,
-            cancelled: result.cancelled,
             code: result.code,
-            lines: output_lines,
             diagnostics: output_diagnostics,
         }),
-        Err(e) => {
-            // Still return collected output on failure.
-            if on_progress.is_some() {
-                bail!("Compilation failed: {e}");
-            }
-            bail!(
-                "Compilation failed: {e}{}",
-                if output_lines.is_empty() {
-                    String::new()
-                } else {
-                    format!("\n\nCompiler output:\n{}", output_lines.join("\n"))
-                }
-            );
-        }
+        Err(e) => bail!("Compilation failed: {e}"),
     }
 }
 
