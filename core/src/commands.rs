@@ -229,6 +229,34 @@ impl fmt::Display for SetCompilerResult {
     }
 }
 
+/// A single structured compiler diagnostic.
+///
+/// Parsed from the normalized diagnostic lines ddk already produces, so all
+/// three source compiler formats (dcc32, Delphi 2007 MSBuild wrapper, plain)
+/// collapse into the same shape. Severity is conveyed by which
+/// [`CompileDiagnostics`] group the entry lives in, so it is not repeated here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompileDiagnostic {
+    /// Compiler code, e.g. `"W1035"`.
+    pub code: String,
+    /// Absolute source file path.
+    pub file: String,
+    /// 1-based line number.
+    pub line: u32,
+    pub message: String,
+}
+
+/// Compiler diagnostics grouped by severity.
+///
+/// Always fully populated regardless of the `show_warnings` / `show_hints`
+/// output filters — those only affect the human-readable `lines`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CompileDiagnostics {
+    pub errors: Vec<CompileDiagnostic>,
+    pub warnings: Vec<CompileDiagnostic>,
+    pub hints: Vec<CompileDiagnostic>,
+}
+
 /// Full compilation output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompileOutput {
@@ -236,7 +264,11 @@ pub struct CompileOutput {
     pub success: bool,
     pub cancelled: bool,
     pub code: i32,
+    /// Human-readable, filter-respecting output lines (backwards compatible).
     pub lines: Vec<String>,
+    /// Structured diagnostics grouped by severity; always complete.
+    #[serde(default)]
+    pub diagnostics: CompileDiagnostics,
 }
 
 pub type CompileProgressCallback = std::sync::Arc<dyn Fn(String) + Send + Sync>;
@@ -327,6 +359,69 @@ lazy_static::lazy_static! {
     static ref FORMATTED_DIAG_REGEX: regex::Regex = regex::Regex::new(
         r"^\d{2}:\d{2}:\d{2}\.\d+:\s+\[(?P<kind>WARN|HINT|ERROR)\]\[[A-Z]\d+\]\s+(?P<file>.+?):\d+(?::\d+)?\s+-\s"
     ).unwrap();
+
+    /// Like `FORMATTED_DIAG_REGEX` but captures every field for structured output.
+    static ref FORMATTED_DIAG_FULL_REGEX: regex::Regex = regex::Regex::new(
+        r"^\d{2}:\d{2}:\d{2}\.\d+:\s+\[(?P<kind>WARN|HINT|ERROR)\]\[(?P<code>[A-Z]\d+)\]\s+(?P<file>.+?):(?P<line>\d+)(?::\d+)?\s+-\s(?P<message>.*)$"
+    ).unwrap();
+}
+
+/// Parse a formatted diagnostic line into its severity group and a structured
+/// [`CompileDiagnostic`]. Returns `None` for non-diagnostic lines.
+fn parse_formatted_diagnostic(line: &str) -> Option<(DiagKind, CompileDiagnostic)> {
+    let caps = FORMATTED_DIAG_FULL_REGEX.captures(line)?;
+    let kind = match caps.name("kind")?.as_str() {
+        "WARN" => DiagKind::Warn,
+        "HINT" => DiagKind::Hint,
+        "ERROR" => DiagKind::Error,
+        _ => return None,
+    };
+    let diag = CompileDiagnostic {
+        code: caps.name("code")?.as_str().to_string(),
+        file: caps.name("file")?.as_str().to_string(),
+        line: caps.name("line")?.as_str().parse().ok()?,
+        message: caps.name("message")?.as_str().to_string(),
+    };
+    Some((kind, diag))
+}
+
+#[cfg(test)]
+mod diagnostics_parse_tests {
+    use super::*;
+
+    #[test]
+    fn parses_warning_line() {
+        let line = "15:55:33.909: [WARN][W1035] C:\\proj\\Hello.dpr:7 - \
+                    Rückgabewert der Funktion 'F' könnte undefiniert sein";
+        let (kind, d) = parse_formatted_diagnostic(line).unwrap();
+        assert_eq!(kind, DiagKind::Warn);
+        assert_eq!(d.code, "W1035");
+        assert_eq!(d.file, "C:\\proj\\Hello.dpr");
+        assert_eq!(d.line, 7);
+        assert!(d.message.contains("Rückgabewert"));
+    }
+
+    #[test]
+    fn parses_error_line_with_column() {
+        let line = "10:00:00.000: [ERROR][E2003] C:\\a\\B.pas:12:5 - Undeclared identifier";
+        let (kind, d) = parse_formatted_diagnostic(line).unwrap();
+        assert_eq!(kind, DiagKind::Error);
+        assert_eq!(d.code, "E2003");
+        assert_eq!(d.line, 12);
+        assert_eq!(d.message, "Undeclared identifier");
+    }
+
+    #[test]
+    fn parses_hint_line() {
+        let line = "10:00:00.000: [HINT][H2077] C:\\a\\B.pas:3 - Value assigned to 'x' never used";
+        let (kind, _d) = parse_formatted_diagnostic(line).unwrap();
+        assert_eq!(kind, DiagKind::Hint);
+    }
+
+    #[test]
+    fn ignores_non_diagnostic_line() {
+        assert!(parse_formatted_diagnostic("just some banner text").is_none());
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1228,6 +1323,10 @@ async fn run_compile_collecting(
     let collected: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let collected_clone = collected.clone();
+    // Structured diagnostics, accumulated independently of the line filters.
+    let diagnostics: std::sync::Arc<std::sync::Mutex<CompileDiagnostics>> =
+        std::sync::Arc::new(std::sync::Mutex::new(CompileDiagnostics::default()));
+    let diagnostics_clone = diagnostics.clone();
     let progress_callback = on_progress.clone();
     let filter_opts = filter.clone();
     let mut receiver = CompilerProgress::subscribe();
@@ -1279,6 +1378,16 @@ async fn run_compile_collecting(
                         }
                         CompilerProgressParams::Stdout { line }
                         | CompilerProgressParams::Stderr { line } => {
+                            // Record structured diagnostics unconditionally,
+                            // before any show_warnings/show_hints suppression.
+                            if let Some((kind, diag)) = parse_formatted_diagnostic(&line) {
+                                let mut d = diagnostics_clone.lock().unwrap();
+                                match kind {
+                                    DiagKind::Error => d.errors.push(diag),
+                                    DiagKind::Warn => d.warnings.push(diag),
+                                    DiagKind::Hint => d.hints.push(diag),
+                                }
+                            }
                             if let Some((kind, file)) = classify_diagnostic_line(&line) {
                                 let suppress = match kind {
                                     DiagKind::Warn => !filter_opts.show_warnings,
@@ -1313,6 +1422,10 @@ async fn run_compile_collecting(
         Ok(mutex) => mutex.into_inner().unwrap_or_default(),
         Err(arc) => arc.lock().unwrap().clone(),
     };
+    let output_diagnostics = match std::sync::Arc::try_unwrap(diagnostics) {
+        Ok(mutex) => mutex.into_inner().unwrap_or_default(),
+        Err(arc) => arc.lock().unwrap().clone(),
+    };
 
     match compile_result {
         Ok(result) => Ok(CompileOutput {
@@ -1321,6 +1434,7 @@ async fn run_compile_collecting(
             cancelled: result.cancelled,
             code: result.code,
             lines: output_lines,
+            diagnostics: output_diagnostics,
         }),
         Err(e) => {
             // Still return collected output on failure.

@@ -158,6 +158,7 @@ fn compile_output_display_success() {
         cancelled: false,
         code: 0,
         lines: vec![],
+        diagnostics: Default::default(),
     };
     let display = format!("{}", output);
     assert!(display.contains("compiled successfully"));
@@ -171,6 +172,7 @@ fn compile_output_display_failure() {
         cancelled: false,
         code: 1,
         lines: vec!["error line".into()],
+        diagnostics: Default::default(),
     };
     let display = format!("{}", output);
     assert!(display.contains("finished with errors"));
@@ -186,6 +188,7 @@ fn compile_output_display_cancelled() {
         cancelled: true,
         code: -1,
         lines: vec![],
+        diagnostics: Default::default(),
     };
     let display = format!("{}", output);
     assert!(display.contains("cancelled"));
