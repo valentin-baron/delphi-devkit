@@ -3,11 +3,11 @@
 tower-lsp server wiring the [`delphi-parser`](../parser) analysis engine to an
 editor. This document describes the **document-lifecycle foundation** (Task 8)
 plus the language features layered on it: **definition + hover** (Task 9),
-**find-references** (Task 10), and **completion + signature help** (Task 11). The
-remaining features (rename / semanticTokens) are **separate later tasks**; a
-capability is advertised only once it is actually backed. **rename** in
-particular is *deliberately deferred* (not just unimplemented) — see "Why rename
-is deferred".
+**find-references** (Task 10), **completion + signature help** (Task 11), and
+**semantic tokens / syntax highlighting** (Task 13). The remaining feature
+(**rename**) is a *separate later task*; a capability is advertised only once it
+is actually backed. **rename** in particular is *deliberately deferred* (not just
+unimplemented) — see "Why rename is deferred".
 
 ## Modules
 
@@ -22,7 +22,8 @@ is deferred".
 | `completion.rs` | Maps the parser's context-sensitive `completions` to LSP `CompletionItem`s (kind → `CompletionItemKind`, a short type/kind `detail`). Pure translation — the parser guarantees **member-only after `.`** (or an empty list on an unresolved receiver) and the top-level set otherwise, so **no top-level symbol can leak into a member list**. |
 | `call_context.rs` | `enclosing_call(text, cursor)`: a **forward single-pass** lexing scan that finds the enclosing unclosed `(` and the **active parameter** (top-level comma count), correctly skipping strings (`'…'`, `''` escape), comments (`{…}`, `(*…*)`, `//…`) and balanced `()[]`. Text-only (`callee_offset`, `active_parameter`); `None` when the cursor is in no call, or inside a string/comment. Exhaustively tested (nesting, comma-in-string, comments, multi-line, no-call, index brackets, dotted callee). |
 | `signature.rs` | Composes the callee offset → the parser `signature_help_at` query → an LSP `SignatureHelp`. Per-parameter labels, active parameter **clamped** to each signature's arity. **Never a fabricated signature**: an unresolved / non-routine callee → `None`. |
-| `main.rs` | tower-lsp handlers: `initialize` capabilities, `didOpen`/`didChange`/`didClose` → `analyze` → `publishDiagnostics`, plus `textDocument/definition`, `textDocument/hover`, `textDocument/references`, `textDocument/completion`, and `textDocument/signatureHelp`. |
+| `semantic.rs` | The semanticTokens **legend** (the single source of truth), the parser `SemanticKind → (typeIndex, modifierBitset)` mapping, and the LSP **delta encoder**. Splits any **multi-line span into one token per line** (an unsplit multi-line token corrupts the whole delta stream), computes `length`/`deltaStartChar` in **UTF-16 code units** via `LineIndex`, sorts by `(line, startChar)` and delta-encodes, **skipping** any unmappable/degenerate span (never a panic, never a bad delta). Pure translation over the parser's already-certain classification. |
+| `main.rs` | tower-lsp handlers: `initialize` capabilities, `didOpen`/`didChange`/`didClose` → `analyze` → `publishDiagnostics`, plus `textDocument/definition`, `textDocument/hover`, `textDocument/references`, `textDocument/completion`, `textDocument/signatureHelp`, and `textDocument/semanticTokens/full`. |
 
 ## Capabilities advertised
 
@@ -71,10 +72,36 @@ is deferred".
   receiver and an unqualified top-level call always resolve. Distinguishing the
   best overload for the current arguments needs argument type-checking the query
   layer does not do, so `activeSignature` defaults to `0` (the editor cycles).
+- `semanticTokensProvider` (**Full**; Range off) — `textDocument/semanticTokens/full`.
+  Whole-buffer syntax highlighting, **additive over the editor's TextMate
+  grammar**. The parser's `semantic_tokens` query classifies each token and emits
+  one **only when the classification is CERTAIN** — lexically certain tokens
+  (keyword / comment / string / number / `{$…}` directive / operator), structurally
+  certain **declaration / member / parameter NAME** sites (with the `declaration`
+  modifier), and identifier **usages** resolved unambiguously cross-unit. An
+  **unresolved or ambiguous identifier is OMITTED** (no token) so the editor's own
+  TextMate color shows — **never a wrong semantic color**. The server splits any
+  multi-line span into one token per line, computes UTF-16 lengths/deltas via
+  `LineIndex`, sorts and delta-encodes, and skips any unmappable span (`semantic.rs`).
+  The advertised **legend** is `semantic::legend()`, the *same* ordered arrays the
+  encoder indexes into — the legend and the `SemanticKind → (typeIndex,
+  modifierBitset)` mapping live in one place and cannot drift.
 
-The remaining feature providers — **rename** / semanticTokens — stay **off**; a
-capability is only advertised once it is actually backed. See below for why
-**rename is deliberately deferred**.
+  **Legend — token types** (index order): `namespace`, `type`, `class`,
+  `interface`, `enum`, `enumMember`, `parameter`, `variable`, `property`,
+  `function`, `method`, `keyword`, `comment`, `string`, `number`, `operator`,
+  `macro`. **Modifiers**: `declaration` (bit 0). `SemanticKind` → LSP type:
+  Keyword→`keyword`, Comment→`comment`, String→`string`, Number→`number`,
+  Operator→`operator`, Macro→`macro`, Namespace→`namespace`, Type→`type`,
+  Class→`class`, Interface→`interface`, Enum→`enum`, EnumMember→`enumMember`,
+  Parameter→`parameter`, Variable→`variable`, Property→`property`,
+  Function→`function`, Method→`method`; Field and Constant have no dedicated
+  standard type and map to `variable` (the closest correct-not-wrong choice —
+  coloring a field as a `property` would be a *wrong* semantic).
+
+The remaining feature provider — **rename** — stays **off**; a capability is only
+advertised once it is actually backed. See below for why **rename is deliberately
+deferred**.
 
 ### Why rename is deferred (not advertised)
 
@@ -160,12 +187,11 @@ from the LSP notifications, not a second OS watcher.
 
 ## Deferred to later feature tasks
 
-- **definition, hover, references, completion, and signatureHelp are now wired**
-  (Tasks 9–11). The remaining language-feature providers (**semanticTokens**) are
-  still deferred. The parser query API
+- **definition, hover, references, completion, signatureHelp, and semanticTokens
+  are now wired** (Tasks 9–11, 13). The parser query API
   (`ProjectSession::{symbol_at, definition, hover_info, references, completions,
-  signature_help, signature_help_at}`) backs each; only the semanticTokens
-  handler + capability remain.
+  signature_help, signature_help_at, semantic_tokens}`) backs each. No feature
+  provider besides **rename** remains deferred.
 - **rename is deferred, not merely unimplemented** (Task 10 Deliverable B): a
   correct+complete rename requires scope-resolved bindings the parser does not
   yet have (over-approximation over-renames; declaration-only under-renames).
