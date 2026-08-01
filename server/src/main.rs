@@ -1,3 +1,5 @@
+mod positions;
+
 use anyhow::Result;
 use tokio::io::{stdin, stdout};
 use tower_lsp::{Client, async_trait, jsonrpc};
