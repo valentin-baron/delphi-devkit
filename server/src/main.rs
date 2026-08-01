@@ -3,6 +3,7 @@ mod completion;
 mod diagnostics;
 mod documents;
 mod hover;
+mod indexing;
 mod locations;
 mod positions;
 mod progress;
@@ -83,6 +84,12 @@ struct DelphiLsp {
     /// so concurrent operations (multiple `analyze`s, task-18 indexing) never
     /// collide on a token. See [`progress::ProgressTokens`].
     progress_tokens: Arc<progress::ProgressTokens>,
+    /// Task 18 — the monotonic activity/cancel token for background indexing.
+    /// `did_open`/`did_change` and every feature handler bump it (foreground
+    /// activity); the idle ticker snapshots it before its debounce and starts a
+    /// pass only if it is unchanged, and a running pass checks it between units
+    /// and cancels the instant it changes. See [`indexing::IndexGeneration`].
+    index_generation: Arc<indexing::IndexGeneration>,
 }
 
 /// The monotonic publish-slot decision, extracted so the out-of-order race is
@@ -134,7 +141,164 @@ impl DelphiLsp {
             // the client advertised support.
             client_supports_progress: Arc::new(AtomicBool::new(false)),
             progress_tokens: Arc::new(progress::ProgressTokens::new()),
+            index_generation: Arc::new(indexing::IndexGeneration::new()),
         }
+    }
+
+    /// Record foreground activity so any in-flight/pending background indexing
+    /// yields to the editor (Task 18): bumps the cancel/generation token. Called
+    /// on the entry of every request that represents the user interacting —
+    /// `didOpen`/`didChange` and every feature handler — so a running pass
+    /// cancels at its next between-units check and a pending idle-debounce
+    /// declines to start. Cheap (one relaxed atomic add); safe to call on every
+    /// request. FOREGROUND WINS.
+    fn note_foreground_activity(&self) {
+        self.index_generation.bump();
+    }
+
+    /// Run ONE background indexing pass over the project's own units (Task 18).
+    ///
+    /// Enumerates the project's `.pas` units (excluding the RTL/VCL tree),
+    /// processes them ONE bounded unit at a time — each under a fresh per-unit
+    /// session-lock acquisition released before the next — trimming the arena
+    /// between units, reporting progress, and cancelling the instant foreground
+    /// activity bumps the generation past `start_generation`.
+    ///
+    /// FOREGROUND RESPONSIVENESS: the lock is taken per unit inside
+    /// [`session::SessionManager::index_unit`] and released between units, so a
+    /// foreground request never waits more than one unit's parse. CANCELATION:
+    /// checked before every unit; the first bump stops the pass with no
+    /// half-state (each unit's parse+persist is atomic). BOUNDED RAM: per-unit
+    /// budget + `trim_arena` between units + moka eviction keep RAM flat across
+    /// the whole pass. NEVER WRONG: warming only improves completeness.
+    ///
+    /// Best-effort throughout: no session, an empty work list, a failed unit, or
+    /// a progress failure never affects correctness — the pass simply does less
+    /// warming.
+    async fn run_indexing_pass(&self, start_generation: u64) {
+        // Resolve the active project inputs and ensure a session is open — the
+        // same resolution `analyze`/`didSave` use, so the pass targets the right
+        // project cache.
+        let inputs = session::resolve_active_project_inputs().await;
+        self.session
+            .ensure_open(
+                inputs.dproj.clone(),
+                inputs.configuration.clone(),
+                inputs.platform.clone(),
+                inputs.profile.clone(),
+                inputs.standard_source_paths.clone(),
+            )
+            .await;
+
+        // Enumerate the project's own unit directories (dproj dir + project
+        // search paths, excluding the RTL/VCL standard source dirs), then the
+        // deterministic sorted `.pas` work list within them.
+        let Some(directories) = self
+            .session
+            .project_unit_directories(inputs.dproj.as_deref(), &inputs.standard_source_paths)
+            .await
+        else {
+            return; // no session open → nothing to index.
+        };
+        let units = indexing::project_unit_paths(&directories, &inputs.standard_source_paths);
+        if units.is_empty() {
+            return;
+        }
+        let total = units.len();
+
+        // A single work-done progress for the whole pass ("Delphi: indexing",
+        // "N/M — <unit>"). Best-effort — `None` when the client doesn't support
+        // it; the pass runs identically.
+        let mut progress = self
+            .begin_progress("Delphi: indexing", Some(format!("0/{total}")))
+            .await;
+
+        let mut indexed = 0usize;
+        for (position, path) in units.iter().enumerate() {
+            // CANCELATION: a foreground event since the pass began bumps the
+            // generation → stop promptly, leaving what was already indexed (each
+            // unit was atomic). Checked BEFORE the unit so a bump is honored
+            // before another unit's parse can start.
+            if self.index_generation.changed_since(start_generation) {
+                break;
+            }
+
+            let outcome = self.session.index_unit(path.clone()).await;
+            if matches!(outcome, indexing::UnitIndexOutcome::NoSession) {
+                // The session went away (re-open for a different identity, or a
+                // failure). Nothing more to index this pass.
+                break;
+            }
+            if matches!(outcome, indexing::UnitIndexOutcome::Indexed) {
+                indexed += 1;
+            }
+
+            // Progress: "N/M — <unit-file>", percentage over the work list.
+            if let Some(reporter) = progress.as_ref() {
+                let unit_label = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let done = position + 1;
+                let percentage = ((done * 100) / total) as u32;
+                reporter
+                    .report(Some(percentage), Some(format!("{done}/{total} — {unit_label}")))
+                    .await;
+            }
+
+            // Yield between units so the async executor can run any queued
+            // foreground task before the next unit's parse — reinforcing the
+            // lock-release non-interference (the lock is already released by
+            // `index_unit`; this hands the executor a scheduling point too).
+            tokio::task::yield_now().await;
+        }
+
+        if let Some(reporter) = progress.take() {
+            reporter
+                .end(Some(format!("indexed {indexed}/{total}")))
+                .await;
+        }
+    }
+
+    /// Spawn the idle-triggered background indexer (Task 18). Owns a `DelphiLsp`
+    /// clone (shared Arcs), so it drives the real session/generation.
+    ///
+    /// The loop is a lightweight ticker: every [`IDLE_TICK`] it snapshots the
+    /// activity generation, waits [`IDLE_DEBOUNCE`], and — if the generation is
+    /// STILL the snapshot (no `didOpen`/`didChange`/feature request arrived
+    /// during the debounce, i.e. the editor is idle) — runs one warming pass at
+    /// that generation. A foreground event during the pass bumps the generation
+    /// and the pass cancels itself between units. After a pass (or a preemption)
+    /// the loop returns to ticking, so a later idle window runs another pass that
+    /// resumes where freshness left off (already-indexed units are skipped).
+    ///
+    /// This lives OUTSIDE the request path: it never blocks a request, and its
+    /// only shared state is the generation atomic + the session lock (taken per
+    /// unit inside the pass, never across the whole loop).
+    fn spawn_idle_indexer(self) {
+        /// How often the idle ticker wakes to check for an idle window.
+        const IDLE_TICK: std::time::Duration = std::time::Duration::from_millis(500);
+        /// The editor must be quiet this long (no foreground event) before a pass
+        /// starts — the spec's 1.5–2s debounce.
+        const IDLE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(IDLE_TICK).await;
+                // Snapshot the generation, then wait the debounce. If ANY
+                // foreground activity bumped it during the wait, the editor is not
+                // idle — skip this window and re-check next tick.
+                let snapshot = self.index_generation.current();
+                tokio::time::sleep(IDLE_DEBOUNCE).await;
+                if self.index_generation.changed_since(snapshot) {
+                    continue;
+                }
+                // Idle: run one warming pass at this generation. It self-cancels
+                // between units the instant a foreground event bumps the
+                // generation past `snapshot`.
+                self.run_indexing_pass(snapshot).await;
+            }
+        });
     }
 
     /// Begin a server-initiated `window/workDoneProgress` titled `title` (with an
@@ -1001,6 +1165,12 @@ impl LanguageServer for DelphiLsp {
 
     async fn initialized(&self, _params: InitializedParams) {
         lsp_info!(self.client, "Delphi LSP server initialized");
+        // Task 18: start the idle-triggered background indexer. It watches the
+        // activity generation and, after a quiet debounce, runs one warming pass;
+        // any foreground event bumps the generation and preempts it. A `DelphiLsp`
+        // clone shares the same Arcs (session, generation, client), so the spawned
+        // task drives the real session.
+        self.clone().spawn_idle_indexer();
     }
 
     async fn shutdown(&self) -> jsonrpc::Result<()> {
@@ -1053,6 +1223,8 @@ impl LanguageServer for DelphiLsp {
     // across the (blocking) parse.
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        // Foreground activity: preempt any background indexing (Task 18).
+        self.note_foreground_activity();
         let document = params.text_document;
         {
             let mut store = self.documents.lock().await;
@@ -1062,6 +1234,9 @@ impl LanguageServer for DelphiLsp {
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        // Foreground activity: preempt any background indexing (Task 18) so the
+        // editor's edit is never made to wait behind a warming pass.
+        self.note_foreground_activity();
         let uri = params.text_document.uri;
         let version = params.text_document.version;
         let updated = {
@@ -1145,6 +1320,7 @@ impl LanguageServer for DelphiLsp {
         &self,
         params: GotoDefinitionParams,
     ) -> jsonrpc::Result<Option<GotoDefinitionResponse>> {
+        self.note_foreground_activity();
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         Ok(self
@@ -1160,6 +1336,7 @@ impl LanguageServer for DelphiLsp {
     // definition — and format them as markdown. No honest facts → `None`, never
     // a fabricated signature.
     async fn hover(&self, params: HoverParams) -> jsonrpc::Result<Option<Hover>> {
+        self.note_foreground_activity();
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         Ok(self.resolve_hover(uri, position).await)
@@ -1175,6 +1352,7 @@ impl LanguageServer for DelphiLsp {
     // `context.include_declaration`. No symbol under the cursor → `None`. The
     // parser work runs on `spawn_blocking` behind the session lock.
     async fn references(&self, params: ReferenceParams) -> jsonrpc::Result<Option<Vec<Location>>> {
+        self.note_foreground_activity();
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let include_declaration = params.context.include_declaration;
@@ -1193,6 +1371,7 @@ impl LanguageServer for DelphiLsp {
         &self,
         params: CompletionParams,
     ) -> jsonrpc::Result<Option<CompletionResponse>> {
+        self.note_foreground_activity();
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         Ok(self
@@ -1211,6 +1390,7 @@ impl LanguageServer for DelphiLsp {
         &self,
         params: SignatureHelpParams,
     ) -> jsonrpc::Result<Option<SignatureHelp>> {
+        self.note_foreground_activity();
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         Ok(self.resolve_signature_help(uri, position).await)
@@ -1228,6 +1408,7 @@ impl LanguageServer for DelphiLsp {
         &self,
         params: SemanticTokensParams,
     ) -> jsonrpc::Result<Option<SemanticTokensResult>> {
+        self.note_foreground_activity();
         let uri = params.text_document.uri;
         Ok(self.resolve_semantic_tokens(uri).await)
     }

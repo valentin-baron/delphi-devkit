@@ -262,6 +262,108 @@ impl SessionManager {
         .await;
     }
 
+    /// Index ONE project unit for the background pass (Task 18): parse it from
+    /// DISK (via [`ProjectSession::parse_source_file`], budgeted per Task-22 —
+    /// bounded), which persists its AST and populates the reference index, then
+    /// `trim_arena()` so the arena stays at ~one unit across the whole pass.
+    ///
+    /// FOREGROUND RESPONSIVENESS: this takes the session lock for exactly ONE
+    /// unit's parse and releases it before returning, so a foreground
+    /// `analyze`/read that arrives between units waits at most one unit's parse.
+    /// The caller (the idle loop) MUST call this per unit and check its cancel
+    /// token between calls — never fold the whole pass under one lock acquisition.
+    ///
+    /// FRESHNESS: a unit already resident in the cache under its (folded) key is
+    /// skipped WITHOUT re-parsing ([`UnitIndexOutcome::AlreadyFresh`]) — the
+    /// snapshot load at `open` is hash-validated, so a resident entry is fresh
+    /// (a stale one was dropped on load / invalidated by the watcher). `unit_key`
+    /// is the file stem folded via the project context's `intern_key`.
+    ///
+    /// Best-effort: a parse failure returns [`UnitIndexOutcome::Failed`] (logged
+    /// by the caller), never aborting the pass — a failed warm-up simply leaves
+    /// that unit un-indexed, which is always correct (just less complete).
+    pub async fn index_unit(&self, path: PathBuf) -> crate::indexing::UnitIndexOutcome {
+        use crate::indexing::{unit_stem, UnitIndexOutcome};
+
+        let session_handle = self.session.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            let mut guard = session_handle.blocking_lock();
+            let Some(project_session) = guard.as_mut() else {
+                return UnitIndexOutcome::NoSession;
+            };
+
+            // Freshness skip: a unit already cached under its folded key is fresh
+            // (hash-validated at load; a stale one would have been dropped). Skip
+            // it without re-parsing so a warm pass over an already-indexed project
+            // is cheap and idempotent.
+            if let Some(stem) = unit_stem(&path) {
+                let unit_key = project_session.context().intern_key(&stem);
+                if matches!(
+                    project_session.context().unit_cache.get(unit_key),
+                    Some(delphi_parser::unit_cache::CacheEntry::Done(_))
+                ) {
+                    return UnitIndexOutcome::AlreadyFresh;
+                }
+            }
+
+            let outcome = match project_session.parse_source_file(&path) {
+                Ok(_) => UnitIndexOutcome::Indexed,
+                Err(_) => UnitIndexOutcome::Failed,
+            };
+            // SAFE CHECKPOINT (Task-19): the parse ran and its meta is owned by
+            // the cache — no arena `&str`/`&[u8]` borrow from this parse is live.
+            // Still under the session `blocking_lock()`, before it releases. Bound
+            // the disk-content arena so a unit that pulled a `uses` graph into the
+            // arena does not leave it resident across the pass — this is the
+            // per-unit trim that keeps RAM flat across thousands of units.
+            project_session.trim_arena();
+            outcome
+        })
+        .await;
+
+        joined.unwrap_or(UnitIndexOutcome::Failed)
+    }
+
+    /// The project's OWN unit directories for the background indexer: the dproj
+    /// directory plus every project `DCC_UnitSearchPath` entry, EXCLUDING the
+    /// standard RTL/VCL source directories (`standard_source_paths` — Task 22's
+    /// one-time bootstrap owns those). Returns `None` when no session is open.
+    ///
+    /// The project search paths are read from the open session's context; the
+    /// standard paths are supplied by the caller (the same list it passed to
+    /// `ensure_open`), so the two sets are separated even though the parser
+    /// merges them into one search-path list at open.
+    pub async fn project_unit_directories(
+        &self,
+        dproj: Option<&Path>,
+        standard_source_paths: &[PathBuf],
+    ) -> Option<Vec<PathBuf>> {
+        let session_handle = self.session.clone();
+        let excluded: std::collections::BTreeSet<PathBuf> = standard_source_paths
+            .iter()
+            .filter_map(|dir| dir.canonicalize().ok())
+            .collect();
+        let dproj_directory = dproj
+            .and_then(|path| path.parent().map(Path::to_path_buf));
+
+        let guard = session_handle.lock().await;
+        let project_session = guard.as_ref()?;
+        let mut directories: Vec<PathBuf> = Vec::new();
+        if let Some(directory) = dproj_directory {
+            directories.push(directory);
+        }
+        for path in &project_session.context().search_paths {
+            // Exclude a search path that IS (canonically) a standard source dir —
+            // the parser merged the standard paths into `search_paths` at open, so
+            // filter them back out here by canonical identity.
+            match path.canonicalize() {
+                Ok(canonical) if excluded.contains(&canonical) => continue,
+                _ => directories.push(path.clone()),
+            }
+        }
+        Some(directories)
+    }
+
     /// A file was SAVED to disk: parse it from DISK (via
     /// [`ProjectSession::parse_source_file`], so the file AND its imports enter
     /// the cache as PERSISTABLE on-disk units — not the virtual editor buffer),
