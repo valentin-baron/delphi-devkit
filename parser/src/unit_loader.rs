@@ -957,4 +957,153 @@ mod tests {
         };
         assert!(Arc::ptr_eq(&first, &second));
     }
+
+    /// Write a straight chain of `count` units `Chain0..Chain{count-1}` where each
+    /// `ChainI` (except the last) `uses ChainI+1` and, via a
+    /// `{$IF Declared(Marker{I+1})}` directive, force-parses `ChainI+1`
+    /// mid-interface. So a Full parse of `Chain0` transitively force-loads the
+    /// ENTIRE tail — one per link — an unbounded cascade unless the budget caps
+    /// it. `MarkerI` is declared in `ChainI`, so the directive in `ChainI-1`
+    /// resolves only after `ChainI` is parsed.
+    fn write_force_load_chain(directory: &std::path::Path, count: usize) {
+        for index in 0..count {
+            let marker = format!("const Marker{index} = True;");
+            let source = if index + 1 < count {
+                format!(
+                    "unit Chain{index};\ninterface\nuses Chain{next};\n\
+                     {marker}\n\
+                     {{$IF Declared(Marker{next})}} const Reached{next} = True; {{$IFEND}}\n\
+                     implementation\nend.",
+                    next = index + 1
+                )
+            } else {
+                format!("unit Chain{index};\ninterface\n{marker}\nimplementation\nend.")
+            };
+            std::fs::write(directory.join(format!("Chain{index}.pas")), source).unwrap();
+        }
+    }
+
+    /// BOUND PROOF (Task-22): a Full parse whose transitive `{$IF Declared}`
+    /// closure is LARGER than the budget force-loads AT MOST `budget` units — the
+    /// didSave / navigation RAM bound. Uses an explicit small budget so the test
+    /// is fast and the cap is unambiguous; the far tail of the chain is proven
+    /// ABSENT from the cache (never force-loaded), and `loads_done` is capped.
+    #[test]
+    fn full_parse_transitive_load_is_capped_at_budget() {
+        let directory = temp_directory("budget_cap");
+        // A 40-link chain: strictly longer than the 8-unit budget below, so the
+        // cascade would run 39 transitive loads without the cap.
+        let chain_length = 40;
+        write_force_load_chain(&directory, chain_length);
+
+        let context = test_context(vec![directory.clone()]);
+        let arena = crate::globals::arena();
+        let budget = 8usize;
+        let loader = UnitLoader::with_store_and_mode(
+            arena,
+            context.clone(),
+            None,
+            None,
+            LoadMode::Budgeted(budget),
+        );
+
+        let file = arena.load(directory.join("Chain0.pas")).unwrap();
+        let (_outcome, meta) =
+            pipeline::parse_and_cache(&arena, &context, file, Some(loader.clone())).unwrap();
+        // Chain0 itself parsed successfully.
+        assert!(meta.is_some());
+
+        // The transitive force-loads are capped at the budget — never the whole
+        // 39-unit tail. This is the load-cap that bounds peak RAM.
+        assert!(
+            loader.loads_done() <= budget,
+            "transitive loads {} exceeded budget {budget}",
+            loader.loads_done()
+        );
+
+        // The NEAR closure (within budget) landed in the cache; the FAR tail is
+        // absent — proving the cascade was truncated, not merely counted. Chain1
+        // (the first forced load) is present; a deep link past the budget is not.
+        assert!(
+            context.unit_cache.get(context.intern_key("CHAIN1")).is_some(),
+            "the first forced import must load (under budget)"
+        );
+        let far = format!("CHAIN{}", chain_length - 1);
+        assert!(
+            context.unit_cache.get(context.intern_key(&far)).is_none(),
+            "the far tail {far} must be absent — the cascade was capped, not run to the end"
+        );
+
+        // The count of distinct forced ChainI units in the cache never exceeds the
+        // budget (Chain0 is the explicitly-parsed root, not a transitive load).
+        let cached_chain_units = (1..chain_length)
+            .filter(|index| {
+                context
+                    .unit_cache
+                    .get(context.intern_key(&format!("CHAIN{index}")))
+                    .is_some()
+            })
+            .count();
+        assert!(
+            cached_chain_units <= budget,
+            "{cached_chain_units} forced units cached, budget was {budget}"
+        );
+    }
+
+    /// The existing small force-load chain (well under `MAX_TRANSITIVE_LOADS`)
+    /// still fully resolves under the DEFAULT Full budget — the didSave /
+    /// navigation precision that must survive the cap. A 5-link chain (4
+    /// transitive loads ≪ 32) reaches its end: every `Reached{I}` marker appears.
+    #[test]
+    fn small_chain_fully_resolves_under_default_budget() {
+        let directory = temp_directory("budget_small");
+        let chain_length = 5;
+        write_force_load_chain(&directory, chain_length);
+
+        let context = test_context(vec![directory.clone()]);
+        let arena = crate::globals::arena();
+        // Default Full budget (MAX_TRANSITIVE_LOADS) — the didSave/navigation path.
+        let loader = UnitLoader::new(arena, context.clone(), None);
+
+        let file = arena.load(directory.join("Chain0.pas")).unwrap();
+        let (_outcome, meta) =
+            pipeline::parse_and_cache(&arena, &context, file, Some(loader.clone())).unwrap();
+        assert!(meta.is_some());
+
+        // Under budget, the whole tail resolved: the last link is in the cache and
+        // the load count equals the chain's transitive length (4), well under 32.
+        let far = format!("CHAIN{}", chain_length - 1);
+        assert!(
+            context.unit_cache.get(context.intern_key(&far)).is_some(),
+            "small chain must resolve to its end under the default budget"
+        );
+        assert!(loader.loads_done() <= MAX_TRANSITIVE_LOADS);
+        assert_eq!(loader.loads_done(), chain_length - 1);
+    }
+
+    /// RESIDENT-ONLY (budget 0, the editor buffer parse) force-loads NOTHING on a
+    /// miss: parsing `Chain0` leaves its imported `Chain1` ABSENT from the cache
+    /// (the Task-21 behavior, now expressed as `Budgeted(0)`). `loads_done`
+    /// stays 0.
+    #[test]
+    fn resident_only_loads_nothing_on_a_miss() {
+        let directory = temp_directory("budget_resident");
+        write_force_load_chain(&directory, 3);
+
+        let context = test_context(vec![directory.clone()]);
+        let arena = crate::globals::arena();
+        let loader = UnitLoader::with_store_resident_only(arena, context.clone(), None, None);
+
+        let file = arena.load(directory.join("Chain0.pas")).unwrap();
+        let (_outcome, meta) =
+            pipeline::parse_and_cache(&arena, &context, file, Some(loader.clone())).unwrap();
+        // Chain0 parses (its own buffer), but its `{$IF Declared(Marker1)}` could
+        // not force-load Chain1 — that import stays out of the cache.
+        assert!(meta.is_some());
+        assert_eq!(loader.loads_done(), 0, "resident-only must force-load nothing");
+        assert!(
+            context.unit_cache.get(context.intern_key("CHAIN1")).is_none(),
+            "resident-only must not pull Chain1 into the cache on a miss"
+        );
+    }
 }
