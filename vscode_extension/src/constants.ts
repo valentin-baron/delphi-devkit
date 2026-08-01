@@ -89,6 +89,9 @@ export namespace PROJECTS {
   export namespace STATUS_BAR {
     export const COMPILER = 'ddk.statusBar.projects.compiler';
     export const COMPILATION = 'ddk.statusBar.projects.compilation';
+    /** The persistent language-server status item (Task 24). A distinct id from
+     *  the compiler items above so the two never collide in the status bar. */
+    export const SERVER_STATUS = 'ddk.statusBar.serverStatus';
   }
 
   export namespace SCHEME {

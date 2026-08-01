@@ -1,7 +1,7 @@
 import {
-    LanguageClient, LanguageClientOptions, ServerOptions, TransportKind
+    LanguageClient, LanguageClientOptions, ServerOptions, State, TransportKind
 } from 'vscode-languageclient/node';
-import { Disposable, DocumentFormattingEditProvider, DocumentRangeFormattingEditProvider, ExtensionMode, languages, Range, TextDocument, TextEdit, window, workspace } from 'vscode';
+import { commands, Disposable, DocumentFormattingEditProvider, DocumentRangeFormattingEditProvider, ExtensionMode, languages, Range, TextDocument, TextEdit, window, workspace } from 'vscode';
 import { Runtime } from './runtime';
 import { Entities } from './projects/entities';
 import { UUID } from 'crypto';
@@ -9,6 +9,11 @@ import { join } from 'path';
 import { existsSync } from 'fs';
 import { CompilerOutputDefinitionProvider } from './projects/compiler/language';
 import { PROJECTS } from './constants';
+import { ServerStatusBar, ServerStatusParams } from './serverStatus';
+
+/** Command id that reveals the "DDK Server" output channel — the click action of
+ *  the persistent server-status item. */
+const REVEAL_SERVER_OUTPUT = 'ddk.serverStatus.revealOutput';
 
 /**
  * The fields `UpdateProject` accepts server-side — the mirror of Rust's
@@ -111,6 +116,10 @@ export class DDK_Client {
     private client: LanguageClient;
     private compilerLinkProvider = new CompilerOutputDefinitionProvider();
     private compilerProgressListeners = new Set<(progressParams: CompilerProgressParams) => void>();
+    /** The persistent language-server status item (Task 24), created in
+     *  `initialize` once the client exists and disposed on client stop /
+     *  deactivate. */
+    private serverStatusBar?: ServerStatusBar;
 
     public addCompilerProgressListener(callback: (progressParams: CompilerProgressParams) => void): void {
         this.compilerProgressListeners.add(callback);
@@ -179,6 +188,36 @@ export class DDK_Client {
             'notifications/compiler/progress',
             this.onCompilerProgress.bind(this)
         );
+        // Persistent language-server status view (Task 24). A dedicated status bar
+        // item, separate from the compiler items, driven by the best-effort
+        // `ddk/serverStatus` notification the server pushes. Complementary to the
+        // task-17 transient progress spinner — this shows the standing state
+        // (Ready / Analyzing <file> / Indexing N/M).
+        Runtime.extension.subscriptions.push(
+            commands.registerCommand(REVEAL_SERVER_OUTPUT, () => {
+                // Reveal the "DDK Server" output channel on click.
+                this.client.outputChannel.show(true);
+            })
+        );
+        this.serverStatusBar = new ServerStatusBar(REVEAL_SERVER_OUTPUT);
+        Runtime.extension.subscriptions.push(this.serverStatusBar);
+        this.client.onNotification(
+            'ddk/serverStatus',
+            (status: ServerStatusParams) => {
+                this.serverStatusBar?.render(status);
+            }
+        );
+        // Dispose the status item when the client stops (server exited/crashed) so
+        // it never lingers showing a stale "Ready" after the server is gone. The
+        // subscription above is the deactivate-time safety net; this handles a
+        // mid-session stop. Registered before `start()` so no state change is
+        // missed.
+        this.client.onDidChangeState((event) => {
+            if (event.newState === State.Stopped) {
+                this.serverStatusBar?.dispose();
+                this.serverStatusBar = undefined;
+            }
+        });
         await this.client.start();
         await this.refresh();
         Runtime.extension.subscriptions.push(
