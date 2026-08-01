@@ -77,6 +77,43 @@ pub enum CompletionKind {
     Builtin,
 }
 
+/// The declared facts of the symbol under a cursor, for `textDocument/hover`.
+///
+/// Resolved through the SAME cross-unit machinery as [`crate::driver::ProjectSession::definition`]:
+/// a hover over an imported symbol carries the IMPORTED declaration's facts (its
+/// kind, declared type, directives, visibility), not a guess. The never-wrong
+/// rule holds: a cursor that resolves to no interface declaration (an unknown
+/// identifier, an implementation-only local) yields `None`, never fabricated
+/// facts. When the declared type is anonymous/complex the parser does not
+/// capture a simple key for (`type_key` is `None`), the devkit shows the KIND
+/// only — never an invented type string.
+#[derive(Debug, Clone)]
+pub struct HoverInfo {
+    /// Display spelling of the resolved declaration (as written at its
+    /// declaration site).
+    pub display: Identifier,
+    /// What the symbol is — a top-level symbol kind or a member kind.
+    pub kind: CompletionKind,
+    /// The declared simple type key (field/property/var/const type or a
+    /// method's return type), when the parser captured one. `None` for an
+    /// anonymous/complex type or a symbol with no meaningful type (a type
+    /// declaration, a procedure) — the devkit then shows kind only.
+    pub type_key: Option<Identifier>,
+    /// Method directive keys (`virtual`/`override`/`abstract`/…), in source
+    /// order. Empty for non-methods.
+    pub directives: Vec<Identifier>,
+    /// The declaration's visibility (only meaningful for a member; a top-level
+    /// symbol carries `Unspecified`).
+    pub visibility: Visibility,
+    /// The owning type's key when the symbol is a member (`Owner.Member`),
+    /// `None` for a top-level symbol.
+    pub owner_type: Option<Identifier>,
+    /// The span of the OCCURRENCE under the cursor (not the declaration) — the
+    /// devkit maps this to the hover's highlight range in the requesting
+    /// document.
+    pub occurrence: CodeLocation,
+}
+
 /// Where a diagnostic came from, so the devkit can group/filter them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagnosticSource {

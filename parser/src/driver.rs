@@ -555,6 +555,76 @@ impl ProjectSession {
         Vec::new()
     }
 
+    /// The declared facts of the symbol under `position` in `unit_key`'s source,
+    /// for `textDocument/hover`. Resolves the occurrence via [`Self::symbol_at`],
+    /// then its DECLARATION (own interface first, else imports in reverse uses
+    /// order via the loader) through the SAME cross-unit machinery as
+    /// [`Self::definition`] — a hover over an imported symbol shows the imported
+    /// declaration's facts.
+    ///
+    /// Never-wrong rule: a cursor over an identifier that resolves to no
+    /// interface declaration (an unknown name, an implementation-only local, a
+    /// member on an unresolved owner) yields `None` — never fabricated facts. An
+    /// anonymous/complex declared type the parser did not reduce to a simple key
+    /// leaves `type_key` `None`; the caller then shows the KIND only.
+    pub fn hover_info(&self, unit_key: Identifier, position: u32) -> Option<crate::query::HoverInfo> {
+        let meta = self.meta_of(unit_key)?;
+        let target = self.symbol_at(unit_key, position)?;
+        let occurrence = target.location;
+
+        // A member occurrence (`Owner.Member`, or a member declaration site):
+        // resolve the owner, then read the member's facts.
+        if let Some(owner_key) = target.owner_type {
+            return self.member_hover(&meta, owner_key, target.key, occurrence);
+        }
+
+        // A top-level symbol: own interface first, then imports (reverse uses
+        // order), identical resolution order to `definition`.
+        if let Some(symbol) = meta.interface().find(target.key) {
+            return Some(symbol_hover(symbol, occurrence));
+        }
+        let loader = self.make_loader();
+        for import in imports_reversed(&meta) {
+            if let crate::parse_state::LoadOutcome::Loaded(imported) = loader.interface_of(import) {
+                if let Some(symbol) = imported.interface().find(target.key) {
+                    return Some(symbol_hover(symbol, occurrence));
+                }
+            }
+        }
+        // The occurrence resolves to no interface declaration — unknown, not
+        // wrong. None (the caller shows no hover).
+        None
+    }
+
+    /// Hover facts for `member_key` on type `owner_key`: resolve the owner (own
+    /// interface first, then imports) and read the member's kind/type/directives/
+    /// visibility. `None` if the owner or the member is unresolved (never
+    /// fabricated facts).
+    fn member_hover(
+        &self,
+        meta: &UnitMeta,
+        owner_key: Identifier,
+        member_key: Identifier,
+        occurrence: CodeLocation,
+    ) -> Option<crate::query::HoverInfo> {
+        if let Some(owner) = meta.interface().find(owner_key) {
+            return owner
+                .find_member(member_key)
+                .map(|member| member_hover(member, owner_key, occurrence));
+        }
+        let loader = self.make_loader();
+        for import in imports_reversed(meta) {
+            if let crate::parse_state::LoadOutcome::Loaded(imported) = loader.interface_of(import) {
+                if let Some(owner) = imported.interface().find(owner_key) {
+                    return owner
+                        .find_member(member_key)
+                        .map(|member| member_hover(member, owner_key, occurrence));
+                }
+            }
+        }
+        None
+    }
+
     /// Every recorded occurrence of `symbol_key` across all cached units (the
     /// candidate set — see [`crate::references`] for the over-approximation
     /// note). Consistent with invalidation: an evicted unit's occurrences are
@@ -984,6 +1054,42 @@ fn member_completion(member: &crate::unit_cache::MemberSymbol) -> Completion {
     }
 }
 
+/// Build [`crate::query::HoverInfo`] from a top-level interface symbol. A
+/// top-level symbol carries no simple declared-type key in the derived index
+/// (only members do) and `Unspecified` visibility — honest kind-only facts.
+fn symbol_hover(
+    symbol: &crate::unit_cache::InterfaceSymbol,
+    occurrence: CodeLocation,
+) -> crate::query::HoverInfo {
+    crate::query::HoverInfo {
+        display: symbol.name,
+        kind: CompletionKind::Symbol(symbol.kind),
+        type_key: symbol_declared_type_key(symbol),
+        directives: Vec::new(),
+        visibility: crate::ast::Visibility::Unspecified,
+        owner_type: None,
+        occurrence,
+    }
+}
+
+/// Build [`crate::query::HoverInfo`] from a type member, carrying its declared
+/// type key (when simple), directives, visibility and owning type.
+fn member_hover(
+    member: &crate::unit_cache::MemberSymbol,
+    owner_key: Identifier,
+    occurrence: CodeLocation,
+) -> crate::query::HoverInfo {
+    crate::query::HoverInfo {
+        display: member.name,
+        kind: CompletionKind::Member(member.kind),
+        type_key: member.type_key,
+        directives: member.directives.clone(),
+        visibility: member.visibility,
+        owner_type: Some(owner_key),
+        occurrence,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1354,6 +1460,89 @@ mod tests {
         // unresolved target → empty, never a wrong location
         let ghost = session.definition(client_key, session.context.intern_key("Nonexistent"), None);
         assert!(ghost.is_empty());
+    }
+
+    #[test]
+    fn hover_info_resolves_facts_own_member_cross_unit_and_unknown() {
+        use crate::query::CompletionKind;
+        use crate::unit_cache::MemberKind;
+
+        let directory = temp_directory("query_hover");
+        std::fs::write(
+            directory.join("Models.pas"),
+            "unit Models;\ninterface\n\
+             type TUser = class\n  Name: string;\n  procedure Greet; virtual;\nend;\n\
+             implementation\nend.",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("Client.pas"),
+            "unit Client;\ninterface\nuses Models;\n\
+             type TManager = class\n  Boss: TUser;\nend;\n\
+             implementation\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("Client.pas")).unwrap();
+        let client_key = session.context.intern_key("CLIENT");
+        let models_key = session.context.intern_key("MODELS");
+
+        // Hover over the `Boss: TUser` FIELD declaration in Client: a member
+        // whose declared type key is `TUser`, kind Field, owner TManager.
+        let client_meta = session.meta_of(client_key).unwrap();
+        let manager = client_meta
+            .interface()
+            .find(session.context.intern_key("TManager"))
+            .unwrap();
+        let boss = manager.find_member(session.context.intern_key("Boss")).unwrap();
+        let hover = session
+            .hover_info(client_key, boss.location.span.start)
+            .expect("hover over the Boss field");
+        assert_eq!(hover.kind, CompletionKind::Member(MemberKind::Field));
+        assert_eq!(hover.owner_type, Some(session.context.intern_key("TManager")));
+        assert_eq!(
+            hover.type_key,
+            Some(session.context.intern_key("TUser")),
+            "the field's declared type is captured"
+        );
+
+        // CROSS-UNIT hover: over the `TUser` occurrence in Client (`Boss: TUser`)
+        // resolves to the imported type declaration's facts (kind Type). This
+        // also loads Models into the cache as an import (dependency-recorded).
+        let client_src = std::fs::read_to_string(directory.join("Client.pas")).unwrap();
+        let tuser_offset = client_src.find("TUser").unwrap() as u32;
+        let cross = session
+            .hover_info(client_key, tuser_offset)
+            .expect("hover over the imported TUser resolves cross-unit");
+        assert_eq!(cross.kind, CompletionKind::Symbol(crate::unit_cache::SymbolKind::Type));
+        assert_eq!(crate::globals::resolve(cross.display), "TUser");
+
+        // Hover over the `Greet` METHOD declaration in Models: directives carry
+        // `virtual`. (Models is now cached from the cross-unit resolution above.)
+        let models_meta = session.meta_of(models_key).expect("Models cached");
+        let user = models_meta
+            .interface()
+            .find(session.context.intern_key("TUser"))
+            .unwrap();
+        let greet = user.find_member(session.context.intern_key("Greet")).unwrap();
+        let method_hover = session
+            .hover_info(models_key, greet.location.span.start)
+            .expect("hover over the Greet method");
+        assert_eq!(method_hover.kind, CompletionKind::Member(MemberKind::Method));
+        assert!(
+            method_hover
+                .directives
+                .contains(&session.context.intern_key("virtual")),
+            "the method's `virtual` directive is surfaced: {:?}",
+            method_hover.directives
+        );
+
+        // Unknown identifier → None, never fabricated facts.
+        assert!(
+            session.hover_info(client_key, 100_000).is_none(),
+            "an out-of-range cursor has no hover"
+        );
     }
 
     #[test]
