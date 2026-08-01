@@ -932,6 +932,66 @@ value: uncertainty → Unknown/None throughout (esp. L6 mixed-width, L9 fold).
   is unverified; the ordinal-ASCII + byte-identical choice is the safe direction
   (never over-matches), revisit only if a real non-ASCII-identifier case appears.
 
+## Iteration 15 work log (2026-08-02) — SAME-UNIT SCOPE RESOLUTION + .unit COMPRESSION
+
+Driven by live-VS-Code testing feedback (three complaints): (a) "no LSP
+functionality works, not even same-unit variable jump", (b) `.unit` files ~1.5MB,
+(c) indexing not visible in the status bar. Diagnosed each against the running
+`ddk-server` over a scripted stdio JSON-RPC harness (`scratchpad/smoke.mjs`).
+
+- **Diagnosis (the crux).** Wiring was NOT broken: interface types/routines DO
+  jump + hover (proven live). The real gap — the implementation section was never
+  parsed into an AST (`ast::Unit` stopped at `implementation_uses`, a literal
+  `// todo: implementation index`); `collect_implementation_usages` was a flat
+  token scan. So `symbol_at`/`definition` resolved ONLY names matching a top-level
+  interface symbol. A LOCAL variable/parameter (impl-section) had no indexed
+  declaration → the reported "variable jump" gap. Complaint (c): the `.unit`
+  files the user saw are written by didSave (Analyzing), not idle indexing; the
+  status stream (Ready→Analyzing→Ready, `$/progress`) works — verified live.
+
+- **.unit compression + format v12→v13→v14** (commit 42e6de0). All persistence
+  (per-unit `.unit` files AND the bulk snapshot) routes through
+  `serialize_meta`/`decode_segment`: `[magic "DUC1" | version u32 | DEFLATE(
+  bincode(UnitMeta))]`. The interface AST is highly repetitive → several-fold
+  smaller on disk. Old headerless segments decode to None → self-heal via
+  re-parse. Test: `segment_is_compressed_versioned_and_roundtrips`.
+
+- **Scope resolution Stage 0+1** (commit 453e2a8). Parse the impl section into
+  per-routine scopes on `UnitMeta.impl_scopes: Vec<ImplRoutine>` (name,
+  owner_type_key, body_span, params, locals with a simple `type_key`), serialized
+  (format v13→v14, `#[serde(default)]`, weigher term). `symbol_at`/`definition_at`
+  /`hover` resolve a body identifier to its enclosing routine's param/local,
+  SCOPE-BEFORE-INTERFACE (a local shadows a same-named interface symbol).
+  NEVER-WRONG gate: `impl_scopes_reliable` — any impl construct the scanner can't
+  track cleanly (asm, inline structured local types, unbalanced end, unexpected
+  token) flips the flag and scope lookups return None (fall back to interface).
+  ADVERSARIAL REVIEW found + fixed two wrong-answer paths: member access `Obj.X`
+  must not bind a local `X` (dot guard); a nested routine's reference to an OUTER
+  local must be found before falling through to the interface (walk covering
+  routines tightest→widest). Live smoke: `Local` (local var) now jumps to its
+  decl.
+
+- **Scope-resolution coverage** (commit 7343b9b). The scanner no longer bails on
+  a leading `class` method modifier (`class function TFoo.Bar`) or an impl-level
+  `var`/`const`/`type`/`threadvar`/`resourcestring`/`label` section — it captures
+  class methods and SKIPS declaration sections (balancing structured
+  `class/record/… end` decls; a variant-record `case` shares the record's `end`
+  and does NOT deepen), continuing to later routines; anything unbalanceable
+  degrades (never a wrong body_span). Real-code probe
+  (`scope_reliability_over_core_tree`, local-tests, over `Intern/src` +
+  `Components/BECOMP`, 820 units): units capturing 0 scopes despite routine
+  headers **300 → 0**; routines captured **6828 → 17745**; 98.4% reliable, 13
+  degraded, 0 parse-failed.
+
+- Tests: **281 portable (+1 ignored) parser + 118 server**, all green.
+- **Format-version delta:** v11 → v12 (compression header) → wait: single bump to
+  v13 (compression) then v14 (impl_scopes). Old snapshots reject cleanly.
+- **STILL OPEN (next):** Stage 3 — member access via a typed receiver
+  (`Local.Value` → resolve `Local`'s `type_key` then the member); currently
+  returns null. Status-bar `Indexing N/M` visibility in a real project (wiring
+  present; needs a live project run to confirm). Task #22 RTL/System bootstrap
+  remains an explicit deferred decision.
+
 ## Next iteration start here
 
 ~~Deep type parse~~ DONE (it. 7). ~~Member symbols v5~~ DONE (it. 7).
