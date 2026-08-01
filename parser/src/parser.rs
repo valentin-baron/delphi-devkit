@@ -523,6 +523,10 @@ impl UnitParser<'_> {
         let location = error_location(&error).unwrap_or_else(|| self.cursor.last_location());
         self.cursor.push_diagnostic(
             location,
+            // Error-tolerant recovery DROPPED a declaration — the interface is
+            // incomplete (missing symbol feeds wrong go-to-def/completion), a
+            // real Warning the user should see, not a hint.
+            crate::token_cursor::Severity::Warning,
             format!("interface declaration dropped by error recovery: {error:?}"),
         );
         self.resync_to_declaration_boundary(open_blocks)
@@ -1400,6 +1404,10 @@ impl UnitParser<'_> {
         for attribute in std::mem::take(&mut self.pending_attributes) {
             self.cursor.push_diagnostic(
                 attribute.location,
+                // A dropped attribute at a section boundary is benign for
+                // analysis (it attached to nothing) — surface it as a Hint, not
+                // a warning about broken code.
+                crate::token_cursor::Severity::Hint,
                 "attribute before `implementation` has no declaration to attach \
                  to; ignored (invalid Delphi)",
             );

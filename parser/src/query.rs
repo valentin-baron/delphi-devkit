@@ -17,6 +17,7 @@
 use crate::ast::Visibility;
 use crate::context::Identifier;
 use crate::meta::CodeLocation;
+use crate::token_cursor::Severity;
 use crate::unit_cache::{MemberKind, SymbolKind};
 
 /// What the identifier under a cursor position resolves to.
@@ -158,6 +159,11 @@ pub enum DiagnosticSource {
     Parse,
     /// A DFM↔PAS linker finding (dangling component, missing handler, …).
     Dfm,
+    /// A cross-unit ANALYSIS finding, computed on demand rather than during the
+    /// parse (currently the conservative unused-uses hint). Kept distinct from
+    /// [`Self::Parse`] so the devkit can group/filter "you might remove this"
+    /// advice separately from real parse findings.
+    Analysis,
 }
 
 /// One diagnostic in the unit's unified list (parse + dfm), for
@@ -165,6 +171,11 @@ pub enum DiagnosticSource {
 #[derive(Debug, Clone)]
 pub struct UnifiedDiagnostic {
     pub source: DiagnosticSource,
+    /// Per-finding severity, set at the creation site (a syntax error is an
+    /// Error, an unknown `{$IF}` a Warning, a benign note Information, an
+    /// unused-uses candidate a Hint). The server maps this 1:1 onto LSP
+    /// `DiagnosticSeverity` — it is NOT a blanket default.
+    pub severity: Severity,
     /// The `.pas` source location the finding refers to, when one exists. Parse
     /// findings always carry one. A DFM finding carries a pas location only when
     /// it names a concrete pas member (e.g. a type mismatch points at the

@@ -203,6 +203,24 @@ impl DfmDiagnostic {
         }
     }
 
+    /// This finding's severity. A HARD finding — a component/handler that
+    /// genuinely cannot resolve (ancestor-less form), or a name that resolves but
+    /// with the wrong type — is a [`Severity::Warning`]. A NOTE — the form class
+    /// isn't declared here, or an unresolved member that a base form MIGHT still
+    /// declare — is a [`Severity::Hint`]: honest, non-alarming, never claiming a
+    /// definite defect.
+    pub fn severity(&self) -> crate::token_cursor::Severity {
+        use crate::token_cursor::Severity;
+        match self {
+            DfmDiagnostic::DanglingComponent { .. }
+            | DfmDiagnostic::ComponentTypeMismatch { .. }
+            | DfmDiagnostic::MissingHandler { .. } => Severity::Warning,
+            DfmDiagnostic::FormClassNotFound { .. }
+            | DfmDiagnostic::UnresolvedComponentPossiblyInherited { .. }
+            | DfmDiagnostic::UnresolvedHandlerPossiblyInherited { .. } => Severity::Hint,
+        }
+    }
+
     /// The byte offset into the dfm file this finding refers to.
     pub fn dfm_offset(&self) -> usize {
         match self {

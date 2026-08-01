@@ -400,6 +400,10 @@ impl ProjectSession {
             .iter()
             .map(|diagnostic| UnifiedDiagnostic {
                 source: DiagnosticSource::Parse,
+                // Carry the per-finding severity the cursor/parser chose at the
+                // creation site (unknown `{$IF}` → Warning, dropped attribute →
+                // Hint, …) — never re-flatten it here.
+                severity: diagnostic.severity,
                 location: Some(diagnostic.location),
                 dfm_offset: None,
                 message: diagnostic.message.clone(),
@@ -952,6 +956,7 @@ impl ProjectSession {
             for diagnostic in &links.diagnostics {
                 all.push(UnifiedDiagnostic {
                     source: DiagnosticSource::Dfm,
+                    severity: diagnostic.severity(),
                     location: diagnostic.pas_location(),
                     dfm_offset: Some(diagnostic.dfm_offset()),
                     message: diagnostic.message(),

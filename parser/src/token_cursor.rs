@@ -66,11 +66,32 @@ pub enum UnknownConditionPolicy {
     AssumeTrue,
 }
 
+/// How serious a diagnostic is. Set at the CREATION SITE (the code that emits a
+/// finding knows its kind); the server maps this 1:1 onto LSP
+/// `DiagnosticSeverity`. This is NOT defaulted blindly — each site chooses:
+/// - [`Severity::Error`]   — a real syntax error in code the user must fix
+///   (lexer error in an active region, an unrecoverable parse failure).
+/// - [`Severity::Warning`] — a recovered-but-lossy situation (a dropped
+///   declaration after error resync, an unknown `{$IF}` assumed one way, a
+///   hard DFM finding like a dangling component).
+/// - [`Severity::Information`] — a deliberate, benign lossy note (a pseudo-include
+///   placeholder, a DFM "possibly inherited"/"form class not found" note).
+/// - [`Severity::Hint`]    — an advisory the user may act on but need not (an
+///   unused-uses candidate; a dropped attribute at a section boundary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    Error,
+    Warning,
+    Information,
+    Hint,
+}
+
 /// Non-fatal finding collected during cursor movement.
 #[derive(Debug)]
 pub struct Diagnostic {
     pub location: CodeLocation,
     pub message: String,
+    pub severity: Severity,
 }
 
 pub struct TokenCursor<'arena> {
@@ -131,11 +152,18 @@ impl<'arena> TokenCursor<'arena> {
 
     /// Record a non-fatal parser finding. Lets the grammar layer surface a
     /// deliberate-but-lossy situation (e.g. an attribute discarded at a section
-    /// boundary) instead of swallowing it silently.
-    pub fn push_diagnostic(&mut self, location: CodeLocation, message: impl Into<String>) {
+    /// boundary) instead of swallowing it silently. The caller chooses the
+    /// [`Severity`] — the grammar layer knows the kind of finding it is emitting.
+    pub fn push_diagnostic(
+        &mut self,
+        location: CodeLocation,
+        severity: Severity,
+        message: impl Into<String>,
+    ) {
         self.diagnostics.push(Diagnostic {
             location,
             message: message.into(),
+            severity,
         });
     }
 
@@ -348,6 +376,10 @@ impl<'arena> TokenCursor<'arena> {
                 let assumed = matches!(self.unknown_policy, UnknownConditionPolicy::AssumeTrue);
                 self.diagnostics.push(Diagnostic {
                     location,
+                    // An unknown `{$IF}` silently picks a branch (AssumeFalse by
+                    // default); a whole guarded region may be wrongly kept or
+                    // dropped, so this is a real Warning, not a benign note.
+                    severity: Severity::Warning,
                     message: format!(
                         "condition '{expression}' is not evaluable; assuming {assumed}"
                     ),
@@ -426,6 +458,9 @@ impl<'arena> TokenCursor<'arena> {
             "DATE" | "TIME" | "DATETIME" => {
                 self.diagnostics.push(Diagnostic {
                     location,
+                    // A build-metadata placeholder is irrelevant to analysis —
+                    // an informational note, not a warning about the code.
+                    severity: Severity::Information,
                     message: format!("{{$I %{variable}%}}: build timestamp replaced by placeholder"),
                 });
                 format!("<{upper}>")
@@ -435,6 +470,9 @@ impl<'arena> TokenCursor<'arena> {
                 Err(_) => {
                     self.diagnostics.push(Diagnostic {
                         location,
+                        // An unset pseudo-include variable splices an empty
+                        // string — a benign informational note, not a warning.
+                        severity: Severity::Information,
                         message: format!(
                             "{{$I %{variable}%}}: variable not set, spliced empty string"
                         ),

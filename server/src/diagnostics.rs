@@ -14,6 +14,7 @@
 
 use delphi_parser::meta::FileId;
 use delphi_parser::query::{DiagnosticSource, UnifiedDiagnostic};
+use delphi_parser::token_cursor::Severity;
 use tower_lsp::lsp_types::{
     Diagnostic, DiagnosticSeverity, Position, Range,
 };
@@ -78,18 +79,26 @@ fn top_of_document() -> Range {
     }
 }
 
-/// Honest severity. The parser's findings are warnings by nature (an unknown
-/// `{$IF}`, a recovered declaration, a dangling dfm component) — they do not
-/// necessarily mean the code fails to compile, so they map to WARNING, not
-/// ERROR. Sharper per-finding severities are a later refinement.
-fn severity_of(_diagnostic: &UnifiedDiagnostic) -> DiagnosticSeverity {
-    DiagnosticSeverity::WARNING
+/// Map the parser's per-finding [`Severity`] onto LSP `DiagnosticSeverity`
+/// one-to-one. The parser sets an accurate severity at each creation site (a
+/// lexer error → Error, an unknown `{$IF}`/recovered declaration/hard dfm
+/// finding → Warning, a benign note → Information, an unused-uses candidate or
+/// dropped attribute → Hint), so this is a pure translation — never a blanket
+/// default.
+fn severity_of(diagnostic: &UnifiedDiagnostic) -> DiagnosticSeverity {
+    match diagnostic.severity {
+        Severity::Error => DiagnosticSeverity::ERROR,
+        Severity::Warning => DiagnosticSeverity::WARNING,
+        Severity::Information => DiagnosticSeverity::INFORMATION,
+        Severity::Hint => DiagnosticSeverity::HINT,
+    }
 }
 
 fn source_label(source: DiagnosticSource) -> &'static str {
     match source {
         DiagnosticSource::Parse => "delphi",
         DiagnosticSource::Dfm => "delphi-dfm",
+        DiagnosticSource::Analysis => "delphi-analysis",
     }
 }
 
@@ -101,6 +110,7 @@ mod tests {
     fn parse_diag(file: FileId, start: usize, end: usize, message: &str) -> UnifiedDiagnostic {
         UnifiedDiagnostic {
             source: DiagnosticSource::Parse,
+            severity: Severity::Warning,
             location: Some(CodeLocation {
                 file,
                 span: Span::new(start, end),
@@ -151,6 +161,7 @@ mod tests {
         let buffer = FileId(3);
         let dfm = UnifiedDiagnostic {
             source: DiagnosticSource::Dfm,
+            severity: Severity::Warning,
             location: None,
             dfm_offset: Some(42),
             message: "dangling component Ghost".to_string(),
@@ -159,5 +170,40 @@ mod tests {
         assert_eq!(diagnostics[0].range, top_of_document());
         assert!(diagnostics[0].message.contains("dfm offset 42"));
         assert_eq!(diagnostics[0].source.as_deref(), Some("delphi-dfm"));
+    }
+
+    /// Part A: the per-finding severity maps 1:1 onto LSP `DiagnosticSeverity`
+    /// — it is NOT a blanket WARNING. Each parser `Severity` variant lands on
+    /// its exact LSP counterpart.
+    #[test]
+    fn severity_maps_one_to_one_not_all_warning() {
+        let index = LineIndex::new("unit X;\n");
+        let buffer = FileId(1);
+        let make = |severity: Severity, source: DiagnosticSource| UnifiedDiagnostic {
+            source,
+            severity,
+            location: Some(CodeLocation { file: buffer, span: Span::new(0, 4) }),
+            dfm_offset: None,
+            message: "m".to_string(),
+        };
+        let cases = [
+            (Severity::Error, DiagnosticSeverity::ERROR),
+            (Severity::Warning, DiagnosticSeverity::WARNING),
+            (Severity::Information, DiagnosticSeverity::INFORMATION),
+            (Severity::Hint, DiagnosticSeverity::HINT),
+        ];
+        for (parser_severity, lsp_severity) in cases {
+            let mapped = to_lsp_diagnostics(&[make(parser_severity, DiagnosticSource::Parse)], buffer, &index);
+            assert_eq!(mapped[0].severity, Some(lsp_severity));
+        }
+        // an Analysis (unused-uses) Hint carries the analysis source label and
+        // the HINT severity.
+        let analysis = to_lsp_diagnostics(
+            &[make(Severity::Hint, DiagnosticSource::Analysis)],
+            buffer,
+            &index,
+        );
+        assert_eq!(analysis[0].severity, Some(DiagnosticSeverity::HINT));
+        assert_eq!(analysis[0].source.as_deref(), Some("delphi-analysis"));
     }
 }
