@@ -380,6 +380,33 @@ mod tests {
     }
 
     #[test]
+    fn multi_line_string_splits_into_per_line_tokens() {
+        // The per-line split is KIND-AGNOSTIC: a multi-line `String` token must
+        // split exactly like the multi-line comment case above (one token per
+        // line, none spanning a line). This closes the coverage gap the spec
+        // called out. Byte layout mirrors the comment test:
+        // line0: "'start"   (0..6), then '\n' at 6
+        // line1: "middle"   (7..13), then '\n' at 13
+        // line2: "end'"     (14..18)
+        // The whole string span is 0..18.
+        let text = "'start\nmiddle\nend'";
+        let index = LineIndex::new(text.to_string());
+        let tokens = vec![token(0, 18, SemanticKind::String, SemanticModifiers::NONE)];
+        let encoded = encode(&tokens, &index);
+        // One token PER line the string covers → 3 tokens, none spanning a line.
+        assert_eq!(encoded.len(), 3, "a 3-line string splits into 3 tokens: {encoded:?}");
+        let string_type = type_index(SemanticKind::String);
+        assert!(encoded.iter().all(|token| token.token_type == string_type));
+
+        // Line 0: from char 0, length = "'start" = 6 UTF-16 units.
+        assert_eq!((encoded[0].delta_line, encoded[0].delta_start, encoded[0].length), (0, 0, 6));
+        // Line 1: deltaLine 1, absolute start 0, length = "middle" = 6.
+        assert_eq!((encoded[1].delta_line, encoded[1].delta_start, encoded[1].length), (1, 0, 6));
+        // Line 2: deltaLine 1, absolute start 0, length = "end'" = 4.
+        assert_eq!((encoded[2].delta_line, encoded[2].delta_start, encoded[2].length), (1, 0, 4));
+    }
+
+    #[test]
     fn utf16_length_and_delta_after_multibyte_and_astral() {
         // Line: "// ä😀 x" then a keyword-ish token after the emoji.
         // '//' comment covers the whole line; but here we test a token AFTER a
@@ -511,6 +538,43 @@ mod tests {
                 "{kind:?} maps to an in-range legend index"
             );
         }
+
+        // Range-checking alone would pass even if the legend and the index map
+        // were SWAPPED (a Class↔Interface swap mis-colors everything while every
+        // index stays in range). Assert the legend entry AT each kind's index IS
+        // the semantically-correct `SemanticTokenType` — this is the guard that
+        // actually catches a legend/index swap.
+        let expected: &[(SemanticKind, SemanticTokenType)] = &[
+            (SemanticKind::Namespace, SemanticTokenType::NAMESPACE),
+            (SemanticKind::Type, SemanticTokenType::TYPE),
+            (SemanticKind::Class, SemanticTokenType::CLASS),
+            (SemanticKind::Interface, SemanticTokenType::INTERFACE),
+            (SemanticKind::Enum, SemanticTokenType::ENUM),
+            (SemanticKind::EnumMember, SemanticTokenType::ENUM_MEMBER),
+            (SemanticKind::Parameter, SemanticTokenType::PARAMETER),
+            (SemanticKind::Property, SemanticTokenType::PROPERTY),
+            (SemanticKind::Function, SemanticTokenType::FUNCTION),
+            (SemanticKind::Method, SemanticTokenType::METHOD),
+            (SemanticKind::Keyword, SemanticTokenType::KEYWORD),
+            (SemanticKind::Comment, SemanticTokenType::COMMENT),
+            (SemanticKind::String, SemanticTokenType::STRING),
+            (SemanticKind::Number, SemanticTokenType::NUMBER),
+            (SemanticKind::Operator, SemanticTokenType::OPERATOR),
+            (SemanticKind::Macro, SemanticTokenType::MACRO),
+            // `Variable`, and the `Field`/`Constant` kinds that lack a dedicated
+            // standard type, all map to `variable`.
+            (SemanticKind::Variable, SemanticTokenType::VARIABLE),
+            (SemanticKind::Field, SemanticTokenType::VARIABLE),
+            (SemanticKind::Constant, SemanticTokenType::VARIABLE),
+        ];
+        for (kind, expected_type) in expected {
+            assert_eq!(
+                &legend.token_types[type_index(*kind) as usize],
+                expected_type,
+                "{kind:?} must resolve to {expected_type:?} via its legend index"
+            );
+        }
+
         // The declaration modifier maps to a valid modifier bit.
         assert!(!legend.token_modifiers.is_empty());
         assert_eq!(modifier_bitset(SemanticModifiers::DECLARATION), 1);
