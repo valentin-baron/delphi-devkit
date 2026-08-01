@@ -15,17 +15,28 @@ yet.
 | `documents.rs` | `DocumentStore`: `Url → { version, LineIndex }` for open editor buffers (the authoritative unsaved text). Applies incremental **and** full `didChange` edits through the position mapper; ignores stale (older-version) changes. |
 | `session.rs` | Bridges ddk-core project/compiler config → parser `CompilerProfile`; owns the parser `ProjectSession` behind an async lock; opens per active project with a graceful **no-dproj fallback** context. |
 | `diagnostics.rs` | Maps the parser's `UnifiedDiagnostic`s to LSP `Diagnostic`s. Only a location **in the analyzed buffer** gets an exact byte-mapped range; a DFM-only offset (or a location in another file) is anchored at the top of the document — **never a fabricated pas range**. |
-| `main.rs` | tower-lsp handlers: `initialize` capabilities, `didOpen`/`didChange`/`didClose` → `analyze` → `publishDiagnostics`. |
+| `locations.rs` | `code_location_to_lsp`: maps a parser `CodeLocation` (a byte span into *some* parsed file) to an LSP `Location`, computing the `Range` from the **TARGET file's own text** — the open-document `LineIndex` when that file is a buffer, else a `LineIndex` built from `arena.content(file)`. Returns `None` (never a fabricated `Location`) for a virtual/non-file target or unreadable content. Shared navigation primitive for definition/hover. |
+| `hover.rs` | Formats the parser's `HoverInfo` into a fenced `delphi` hover signature. Renders only facts the parser captured — a field/property's known type, a method's directives, the owning type — and shows **kind only** when the declared type is anonymous (`type_key` None): **never a fabricated type/return type**. |
+| `main.rs` | tower-lsp handlers: `initialize` capabilities, `didOpen`/`didChange`/`didClose` → `analyze` → `publishDiagnostics`, plus `textDocument/definition` and `textDocument/hover`. |
 
 ## Capabilities advertised
 
 - `textDocumentSync = INCREMENTAL` — the editor streams open/change/close.
 - Pushed diagnostics via `textDocument/publishDiagnostics` (needs no capability
   flag).
+- `definitionProvider` — `textDocument/definition`. The identifier under the
+  cursor → its declaration site(s), own-unit or **cross-file**, each mapped to a
+  `Location` from the **target file's own text**. An unresolved target → **no
+  jump** (empty), never a wrong one.
+- `hoverProvider` — `textDocument/hover`. The symbol under the cursor → its
+  declared facts (kind, declared type, method directives, visibility, owning
+  type), resolved **cross-unit** through the same machinery as definition, and
+  rendered as a fenced `delphi` signature. No honest facts → **None**, never a
+  fabricated type.
 
-Everything else stays **off**. No definition/completion/references/hover/
-rename/signatureHelp/semanticTokens provider is claimed — a capability is only
-advertised once it is actually backed.
+The remaining feature providers — completion / references / rename /
+signatureHelp / semanticTokens — stay **off**; a capability is only advertised
+once it is actually backed.
 
 ## Async / lock model (why it can't deadlock or block the executor)
 
@@ -84,10 +95,16 @@ from the LSP notifications, not a second OS watcher.
 
 ## Deferred to later feature tasks
 
-- Language-feature providers (definition/references/completion/hover/rename/
-  signatureHelp/semanticTokens) — the parser query API
-  (`ProjectSession::{symbol_at, definition, references, completions}`) already
-  exists; only the LSP request handlers + capabilities remain.
+- **definition and hover are now wired** (Task 9). The remaining language-feature
+  providers (references / completion / rename / signatureHelp / semanticTokens)
+  are still deferred — the parser query API
+  (`ProjectSession::{symbol_at, definition, hover_info, references, completions}`)
+  already exists; only the LSP request handlers + capabilities remain.
+- **Interface ↔ implementation method jump** (Task 9 Deliverable D) is deferred:
+  the parser does not yet structurally capture implementation-section method
+  headers (`procedure TFoo.Bar; begin … end;`), so the jump has no data and was
+  NOT faked. Ledgered as parser SESSION.md **#40** with a capture-and-map plan;
+  `definition`/`hover` resolve the interface declaration today.
 - **Per-document project resolution.** The foundation uses the *active* project
   for the session; matching an arbitrary opened file to the project that owns it
   (by search-path membership) is a refinement.
