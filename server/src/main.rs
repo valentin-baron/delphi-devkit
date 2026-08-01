@@ -242,10 +242,6 @@ impl DelphiLsp {
             let store = self.documents.lock().await;
             store.get(&uri)?.text().to_string()
         };
-        // Snapshot the document store so the blocking task can tell whether a
-        // TARGET file is open (reusing its live line index) without taking the
-        // async store lock across the parse.
-        let documents = { self.documents.lock().await.clone() };
 
         // Ensure a session is open for the active project (same as `analyze`).
         let inputs = session::resolve_active_project_inputs().await;
@@ -273,7 +269,7 @@ impl DelphiLsp {
             // Identifier under the cursor → its declaration site(s), each mapped
             // to an LSP Location from the TARGET file's own text. Unresolved or
             // unmappable → None (never a fabricated jump).
-            locations::resolve_definition_locations(project_session, &documents, unit_key, offset)
+            locations::resolve_definition_locations(project_session, unit_key, offset)
         })
         .await;
 

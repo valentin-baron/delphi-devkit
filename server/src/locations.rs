@@ -11,13 +11,19 @@
 //! line in the wrong file; that is exactly the "never a wrong answer" failure the
 //! parser's query layer refuses to make, mirrored here at the LSP boundary.
 //!
-//! Sources of the target file's text, in preference order:
-//! 1. the open-document store, when the target file is a buffer the editor holds
-//!    (unsaved edits live only there — the authoritative text, and its
-//!    `LineIndex` is already built, so no re-read);
-//! 2. otherwise the parser arena's decoded content for that file
-//!    (`arena.content(file)`), the source of truth for any parsed-but-not-open
-//!    file.
+//! Source of the target file's text: ALWAYS the parser arena's decoded content
+//! for the span's own file (`arena.content(location.file)`). The span's byte
+//! offsets index the exact text the arena parsed, so a `LineIndex` built from
+//! that same content is guaranteed consistent with the span — regardless of
+//! whether an open editor buffer has since been edited. Consulting the open
+//! document's current line index instead would be a PROVENANCE mismatch: the
+//! span comes from the target unit's CACHED (last-parsed) meta, so between a
+//! target's didChange (store updated) and that change's reparse completing, the
+//! open buffer's index would map the cached span's OLD offsets onto NEW text →
+//! a `Range` at the wrong bytes. For an open file `parse_buffer` keeps the arena
+//! content byte-identical to the parsed text, so the arena content always
+//! matches the span; using it unconditionally is the internally-consistent (and
+//! never-wrong) choice.
 //!
 //! Returns `None` — never a fabricated `Location` — when the target file's path
 //! cannot become a `file://` URL (a virtual/unsaved buffer whose display path
@@ -30,21 +36,21 @@ use tower_lsp::lsp_types::{Location, Range, Url};
 use delphi_parser::driver::ProjectSession;
 use delphi_parser::meta::CodeLocation;
 
-use crate::documents::DocumentStore;
 use crate::positions::LineIndex;
 
 /// Map a parser [`CodeLocation`] to an LSP [`Location`], computing the `Range`
-/// from the TARGET file's own text.
+/// from the TARGET SPAN'S OWN file text (the arena's decoded content for
+/// `location.file`).
 ///
-/// `documents` lets an already-open target reuse its live `LineIndex` (and its
-/// unsaved text) instead of re-reading from disk; a target that is not open is
-/// mapped through a `LineIndex` built from the arena's decoded content.
+/// The span indexes the exact bytes the arena parsed for that file, so the
+/// `Range` is built from that same content — never from an open editor buffer,
+/// whose current text may have drifted from the (cached, last-parsed) span it is
+/// asked to map. See the module docs for the provenance argument.
 ///
 /// `None` (never a wrong `Location`) when the target path is not a `file://`
 /// URL, or its content cannot be read.
 pub fn code_location_to_lsp(
     session: &ProjectSession,
-    documents: &DocumentStore,
     location: CodeLocation,
 ) -> Option<Location> {
     let arena = session.arena();
@@ -57,16 +63,12 @@ pub fn code_location_to_lsp(
     // rejects it → `None` (never a fabricated URL for a virtual target).
     let url = Url::from_file_path(path).ok()?;
 
-    // Prefer the open document's live line index (its unsaved text is the truth,
-    // and the index is already built — no re-read). Fall back to the arena's
-    // decoded content for a parsed-but-not-open target.
-    let range = if let Some(document) = documents.get(&url) {
-        span_to_range(&document.line_index, location)
-    } else {
-        let content = arena.content(location.file).ok()?;
-        let index = LineIndex::new(content.to_string());
-        span_to_range(&index, location)
-    };
+    // Map the span through a LineIndex built from the SPAN'S OWN parsed content
+    // (arena content of `location.file`). This is internally consistent with the
+    // span's byte offsets no matter how fresh or stale any open buffer is.
+    let content = arena.content(location.file).ok()?;
+    let index = LineIndex::new(content.to_string());
+    let range = span_to_range(&index, location);
 
     Some(Location { uri: url, range })
 }
@@ -81,7 +83,6 @@ pub fn code_location_to_lsp(
 /// target).
 pub fn resolve_definition_locations(
     session: &ProjectSession,
-    documents: &DocumentStore,
     unit_key: delphi_parser::context::Identifier,
     offset: u32,
 ) -> Option<Vec<Location>> {
@@ -89,7 +90,7 @@ pub fn resolve_definition_locations(
     let locations = session.definition(unit_key, target.key, target.owner_type);
     let mapped: Vec<Location> = locations
         .into_iter()
-        .filter_map(|location| code_location_to_lsp(session, documents, location))
+        .filter_map(|location| code_location_to_lsp(session, location))
         .collect();
     if mapped.is_empty() { None } else { Some(mapped) }
 }
@@ -107,6 +108,7 @@ fn span_to_range(index: &LineIndex, location: CodeLocation) -> Range {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::documents::DocumentStore;
     use delphi_parser::meta::Span;
 
     /// A session over two on-disk units in a temp dir, so cross-file targets
@@ -123,9 +125,14 @@ mod tests {
 
         let directory = std::env::temp_dir().join("ddk-server-locations").join(tag);
         std::fs::create_dir_all(&directory).unwrap();
+        // Models is padded with blank lines so `type TUser` lands on line 5
+        // (0-based) — deliberately DIFFERENT from any line a source reference to
+        // it sits on in Client (uses on line 2, `Boss: TUser` on line 4). A
+        // wrong (source) line index would therefore yield a wrong line number,
+        // so the cross-file range tests actually discriminate.
         std::fs::write(
             directory.join("Models.pas"),
-            "unit Models;\ninterface\ntype TUser = class\n  Name: string;\nend;\nimplementation\nend.",
+            "unit Models;\ninterface\n\n\n\ntype TUser = class\n  Name: string;\nend;\nimplementation\nend.",
         )
         .unwrap();
         std::fs::write(
@@ -169,12 +176,11 @@ mod tests {
     #[test]
     fn same_file_target_maps_to_a_range_in_that_file() {
         let (session, _directory) = session_with_two_units("same_file");
-        let documents = DocumentStore::new();
         let client_key = session.context().intern_key("CLIENT");
         let defs =
             session.definition(client_key, session.context().intern_key("TManager"), None);
         assert_eq!(defs.len(), 1, "own symbol resolves to its own declaration");
-        let location = code_location_to_lsp(&session, &documents, defs[0]).expect("maps");
+        let location = code_location_to_lsp(&session, defs[0]).expect("maps");
         // URL is the Client file.
         assert!(location.uri.to_file_path().unwrap().ends_with("Client.pas"));
         // "type TManager" is on line 3 (0-based) of Client.pas.
@@ -183,30 +189,76 @@ mod tests {
 
     /// A CROSS-FILE target: `TUser` used in Client resolves to its declaration in
     /// Models; the `Range` MUST be computed from Models.pas's own text, not
-    /// Client's. `TUser` sits on line 2 (0-based) of Models.pas — proving the
-    /// target file's own line index was used.
+    /// Client's. Models is padded so `type TUser` sits on line 5 (0-based),
+    /// DIFFERENT from the source `Boss: TUser` reference's line 4 in Client — so
+    /// a wrong (source) line index would yield line 4, and this assertion
+    /// genuinely discriminates.
     #[test]
     fn cross_file_target_range_uses_the_target_files_own_lineindex() {
         let (session, _directory) = session_with_two_units("cross_file");
-        let documents = DocumentStore::new();
         let client_key = session.context().intern_key("CLIENT");
         // Resolve TUser's definition (lives in Models).
         let defs = session.definition(client_key, session.context().intern_key("TUser"), None);
         assert_eq!(defs.len(), 1);
-        let location = code_location_to_lsp(&session, &documents, defs[0]).expect("maps");
+        let location = code_location_to_lsp(&session, defs[0]).expect("maps");
         // The URL points at Models.pas, NOT Client.pas — a cross-file jump.
         assert!(
             location.uri.to_file_path().unwrap().ends_with("Models.pas"),
             "cross-file target must resolve to Models.pas: {:?}",
             location.uri
         );
-        // "type TUser" is on line 2 (0-based) of Models.pas. If the source
-        // (Client) line index had been used, this would be a different line —
-        // this is the load-bearing assertion.
+        // "type TUser" is on line 5 (0-based) of Models.pas. The source
+        // reference (`Boss: TUser` in Client) is on line 4 — a wrong index would
+        // produce line 4, so this is a discriminating load-bearing assertion.
         assert_eq!(
-            location.range.start.line, 2,
+            location.range.start.line, 5,
             "the range must be computed from Models.pas's own text"
         );
+    }
+
+    /// PROVENANCE (staleness) guard: a cross-file target's `Range` must be built
+    /// from the SPAN'S OWN parsed content (arena content of the span's file),
+    /// never from a divergent open buffer. We simulate the drift: after the
+    /// session parsed Models (span provenance = the on-disk text, `type TUser` on
+    /// line 5), we open a buffer for Models with a DIFFERENT line layout (the
+    /// blank padding removed, so `type TUser` would be on line 2). The mapped
+    /// Range must still be line 5 — the span's provenance — NOT line 2 (the stale
+    /// buffer). This is the wrong-bytes failure finding #2 closes: the cached
+    /// span indexes the parsed text, so it must be mapped through that text.
+    #[test]
+    fn cross_file_range_follows_span_provenance_not_a_divergent_open_buffer() {
+        let (session, directory) = session_with_two_units("provenance");
+        // Open Models in the store with a re-laid-out buffer: no blank padding,
+        // so `type TUser` sits on line 2 here — divergent from the parsed text
+        // the span came from (line 5). If the mapping ever consulted this buffer,
+        // it would return line 2 (the wrong bytes).
+        let models_url =
+            Url::from_file_path(directory.join("Models.pas")).unwrap();
+        let mut documents = DocumentStore::new();
+        documents.open(
+            models_url,
+            1,
+            "unit Models;\ninterface\ntype TUser = class\n  Name: string;\nend;\nimplementation\nend."
+                .to_string(),
+        );
+
+        let client_key = session.context().intern_key("CLIENT");
+        let defs = session.definition(client_key, session.context().intern_key("TUser"), None);
+        assert_eq!(defs.len(), 1);
+        let location = code_location_to_lsp(&session, defs[0]).expect("maps");
+        assert!(location.uri.to_file_path().unwrap().ends_with("Models.pas"));
+        // The span came from the PARSED text (line 5), so the Range is line 5 —
+        // the open buffer's divergent line 2 is (correctly) never consulted.
+        assert_eq!(
+            location.range.start.line, 5,
+            "range must follow the span's own parsed content, not the open buffer"
+        );
+        // The store still holds the divergent buffer — the assertion above is
+        // meaningful precisely because a buffer-consulting implementation would
+        // have returned its line 2.
+        assert!(documents.is_open(
+            &Url::from_file_path(directory.join("Models.pas")).unwrap()
+        ));
     }
 
     /// Definition on an OWN-unit symbol: the cursor on `TManager`'s use resolves
@@ -214,13 +266,12 @@ mod tests {
     #[test]
     fn definition_own_unit_symbol() {
         let (session, directory) = session_with_two_units("def_own");
-        let documents = DocumentStore::new();
         let client_key = session.context().intern_key("CLIENT");
         // Byte offset of the `TManager` occurrence in the declaration line.
         let client_src = std::fs::read_to_string(directory.join("Client.pas")).unwrap();
         let offset = client_src.find("TManager").unwrap() as u32;
         let locations =
-            resolve_definition_locations(&session, &documents, client_key, offset).expect("resolves");
+            resolve_definition_locations(&session, client_key, offset).expect("resolves");
         assert_eq!(locations.len(), 1);
         assert!(locations[0].uri.to_file_path().unwrap().ends_with("Client.pas"));
         assert_eq!(locations[0].range.start.line, 3); // "type TManager" line
@@ -231,20 +282,19 @@ mod tests {
     #[test]
     fn definition_cross_file_symbol() {
         let (session, directory) = session_with_two_units("def_cross");
-        let documents = DocumentStore::new();
         let client_key = session.context().intern_key("CLIENT");
         let client_src = std::fs::read_to_string(directory.join("Client.pas")).unwrap();
         // `TUser` appears as the field type `Boss: TUser;` in Client.
         let offset = client_src.find("TUser").unwrap() as u32;
         let locations =
-            resolve_definition_locations(&session, &documents, client_key, offset).expect("resolves");
+            resolve_definition_locations(&session, client_key, offset).expect("resolves");
         assert_eq!(locations.len(), 1);
         assert!(
             locations[0].uri.to_file_path().unwrap().ends_with("Models.pas"),
             "cross-file jump lands in Models.pas: {:?}",
             locations[0].uri
         );
-        assert_eq!(locations[0].range.start.line, 2); // "type TUser" in Models
+        assert_eq!(locations[0].range.start.line, 5); // "type TUser" in Models
     }
 
     /// Definition on a MEMBER (`Name` field of `TUser`) resolves to the member
@@ -252,7 +302,6 @@ mod tests {
     #[test]
     fn definition_member_symbol() {
         let (session, _directory) = session_with_two_units("def_member");
-        let documents = DocumentStore::new();
         let client_key = session.context().intern_key("CLIENT");
         // Resolve the member directly (the server derives owner_type from
         // symbol_at; here we exercise definition's member path via the same
@@ -263,21 +312,20 @@ mod tests {
             Some(session.context().intern_key("TUser")),
         );
         assert_eq!(defs.len(), 1);
-        let location = code_location_to_lsp(&session, &documents, defs[0]).expect("maps");
+        let location = code_location_to_lsp(&session, defs[0]).expect("maps");
         assert!(location.uri.to_file_path().unwrap().ends_with("Models.pas"));
-        assert_eq!(location.range.start.line, 3); // "  Name: string;" in Models
+        assert_eq!(location.range.start.line, 6); // "  Name: string;" in Models
     }
 
     /// A cursor on whitespace/an unknown identifier → `None`, never a wrong jump.
     #[test]
     fn definition_on_whitespace_is_none() {
         let (session, _directory) = session_with_two_units("def_none");
-        let documents = DocumentStore::new();
         let client_key = session.context().intern_key("CLIENT");
         // Offset 0 is the `u` of `unit` — a keyword, not a resolvable symbol
         // occurrence; and a far-past-EOF offset has nothing under it.
         assert!(
-            resolve_definition_locations(&session, &documents, client_key, 100_000).is_none(),
+            resolve_definition_locations(&session, client_key, 100_000).is_none(),
             "an out-of-range cursor yields no definition"
         );
     }
@@ -287,7 +335,6 @@ mod tests {
     #[test]
     fn virtual_target_is_none() {
         let (session, _directory) = session_with_two_units("virtual");
-        let documents = DocumentStore::new();
         // Fabricate a location into a virtual buffer (a display-name-only path).
         let file = session
             .arena()
@@ -297,7 +344,7 @@ mod tests {
             span: Span::new(0, 4),
         };
         assert!(
-            code_location_to_lsp(&session, &documents, location).is_none(),
+            code_location_to_lsp(&session, location).is_none(),
             "a virtual target with a non-file path must map to None"
         );
     }
