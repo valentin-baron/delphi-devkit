@@ -80,7 +80,19 @@ impl DocumentStore {
     ) -> Option<String> {
         let document = self.documents.get_mut(uri)?;
         // Ignore an out-of-order (older) version — never regress the buffer.
+        //
+        // An EQUAL version needs care. The LSP spec requires every didChange to
+        // carry a strictly increasing version, so an equal-version notification
+        // is a duplicate. Re-applying a *ranged* edit on a duplicate would
+        // double-apply it (ranged edits are NOT idempotent — e.g. an insert would
+        // be inserted twice), corrupting the buffer. A *full replacement* is
+        // idempotent, so an equal-version full-replacement resend is harmless and
+        // is honored. We therefore reject an equal-version notification only when
+        // it contains any ranged edit; a pure full-replacement duplicate passes.
         if version < document.version {
+            return None;
+        }
+        if version == document.version && changes.iter().any(|change| change.range.is_some()) {
             return None;
         }
 
@@ -249,6 +261,43 @@ mod tests {
         assert!(text.is_none());
         assert_eq!(store.get(&uri()).unwrap().text(), "current");
         assert_eq!(store.get(&uri()).unwrap().version, 5);
+    }
+
+    #[test]
+    fn equal_version_ranged_edit_is_rejected_not_double_applied() {
+        // A duplicate notification at the SAME version must not re-apply a
+        // ranged edit (which is not idempotent — it would insert twice).
+        let mut store = DocumentStore::new();
+        store.open(uri(), 1, "Hello".to_string());
+        // First v2 change inserts " World".
+        let first = store.apply_change(&uri(), 2, vec![ranged_change((0, 5), (0, 5), " World")]);
+        assert_eq!(first.as_deref(), Some("Hello World"));
+        // A duplicate v2 with the same ranged edit must be dropped — the buffer
+        // stays "Hello World", NOT "Hello World World" (or a corrupted splice).
+        let duplicate =
+            store.apply_change(&uri(), 2, vec![ranged_change((0, 5), (0, 5), " World")]);
+        assert!(duplicate.is_none(), "an equal-version ranged edit must be rejected");
+        assert_eq!(store.get(&uri()).unwrap().text(), "Hello World");
+        assert_eq!(store.get(&uri()).unwrap().version, 2);
+    }
+
+    #[test]
+    fn equal_version_full_replacement_is_honored() {
+        // A full replacement is idempotent, so an equal-version full-replacement
+        // resend is safe and honored (per the spec-tolerant comment in
+        // apply_change).
+        let mut store = DocumentStore::new();
+        store.open(uri(), 1, "old".to_string());
+        assert_eq!(
+            store.apply_change(&uri(), 2, vec![full_change("new")]).as_deref(),
+            Some("new")
+        );
+        // Same version, full replacement again — allowed (idempotent).
+        assert_eq!(
+            store.apply_change(&uri(), 2, vec![full_change("new")]).as_deref(),
+            Some("new")
+        );
+        assert_eq!(store.get(&uri()).unwrap().text(), "new");
     }
 
     #[test]
