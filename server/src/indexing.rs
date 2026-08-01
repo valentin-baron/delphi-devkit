@@ -109,10 +109,12 @@ pub fn project_unit_paths(
     for directory in project_directories {
         // Skip a project directory that IS (canonically) a standard source dir —
         // e.g. a dproj that redundantly lists an RTL path in its search path.
-        if let Ok(canonical_dir) = directory.canonicalize() {
-            if excluded.contains(&canonical_dir) {
-                continue;
-            }
+        if directory
+            .canonicalize()
+            .map(|canonical_dir| excluded.contains(&canonical_dir))
+            .unwrap_or(false)
+        {
+            continue;
         }
         let Ok(entries) = std::fs::read_dir(directory) else {
             continue;
@@ -124,15 +126,20 @@ pub fn project_unit_paths(
             }
             // Exclude a `.pas` whose (canonical) parent is a standard source dir,
             // even if it was reached through a non-standard-looking spelling.
-            if let Ok(canonical) = path.canonicalize() {
-                if let Some(parent) = canonical.parent() {
-                    if excluded.contains(parent) {
+            match path.canonicalize() {
+                Ok(canonical) => {
+                    let parent_excluded = canonical
+                        .parent()
+                        .map(|parent| excluded.contains(parent))
+                        .unwrap_or(false);
+                    if parent_excluded {
                         continue;
                     }
+                    units.insert(canonical);
                 }
-                units.insert(canonical);
-            } else {
-                units.insert(path);
+                Err(_) => {
+                    units.insert(path);
+                }
             }
         }
     }
