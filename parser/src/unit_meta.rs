@@ -60,6 +60,17 @@ pub struct UnitMeta {
     /// invalidation; the dfm↔pas LINK itself is computed on demand by
     /// [`crate::dfm_link`].
     pub dfm: Option<SourceStamp>,
+    /// Decoded source length in bytes at parse time — the CHEAP, ROBUST proxy
+    /// for this meta's real AST heap footprint (Task 16 D). The whole AST is
+    /// derived from these source bytes, so parsed heap grows roughly linearly
+    /// with them; the moka weigher ([`Self::estimated_bytes`]) multiplies this
+    /// by a per-byte factor so the byte cap actually bounds RAM. Persisted (a
+    /// reloaded unit must weigh the same as when first parsed, else eviction
+    /// pressure would differ across sessions). `0` for a meta built through
+    /// [`Self::new`] without a source length (older callers / tests); the
+    /// weigher then falls back to a structural estimate.
+    #[serde(default)]
+    pub source_len: u32,
     /// Derived interface surface (symbols + flattened members), built lazily
     /// from `ast` and cached. Never serialized — rebuilt on demand.
     #[serde(skip)]
@@ -86,8 +97,17 @@ impl UnitMeta {
             dependencies,
             usages,
             dfm: None,
+            source_len: 0,
             interface_index: OnceCell::new(),
         }
+    }
+
+    /// Record the decoded source length (builder style, keeps [`Self::new`]'s
+    /// positional signature stable). Set by [`crate::pipeline::build_unit_meta`]
+    /// from the arena so the weigher has its robust size proxy.
+    pub fn with_source_len(mut self, source_len: u32) -> Self {
+        self.source_len = source_len;
+        self
     }
 
     /// Mark this meta as produced by error-tolerant recovery (builder style,
@@ -131,37 +151,74 @@ impl UnitMeta {
             }))
     }
 
-    /// Rough footprint for the moka weigher. Precision is irrelevant — it only
-    /// steers eviction pressure. Deliberately STRUCTURAL: it reads only shallow
-    /// AST counts and never calls [`interface()`](Self::interface). The weigher
-    /// runs on the insert hot path under moka's internal lock; forcing the
-    /// derived interface index there would build the full member surface and
-    /// mutate the `OnceCell` under that lock (NIT from review). Members are
-    /// approximated by counting each declaration's structured members straight
-    /// from the AST instead.
+    /// Real-heap footprint estimate for the moka weigher — a CLOSE proxy so the
+    /// byte cap actually bounds process RAM (Task 16 D). It must NOT undercount:
+    /// `UnitMeta` owns the WHOLE unit AST (nested `TypeExpression`s, member vecs,
+    /// every declaration), whose heap grows roughly linearly with the source it
+    /// was derived from. The old estimate counted only shallow members × struct
+    /// sizes and undercounted a real VCL/RTL unit by an order of magnitude, so
+    /// the "512MB cap" never bounded RAM.
+    ///
+    /// PRIMARY proxy: the decoded SOURCE byte length ([`Self::source_len`]),
+    /// scaled by [`Self::AST_BYTES_PER_SOURCE_BYTE`] — a parsed AST typically
+    /// costs several bytes of heap per source byte (nodes, spans, interned refs,
+    /// the usage index). This is O(1), never touches the `OnceCell`, and is
+    /// robust across unit shapes. On TOP of that, the explicitly-owned side
+    /// vectors (usages, dependencies, includes) are added at their real element
+    /// size — they scale with cross-unit references, not just source length.
+    ///
+    /// FALLBACK: a meta with no recorded `source_len` (built via [`Self::new`]
+    /// by an older caller / a test) uses a structural estimate that STILL scales
+    /// with declaration + member counts, so it never collapses to a constant.
+    ///
+    /// Deliberately never calls [`interface()`](Self::interface): the weigher
+    /// runs on the insert hot path under moka's lock; building the derived index
+    /// there would mutate the `OnceCell` under that lock.
     pub fn estimated_bytes(&self) -> u32 {
-        let member_count: usize = self
-            .ast
-            .interface_declarations
-            .iter()
-            .map(|declaration| {
-                declaration
-                    .type_expression
-                    .as_ref()
-                    .map(shallow_member_count)
-                    .unwrap_or(0)
-            })
-            .sum();
-        let base = 256
-            + self.source_path.as_os_str().len()
-            + self.includes.len() * 64
-            + self.dependencies.len() * 64
-            + self.usages.len() * std::mem::size_of::<Usage>()
-            + self.ast.interface_declarations.len()
-                * (128 + std::mem::size_of::<InterfaceSymbol>())
-            + member_count * std::mem::size_of::<MemberSymbol>();
-        base.min(u32::MAX as usize) as u32
+        // Real per-element sizes of the owned side tables (these scale with
+        // cross-unit references / occurrences, independent of source length).
+        let side_tables = self.usages.len() * std::mem::size_of::<Usage>()
+            + self.dependencies.len() * (std::mem::size_of::<Dependency>() + 96)
+            + self.includes.len() * (std::mem::size_of::<SourceStamp>() + 96)
+            + self.source_path.as_os_str().len();
+
+        let ast_estimate = if self.source_len > 0 {
+            // Primary: source-length proxy for the owned AST heap.
+            (self.source_len as usize) * Self::AST_BYTES_PER_SOURCE_BYTE
+        } else {
+            // Fallback (no source_len): a structural estimate that still scales
+            // with the AST's declaration + member counts, generously weighted so
+            // it does not undercount the nested TypeExpression heap it stands in
+            // for. Never a flat constant.
+            let member_count: usize = self
+                .ast
+                .interface_declarations
+                .iter()
+                .map(|declaration| {
+                    declaration
+                        .type_expression
+                        .as_ref()
+                        .map(shallow_member_count)
+                        .unwrap_or(0)
+                })
+                .sum();
+            self.ast.interface_declarations.len()
+                * (256 + std::mem::size_of::<InterfaceSymbol>())
+                + member_count * (128 + std::mem::size_of::<MemberSymbol>())
+        };
+
+        let total = 512 + ast_estimate + side_tables;
+        total.min(u32::MAX as usize) as u32
     }
+
+    /// Heap bytes charged per source byte for the owned AST (Task 16 D). A
+    /// parsed interface AST costs several heap bytes per source byte once nodes,
+    /// spans, interned-identifier references and the derived-on-demand surface
+    /// are accounted for. `8` is a deliberately conservative (over- rather than
+    /// under-counting) multiplier: the weigher must NOT undercount, since an
+    /// undercount is exactly what let RAM blow past the cap. Tuned together with
+    /// the editor default capacity ([`crate::unit_cache::DEFAULT_CAPACITY_BYTES`]).
+    pub const AST_BYTES_PER_SOURCE_BYTE: usize = 8;
 }
 
 // ─── Interface surface derivation (AST → queryable index) ────────────────

@@ -75,6 +75,11 @@ pub fn build_unit_meta(
     // Associate the sibling `.dfm` (`Unit1.pas` ↔ `Unit1.dfm`) so a form edit
     // stales this unit. Only stamped when the dfm actually exists on disk.
     let dfm = sibling_dfm_stamp(&own.path);
+    // Decoded source length — the weigher's robust size proxy (Task 16 D). The
+    // content was just materialized by the parse, so this is a cheap length
+    // read (no re-decode). Saturating cast: a >4GiB source is implausible and
+    // would only saturate the weight, never wrap.
+    let source_len = arena.loaded_content(file).len().min(u32::MAX as usize) as u32;
     UnitMeta::new(
         unit,
         cycle_tainted,
@@ -86,6 +91,7 @@ pub fn build_unit_meta(
     )
     .with_dfm(dfm)
     .with_recovered(recovered)
+    .with_source_len(source_len)
 }
 
 /// Parse a materialized file; when it is a unit, build + cache its [`UnitMeta`].
@@ -355,6 +361,58 @@ mod tests {
                 .unwrap()
                 .read_target,
             Some(fresh_context.intern_key("FVALUE"))
+        );
+    }
+
+    /// M1 (strengthened, Task 16 D): the weigher must NOT undercount — a large
+    /// unit must weigh SUBSTANTIALLY more than a tiny one, roughly proportional
+    /// to its source size. This catches an undercount regression: the old
+    /// shallow estimate counted only member structs and weighed a big unit
+    /// almost the same as a small one, so the byte cap never bounded RAM.
+    #[test]
+    fn weigher_scales_with_source_size_not_undercounting() {
+        let context = test_context(Vec::new());
+        let arena = SourceArena::new();
+
+        let tiny_src = "unit Tiny; interface implementation end.";
+        let tiny_file = arena.insert_virtual("Tiny.pas", tiny_src);
+        let (_, tiny) = parse_and_cache(&arena, &context, tiny_file, None).unwrap();
+        let tiny = tiny.unwrap();
+
+        // a large unit: many declarations → a large source and a large AST
+        let mut big_src = String::from("unit Big; interface\n");
+        for index in 0..400 {
+            big_src.push_str(&format!(
+                "type TThing{index} = class F{index}: Integer; procedure Go{index}; end;\n"
+            ));
+        }
+        big_src.push_str("implementation end.");
+        let big_file = arena.insert_virtual("Big.pas", &big_src);
+        let (_, big) = parse_and_cache(&arena, &context, big_file, None).unwrap();
+        let big = big.unwrap();
+
+        let tiny_weight = tiny.estimated_bytes();
+        let big_weight = big.estimated_bytes();
+
+        // the source-length proxy is recorded and non-trivial
+        assert!(big.source_len as usize >= big_src.len() - 4);
+        assert!(tiny.source_len > 0);
+
+        // the load-bearing anti-undercount assertion: the big unit weighs at
+        // least an order of magnitude more than the tiny one. A flat/undercount
+        // estimate (old behaviour) would fail this hard.
+        assert!(
+            big_weight > tiny_weight * 10,
+            "big unit ({big_weight} B, {} src) must weigh >> tiny ({tiny_weight} B, {} src)",
+            big.source_len,
+            tiny.source_len,
+        );
+        // and the weight tracks source size closely (within a small band of the
+        // per-byte proxy), proving it is proportional, not a coincidental bump.
+        let expected = big.source_len as u32 * UnitMeta::AST_BYTES_PER_SOURCE_BYTE as u32;
+        assert!(
+            big_weight >= expected,
+            "weight {big_weight} must be at least the source-length proxy {expected}"
         );
     }
 

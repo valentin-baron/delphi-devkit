@@ -23,8 +23,15 @@ use crate::meta::CodeLocation;
 use crate::parser::ParseError;
 use crate::unit_meta::UnitMeta;
 
-const CACHE_FORMAT_VERSION: u32 = 11;
-const DEFAULT_CAPACITY_BYTES: u64 = 512 * 1024 * 1024;
+const CACHE_FORMAT_VERSION: u32 = 12;
+/// Default RAM cap for the in-memory AST cache. Lowered from 512MiB to 256MiB
+/// for an EDITOR workload (Task 16 D): the disk-backed cache means an evicted
+/// unit reloads cheaply from its per-unit file instead of re-parsing, so a
+/// tighter working set trades a little reload latency for a much smaller
+/// resident footprint. Paired with a NON-undercounting weigher
+/// ([`UnitMeta::estimated_bytes`]) so this cap actually bounds process RAM near
+/// its value rather than being blown past by an undercount.
+pub const DEFAULT_CAPACITY_BYTES: u64 = 256 * 1024 * 1024;
 
 pub fn hash_bytes(bytes: &[u8]) -> u64 {
     xxhash_rust::xxh3::xxh3_64(bytes)
@@ -912,8 +919,8 @@ mod tests {
 
     #[test]
     fn old_version_snapshot_is_cleanly_rejected() {
-        // A snapshot written by a PRIOR format version (here v10, one behind the
-        // current v11) must be refused with a clean version-mismatch error — not
+        // A snapshot written by a PRIOR format version (here v11, one behind the
+        // current v12) must be refused with a clean version-mismatch error — not
         // a panic, not a partial/garbage load. Bincode is not self-describing,
         // so an old snapshot's unit bytes may not even match the current
         // `UnitMeta` layout; the version guard must reject BEFORE any unit
@@ -926,9 +933,9 @@ mod tests {
         // segment of bytes that would NOT decode under the current `UnitMeta`
         // layout. The version guard must reject before any segment is touched,
         // so these bytes are never even reached.
-        assert_eq!(CACHE_FORMAT_VERSION, 11, "update this test on a format bump");
+        assert_eq!(CACHE_FORMAT_VERSION, 12, "update this test on a format bump");
         let stale = SavedCacheDisk {
-            version: 10,
+            version: 11,
             units: vec![vec![0xDE, 0xAD, 0xBE, 0xEF]],
         };
         std::fs::write(&snapshot, bincode::serialize(&stale).unwrap()).unwrap();
@@ -938,8 +945,8 @@ mod tests {
         let error = result.expect_err("an old-version snapshot must be rejected");
         // the message names both the found and expected versions
         assert!(
-            error.message.contains("10") && error.message.contains("11"),
-            "version-mismatch message must name found (10) and expected (11): {}",
+            error.message.contains("11") && error.message.contains("12"),
+            "version-mismatch message must name found (11) and expected (12): {}",
             error.message
         );
     }
