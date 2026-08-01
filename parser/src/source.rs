@@ -100,6 +100,14 @@ pub struct SourceArena {
     /// with the next value here; `trim_disk_content` evicts the smallest ticks
     /// first. A plain `AtomicU64` — no wraparound concern in any realistic
     /// process lifetime (2^64 accesses).
+    ///
+    /// CORRECTNESS of the LRU ordering rests on the SESSION LOCK, not on the
+    /// atomic's memory ordering: every `content`/`raw_bytes` access and every
+    /// `trim_disk_content` run under the LSP session `blocking_lock()` (see
+    /// `ProjectSession::trim_arena`), so fetch-add / store / read of these ticks
+    /// are already serialized. `Relaxed` is therefore sufficient — the atomics
+    /// exist only to keep the entry `Sync` and to be cheap, not to establish a
+    /// happens-before between otherwise-racing threads (there are none).
     access_clock: AtomicU64,
 }
 
@@ -339,6 +347,17 @@ impl SourceArena {
         self.files.get(file.0 as usize).map(|entry| entry.path.as_path())
     }
 
+    /// Whether `file` is a VIRTUAL (in-memory editor) buffer rather than a disk
+    /// file. A virtual buffer's content is authoritative (byte-identical to what
+    /// its meta's spans index — see [`Self::set_virtual`]'s span-provenance note)
+    /// and is never trimmed/re-read, so it can never drift from its parsed text;
+    /// a disk file CAN (task-19 trim + an external on-disk edit). The server's
+    /// staleness guard uses this to skip the on-disk hash comparison for virtual
+    /// targets. `None` for a `FileId` this arena never issued (non-panicking).
+    pub fn is_virtual(&self, file: FileId) -> Option<bool> {
+        self.files.get(file.0 as usize).map(|entry| entry.is_virtual)
+    }
+
     /// Full text of a file, reading it from disk on first access if the entry
     /// was only registered. The reference stays valid for the arena's whole
     /// lifetime — later loads never move existing buffers. The raw on-disk bytes
@@ -506,6 +525,7 @@ impl SourceArena {
     /// evict OTHER concurrently-parsing tests' entries and race their live
     /// borrows (the harness has no cross-test session lock; production's session
     /// lock provides exactly that serialization). Not on the LSP hot path.
+    #[doc(hidden)]
     pub fn clear_disk_entry_for_test(&self, file: FileId) -> usize {
         let entry = self.entry(file);
         if entry.is_virtual {

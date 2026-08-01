@@ -1446,6 +1446,75 @@ impl ProjectSession {
         self.arena
     }
 
+    /// Whether the CURRENT bytes of `file` still match what the cached meta that
+    /// indexes spans into `file` was PARSED against. The provenance guard for the
+    /// LSP mapping layer (task-19 correctness): a cached `UnitMeta` holds
+    /// `(FileId, Span)` spans into the file's PARSE-TIME text, but that text is
+    /// trimmable — a disk entry's content can be freed and RE-READ on demand, and
+    /// if the file CHANGED on disk between parse and query (an unopened import
+    /// whose watcher/invalidation lagged) the re-read yields NEW bytes. Mapping a
+    /// PARSE-TIME span onto that NEW text produces a WRONG range. Before mapping,
+    /// the server asks this: only map when the answer is `true`.
+    ///
+    /// - VIRTUAL (open editor) buffer: always `true`. Its content is replaced
+    ///   only between parses under the session lock and the meta produced by that
+    ///   parse indexes exactly the stored text (span-provenance, see
+    ///   [`SourceArena::set_virtual`]); it is never trimmed/re-read, so it can
+    ///   never drift from its parsed text. No disk hash is taken (its display path
+    ///   need not exist on disk).
+    /// - DISK file: hash the CURRENT on-disk bytes and compare to the parse-time
+    ///   `source_hash` of the cached meta for this file. `true` only when a cached
+    ///   meta for this exact file path is found AND the current on-disk hash
+    ///   equals its `source_hash`. Any of {`FileId` not issued here, no cached
+    ///   meta for the path, on-disk read fails, hashes differ} → `false`: the
+    ///   caller then returns NO location rather than a wrong range (never-wrong).
+    ///
+    /// The parse-time hash is `meta.source_hash` — the hash of the file's RAW
+    /// on-disk bytes at parse time (see `pipeline::stamp_file`), byte-identical to
+    /// [`crate::unit_cache::hash_file`], so re-hashing the current on-disk bytes
+    /// with the same function is an apples-to-apples comparison.
+    pub fn content_matches_parsed(&self, file: FileId) -> bool {
+        let Some(path) = self.arena.try_path(file) else {
+            // A FileId this arena never issued: cannot verify provenance → treat
+            // as a mismatch (no location beats a wrong one).
+            return false;
+        };
+        // Virtual buffers are authoritative and cannot drift (see the doc note).
+        if self.arena.is_virtual(file) == Some(true) {
+            return true;
+        }
+        let path = path.to_path_buf();
+        // The parse-time hash lives in the cached meta whose source is THIS file.
+        // metas are keyed by unit name, not FileId, so match on the source path
+        // (both `meta.source_path` and `arena.path` come from the arena's
+        // canonicalized path in `build_unit_meta`, so they compare byte-equal).
+        let Some(parsed_hash) = self.parsed_source_hash_for_path(&path) else {
+            // No cached meta indexes this file → we do not know what its spans
+            // were parsed against, so we cannot certify the re-read text matches.
+            return false;
+        };
+        // Hash the CURRENT on-disk bytes. A read failure (deleted/locked) → no
+        // certification → mismatch.
+        match crate::unit_cache::hash_file(&path) {
+            Ok(current_hash) => current_hash == parsed_hash,
+            Err(_) => false,
+        }
+    }
+
+    /// The parse-time `source_hash` of the cached, successfully-parsed meta whose
+    /// `source_path` is `path`, if any. Used by [`Self::content_matches_parsed`]
+    /// to recover the provenance hash for a target `FileId` (metas are keyed by
+    /// unit name, not by file, so this matches on the canonical source path).
+    fn parsed_source_hash_for_path(&self, path: &std::path::Path) -> Option<u64> {
+        self.context
+            .unit_cache
+            .iter_entries()
+            .find_map(|(_, entry)| match entry {
+                CacheEntry::Done(meta) if meta.source_path == path => Some(meta.source_hash),
+                _ => None,
+            })
+    }
+
     /// Bound the process-global source arena's DISK-file text at a SAFE
     /// CHECKPOINT (Task-19). LRU-evicts the coldest disk entries' resident
     /// content+raw until it is at most [`ARENA_DISK_CONTENT_CAP`] bytes; a

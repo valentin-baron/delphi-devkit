@@ -63,9 +63,25 @@ pub fn code_location_to_lsp(
     // rejects it → `None` (never a fabricated URL for a virtual target).
     let url = Url::from_file_path(path).ok()?;
 
+    // PROVENANCE / STALENESS GUARD (task-19 correctness). The span comes from the
+    // target file's CACHED (last-parsed) meta and indexes that file's PARSE-TIME
+    // text. But a disk file's arena text is TRIMMABLE and RE-READ on demand: if
+    // the file changed on disk between parse and this query (an unopened import
+    // whose watch/invalidation lagged), `arena.content` below would re-read the
+    // NEW bytes and a `LineIndex` over them would map the OLD span offsets onto
+    // NEW text → a WRONG range. So, before mapping, require that the current file
+    // content still matches what the cached meta was parsed against (hash equal
+    // for a disk file; always true for an authoritative virtual buffer). On a
+    // mismatch we return `None` — NO location — trading a momentary no-result for
+    // never a wrong range; it self-corrects once the watcher re-parses the file.
+    if !session.content_matches_parsed(location.file) {
+        return None;
+    }
+
     // Map the span through a LineIndex built from the SPAN'S OWN parsed content
-    // (arena content of `location.file`). This is internally consistent with the
-    // span's byte offsets no matter how fresh or stale any open buffer is.
+    // (arena content of `location.file`). The guard above certified the current
+    // content equals the parse-time text, so the span's byte offsets index it
+    // consistently — no matter how fresh or stale any open buffer is.
     let content = arena.content(location.file).ok()?;
     let index = LineIndex::new(content.to_string());
     let range = span_to_range(&index, location);
@@ -511,6 +527,93 @@ mod tests {
         assert!(
             code_location_to_lsp(&session, location).is_none(),
             "a virtual target with a non-file path must map to None"
+        );
+    }
+
+    // ─── task-19 provenance guard: never map a span onto CHANGED text ────
+    //
+    // The arena trims (frees) a disk file's text and RE-READS it on demand. If
+    // the file changed on disk between parse and query (an unopened import whose
+    // watch/invalidation lagged), a re-read yields NEW bytes and the cached
+    // PARSE-TIME span offsets would map onto them → a WRONG range. The guard in
+    // `code_location_to_lsp` requires the current file content to still match
+    // what the span was parsed against (hash of the on-disk bytes == the cached
+    // meta's parse-time `source_hash`); on a mismatch it returns `None` — a
+    // momentary no-result, never a wrong range — self-correcting once the file is
+    // re-parsed.
+
+    /// The changed-import scenario: Models is parsed (meta cached, `source_hash`
+    /// = original on-disk bytes; `type TUser` on line 5). Its arena content is
+    /// TRIMMED (freed), then Models is CHANGED on disk to a DIFFERENT layout so
+    /// the cached span no longer aligns. Mapping a `CodeLocation` into Models via
+    /// `code_location_to_lsp` must now return `None` — the guard refuses to map a
+    /// parse-time span onto the changed text — NOT a misaligned range.
+    #[test]
+    fn changed_on_disk_import_returns_none_not_a_wrong_range() {
+        let (session, directory) = session_with_both_units_parsed("changed_import");
+        let client_key = session.context().intern_key("CLIENT");
+        // A span into Models (the declaration of TUser, on line 5 of the ORIGINAL
+        // Models text — the version the meta was parsed against).
+        let defs =
+            session.definition(client_key, session.context().intern_key("TUser"), None);
+        assert_eq!(defs.len(), 1);
+        let models_location = defs[0];
+
+        // Sanity: with Models unchanged, the location maps and lands on line 5.
+        let before = code_location_to_lsp(&session, models_location).expect("maps while fresh");
+        assert!(before.uri.to_file_path().unwrap().ends_with("Models.pas"));
+        assert_eq!(before.range.start.line, 5);
+
+        // Trim: free Models's resident arena text (task-19 clears it; a later
+        // `content` re-reads from disk on demand). Use the deterministic
+        // per-entry clear so we do not disturb other parallel tests' entries.
+        let freed = session.arena().clear_disk_entry_for_test(models_location.file);
+        assert!(freed > 0, "Models's resident content was cleared");
+
+        // Change Models on disk: a DIFFERENT line layout (the blank padding
+        // removed) so the cached span (parsed against the padded text) no longer
+        // aligns — and, decisively, the on-disk bytes now hash differently than
+        // the cached meta's parse-time `source_hash`.
+        std::fs::write(
+            directory.join("Models.pas"),
+            "unit Models;\ninterface\ntype TUser = class\n  Name: string;\nend;\nimplementation\nend.",
+        )
+        .unwrap();
+
+        // The guard must refuse: no location, NOT a range mapped onto the changed
+        // text (which would be a wrong-bytes highlight).
+        assert!(
+            code_location_to_lsp(&session, models_location).is_none(),
+            "a span into an externally-changed, not-yet-revalidated import must map \
+             to None (never a wrong range)"
+        );
+    }
+
+    /// The control: after a trim WITHOUT a disk change, the on-disk bytes still
+    /// hash to the cached meta's parse-time `source_hash`, so the guard passes and
+    /// the location maps correctly (through the re-read, byte-identical text). The
+    /// guard must not suppress a legitimate map — only a genuinely-stale one.
+    #[test]
+    fn trim_without_change_still_maps_correctly() {
+        let (session, _directory) = session_with_both_units_parsed("trim_no_change");
+        let client_key = session.context().intern_key("CLIENT");
+        let defs =
+            session.definition(client_key, session.context().intern_key("TUser"), None);
+        assert_eq!(defs.len(), 1);
+        let models_location = defs[0];
+
+        // Trim Models's resident text (forces a re-read on the next `content`).
+        let freed = session.arena().clear_disk_entry_for_test(models_location.file);
+        assert!(freed > 0, "Models's resident content was cleared");
+
+        // No on-disk change → current bytes hash == parse-time source_hash → the
+        // guard passes and the span maps to its correct line (5 in Models).
+        let location =
+            code_location_to_lsp(&session, models_location).expect("maps after a no-change trim");
+        assert!(location.uri.to_file_path().unwrap().ends_with("Models.pas"));
+        assert_eq!(
+            location.range.start.line, 5,
+            "an unchanged file re-reads byte-identical text; the span still maps to line 5"
         );
     }
 }
