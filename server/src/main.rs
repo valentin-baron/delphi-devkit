@@ -1,5 +1,6 @@
 mod documents;
 mod positions;
+mod session;
 
 use std::sync::Arc;
 
@@ -11,6 +12,7 @@ use tower_lsp::{LanguageServer, LspService, Server};
 use tower_lsp::lsp_types::*;
 
 use documents::DocumentStore;
+use session::SessionManager;
 
 use ddk_core::lsp_types::*;
 use ddk_core::projects::*;
@@ -27,6 +29,10 @@ struct DelphiLsp {
     /// spans a blocking parse — the parse runs on a `spawn_blocking` task AFTER
     /// the text has been copied out, so the lock is never held across `.await`.
     documents: Arc<Mutex<DocumentStore>>,
+    /// The parser session for the open project, behind an async lock. Parses run
+    /// on `spawn_blocking`; the lock is never held across `.await`. See
+    /// [`session`] for the async/lock model.
+    session: Arc<SessionManager>,
 }
 
 impl DelphiLsp {
@@ -34,6 +40,7 @@ impl DelphiLsp {
         DelphiLsp {
             client,
             documents: Arc::new(Mutex::new(DocumentStore::new())),
+            session: Arc::new(SessionManager::new()),
         }
     }
 

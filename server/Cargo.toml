@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 ddk-core = { path = "../core" }
+delphi-parser = { path = "../parser" }
 anyhow = "1.0.100"
 serde_json = "1.0.149"
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros"] }

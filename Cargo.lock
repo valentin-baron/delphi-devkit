@@ -396,6 +396,7 @@ version = "2.5.1"
 dependencies = [
  "anyhow",
  "ddk-core",
+ "delphi-parser",
  "serde_json",
  "tokio",
  "tower-lsp",
