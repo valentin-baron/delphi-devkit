@@ -397,6 +397,7 @@ dependencies = [
  "anyhow",
  "ddk-core",
  "delphi-parser",
+ "serde",
  "serde_json",
  "tokio",
  "tower-lsp",

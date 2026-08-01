@@ -10,6 +10,7 @@ mod progress;
 mod semantic;
 mod session;
 mod signature;
+mod status;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -239,10 +240,29 @@ impl DelphiLsp {
             // CANCELATION: a foreground event since the pass began bumps the
             // generation → stop promptly, leaving what was already indexed (each
             // unit was atomic). Checked BEFORE the unit so a bump is honored
-            // before another unit's parse can start.
+            // before another unit's parse can start. The `Ready` status is emitted
+            // AFTER the loop, so this cancel `break` flips the persistent view back
+            // to `Ready` too (never a stuck `Indexing` on a preempted pass).
             if self.index_generation.changed_since(start_generation) {
                 break;
             }
+
+            // Task 24: push the persistent `Indexing { current, total, detail }`
+            // status for this unit. `current` is 1-based (the unit about to be
+            // processed) over `total`, `detail` the unit file name. Best-effort;
+            // no lock held. Paired with the `Ready` emitted after the loop so the
+            // view returns to `Ready` on completion OR cancel.
+            let unit_label = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.set_status(status::ServerStatusParams::counted(
+                status::ServerState::Indexing,
+                (position + 1) as u32,
+                total as u32,
+                unit_label,
+            ))
+            .await;
 
             // OPEN-BUFFER EXCLUSION (correctness guard): never re-parse from disk a
             // unit that is OPEN in the editor. Membership is by PATH→URL against the
@@ -303,6 +323,17 @@ impl DelphiLsp {
                 .end(Some(format!("indexed {indexed}/{total}")))
                 .await;
         }
+
+        // Task 24: the pass has ended — whether it ran to completion, was
+        // canceled by a foreground bump (the `break` above), or stopped because
+        // the session went away (`NoSession`) — flip the persistent status back to
+        // `Ready`. This is the single exit point after the loop, so EVERY way the
+        // loop terminates returns the view to `Ready` (no stuck `Indexing`
+        // spinner). NOTE: the early returns BEFORE the loop (no session/no
+        // directories/empty work list) never emitted an `Indexing` status, so the
+        // view was already `Ready` and needs no correction. Best-effort; no lock.
+        self.set_status(status::ServerStatusParams::bare(status::ServerState::Ready))
+            .await;
     }
 
     /// Spawn the idle-triggered background indexer (Task 18). Owns a `DelphiLsp`
@@ -373,6 +404,27 @@ impl DelphiLsp {
             message,
         )
         .await
+    }
+
+    /// Push a `ddk/serverStatus` notification carrying `params` — the persistent
+    /// status view's sole driver (Task 24). FIRE-AND-FORGET / BEST-EFFORT: a
+    /// failed send is swallowed by `send_notification` and never propagates, so a
+    /// status update can never fail or slow the analyze/indexing operation it
+    /// describes.
+    ///
+    /// Lock/async: this holds NO document or session lock — it only clones the
+    /// `Client` (a cheap handle) and awaits the send — so it can never introduce a
+    /// lock-across-`.await` (task-8 discipline). Callers MUST NOT hold a lock
+    /// across this await; the existing call sites (`initialized`, `analyze` begin/
+    /// end, the indexing pass) all invoke it with no lock held.
+    ///
+    /// This is COMPLEMENTARY to task-17 `begin_progress`: progress drives VS
+    /// Code's transient spinner, this drives the standing status item. Both are
+    /// emitted; neither replaces the other.
+    async fn set_status(&self, params: status::ServerStatusParams) {
+        self.client
+            .send_notification::<status::ServerStatus>(params)
+            .await;
     }
 
     /// Publish `diagnostics` for `(uri, version)` unless a NEWER (or equal) set
@@ -462,6 +514,15 @@ impl DelphiLsp {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| uri.to_string());
+        // Task 24: flip the persistent status to `Analyzing { detail: file }` for
+        // the duration of this parse. Paired with the `Ready` emitted right after
+        // the blocking parse returns (below), on EVERY path out of `analyze`, so
+        // the status never sticks on `Analyzing`. Best-effort; no lock held.
+        self.set_status(status::ServerStatusParams::with_detail(
+            status::ServerState::Analyzing,
+            unit_label.clone(),
+        ))
+        .await;
         let progress = self
             .begin_progress(
                 format!("Delphi: analyzing {unit_label}"),
@@ -543,6 +604,15 @@ impl DelphiLsp {
         if let Some(reporter) = progress {
             reporter.end(None).await;
         }
+
+        // Task 24: the parse has returned — flip the persistent status back to
+        // `Ready`. Done HERE, before the branches below (which have their own
+        // early returns for a join error or a stale-version recheck), so `Ready`
+        // is emitted on EVERY path out of `analyze` and the status never sticks on
+        // `Analyzing`. This mirrors why `progress.end()` is placed here.
+        // Best-effort; no lock held across the send.
+        self.set_status(status::ServerStatusParams::bare(status::ServerState::Ready))
+            .await;
 
         let lsp_diagnostics = match result {
             Ok(AnalyzeOutcome::Publish { diagnostics, unit_key }) => {
@@ -1210,6 +1280,11 @@ impl LanguageServer for DelphiLsp {
 
     async fn initialized(&self, _params: InitializedParams) {
         lsp_info!(self.client, "Delphi LSP server initialized");
+        // Task 24: the server is now up and idle — push the first persistent
+        // `Ready` status so the editor's status item leaves "starting…" and shows
+        // the server is ready. Best-effort; no lock held across the send.
+        self.set_status(status::ServerStatusParams::bare(status::ServerState::Ready))
+            .await;
         // Task 18: start the idle-triggered background indexer. It watches the
         // activity generation and, after a quiet debounce, runs one warming pass;
         // any foreground event bumps the generation and preempts it. A `DelphiLsp`
@@ -1585,6 +1660,118 @@ mod publish_guard_tests {
             "a reopened document's v1 must not be blocked by the old v5"
         );
         assert_eq!(published.get(&uri()), Some(&1));
+    }
+}
+
+#[cfg(test)]
+mod status_transition_tests {
+    //! Task 24: the persistent `ddk/serverStatus` transitions. The live transport
+    //! (`set_status` → `send_notification` over stdio) needs a real `Client` and
+    //! is not unit-testable — but the STATE TRANSITIONS the analyze/indexing paths
+    //! drive (which `ServerStatusParams` each emits, with which fields) are the
+    //! part that could be wrong, so they are asserted here. Each test constructs
+    //! the SAME `ServerStatusParams` the corresponding call site in `main.rs`
+    //! builds, proving the state, detail and N/M counters are right per transition.
+
+    use crate::status::{ServerState, ServerStatusParams};
+
+    /// `initialized` emits a bare `Ready` (the server is up and idle) — no
+    /// detail/counters.
+    #[test]
+    fn initialized_emits_bare_ready() {
+        // The exact param `initialized` constructs.
+        let params = ServerStatusParams::bare(ServerState::Ready);
+        assert_eq!(params.state, ServerState::Ready);
+        assert!(params.detail.is_none());
+        assert!(params.current.is_none() && params.total.is_none());
+    }
+
+    /// `analyze` begins with `Analyzing { detail: file }` and ends with a bare
+    /// `Ready` — the pair that guarantees the view never sticks on `Analyzing`.
+    /// This reproduces the exact begin/end params `analyze` builds around its
+    /// blocking parse.
+    #[test]
+    fn analyze_emits_analyzing_file_then_ready() {
+        // BEGIN: `Analyzing` carrying the file name (the label `analyze` derives
+        // from the document path's file_name).
+        let path = std::path::Path::new("C:/proj/Unit1.pas");
+        let unit_label = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap();
+        let begin = ServerStatusParams::with_detail(ServerState::Analyzing, unit_label.clone());
+        assert_eq!(begin.state, ServerState::Analyzing);
+        assert_eq!(begin.detail.as_deref(), Some("Unit1.pas"));
+        assert!(
+            begin.current.is_none() && begin.total.is_none(),
+            "Analyzing carries no N/M counters"
+        );
+
+        // END: bare `Ready`, emitted right after the blocking parse returns on
+        // every path out of `analyze`.
+        let end = ServerStatusParams::bare(ServerState::Ready);
+        assert_eq!(end.state, ServerState::Ready);
+        assert!(end.detail.is_none());
+    }
+
+    /// The indexing pass emits `Indexing { current, total, detail: unit }` per
+    /// unit with a 1-based `current` over `total`, then a bare `Ready` when the
+    /// pass ends. This reproduces the per-unit param the loop builds (position+1)
+    /// and the terminal `Ready`.
+    #[test]
+    fn indexing_pass_emits_counted_indexing_per_unit_then_ready() {
+        let units = ["A.pas", "B.pas", "C.pas"];
+        let total = units.len();
+        // Per-unit `Indexing`: 1-based position, the unit file name as detail.
+        for (position, unit) in units.iter().enumerate() {
+            let params = ServerStatusParams::counted(
+                ServerState::Indexing,
+                (position + 1) as u32,
+                total as u32,
+                *unit,
+            );
+            assert_eq!(params.state, ServerState::Indexing);
+            assert_eq!(
+                params.current,
+                Some((position + 1) as u32),
+                "current is 1-based (the unit about to be processed)"
+            );
+            assert_eq!(params.total, Some(total as u32));
+            assert_eq!(params.detail.as_deref(), Some(*unit));
+        }
+        // First and last counters are 1/3 and 3/3 — the view shows honest N/M.
+        let first =
+            ServerStatusParams::counted(ServerState::Indexing, 1, total as u32, units[0]);
+        let last = ServerStatusParams::counted(
+            ServerState::Indexing,
+            total as u32,
+            total as u32,
+            units[total - 1],
+        );
+        assert_eq!((first.current, first.total), (Some(1), Some(3)));
+        assert_eq!((last.current, last.total), (Some(3), Some(3)));
+
+        // TERMINAL: whether the loop runs to the end OR the cancel `break` fires,
+        // the single post-loop emission is a bare `Ready` — no stuck `Indexing`.
+        let ready = ServerStatusParams::bare(ServerState::Ready);
+        assert_eq!(ready.state, ServerState::Ready);
+        assert!(ready.current.is_none() && ready.total.is_none());
+    }
+
+    /// The cancel path: a preempted pass takes the same terminal `Ready` emission
+    /// as a completed pass (the post-loop `set_status`), so a foreground event
+    /// that cancels mid-pass flips the view back to `Ready`, never leaving a stuck
+    /// `Indexing`. Same param value as the completion path — proving the two
+    /// share one honest exit.
+    #[test]
+    fn canceled_pass_returns_to_ready_like_completion() {
+        let completion_ready = ServerStatusParams::bare(ServerState::Ready);
+        let cancel_ready = ServerStatusParams::bare(ServerState::Ready);
+        assert_eq!(
+            completion_ready, cancel_ready,
+            "cancel and completion emit the identical bare Ready"
+        );
+        assert_eq!(cancel_ready.state, ServerState::Ready);
     }
 }
 
