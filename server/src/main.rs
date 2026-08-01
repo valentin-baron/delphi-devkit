@@ -305,23 +305,15 @@ impl DelphiLsp {
 
     /// The folded unit key a read handler should query for `uri`, reusing the
     /// meta the last `analyze` cached (Task-15 part 1 — read handlers never
-    /// re-parse). If no key is recorded yet (a read arrived before any `analyze`
-    /// completed for this URL, e.g. the very first hover after open), run a
-    /// SINGLE `analyze` for the document's current version and look up once more.
-    /// Never loops: at most one analyze, then whatever the map holds (possibly
-    /// still `None` for a non-unit source or unparseable buffer → the caller
-    /// returns an honest empty result, never a wrong answer).
+    /// re-parse). Read handlers NEVER trigger an `analyze` themselves: `did_open`
+    /// and `did_change` are the sole analyze drivers. A read that arrives before
+    /// the open/change analyze has recorded a key returns `None` → the caller
+    /// yields an honest empty result, and the feature resolves a moment later
+    /// once the driving analyze completes (the editor re-requests). This is
+    /// deliberate: having reads trigger analyze let a launch-time burst of
+    /// feature requests each spawn a full transitive-parse `analyze` before the
+    /// first one recorded its key — concurrent parse storms that OOM the server.
     async fn unit_key_for_read(&self, uri: &Url) -> Option<delphi_parser::context::Identifier> {
-        if let Some(key) = self.analyzed_units.lock().await.get(uri).copied() {
-            return Some(key);
-        }
-        // Not analyzed yet — trigger exactly one analyze for the current version,
-        // then retry the lookup once.
-        let version = {
-            let store = self.documents.lock().await;
-            store.get(uri)?.version
-        };
-        self.analyze(uri.clone(), version).await;
         self.analyzed_units.lock().await.get(uri).copied()
     }
 
