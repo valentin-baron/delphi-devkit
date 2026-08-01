@@ -1,0 +1,106 @@
+//! LSP query API surface over cached [`UnitMeta`]s (task 5, Deliverable A).
+//!
+//! This is the query layer delphi-devkit consumes to answer
+//! `textDocument/{definition,references,completion,hover}` — the LSP *server*
+//! itself is NOT built here (SESSION decision); these methods return owned,
+//! location-bearing results the devkit maps to LSP types.
+//!
+//! GOVERNING RULE (same family as scoped `Declared`/SizeOf): a query must never
+//! return a WRONG answer. Insufficient information yields empty/none, never a
+//! guess. Definition/references resolve through the SAME dependency-recorded,
+//! cycle-safe machinery as scoped `Declared` — an unresolved target is
+//! no-result, never a wrong location.
+//!
+//! The query types live here; the methods that need cache/loader/arena access
+//! live on [`crate::driver::ProjectSession`].
+
+use crate::ast::Visibility;
+use crate::context::Identifier;
+use crate::meta::CodeLocation;
+use crate::unit_cache::{MemberKind, SymbolKind};
+
+/// What the identifier under a cursor position resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetKind {
+    /// The declaring occurrence of an interface symbol (`type TFoo = …`).
+    Declaration,
+    /// The declaring occurrence of a member (`FBar: Integer;` inside a type).
+    Member,
+    /// A use of some identifier (interface body reference or implementation
+    /// occurrence). Over-approximating: the usage index does not yet resolve
+    /// scopes, so this is a candidate identity (its folded key), not a proven
+    /// binding.
+    Usage,
+}
+
+/// The identifier occurrence under a byte position: the folded lookup key, its
+/// display spelling, what kind of thing it is and its exact source span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryTarget {
+    /// Case-folded lookup key — feeds `definition`/`references`.
+    pub key: Identifier,
+    /// Display spelling (as written at this occurrence).
+    pub display: Identifier,
+    pub kind: TargetKind,
+    /// Exact source span of the occurrence.
+    pub location: CodeLocation,
+    /// When the occurrence is a member (or a `Type.Member` usage), the owning
+    /// type's folded key — needed to resolve a member definition. `None` for a
+    /// top-level symbol or an unqualified usage.
+    pub owner_type: Option<Identifier>,
+}
+
+/// One completion candidate. Carries the rich member/symbol facts from the
+/// derived interface index (task 2) so the devkit can render kind/type/detail.
+#[derive(Debug, Clone)]
+pub struct Completion {
+    /// Display spelling to insert/show.
+    pub display: Identifier,
+    /// Folded key (de-duplication identity).
+    pub key: Identifier,
+    pub kind: CompletionKind,
+    /// Declared simple type key (field/property/return type), when known.
+    pub type_key: Option<Identifier>,
+    /// Method directive keys (`virtual`/`override`/…), empty for non-methods.
+    pub directives: Vec<Identifier>,
+    /// Member visibility (only meaningful for member completions).
+    pub visibility: Visibility,
+}
+
+/// The kind of a completion candidate — either a top-level symbol kind or a
+/// member kind, unified so the devkit maps one enum to LSP `CompletionItemKind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionKind {
+    Symbol(SymbolKind),
+    Member(MemberKind),
+    /// A compiler built-in surfaced at the top level (`Integer`, `string`, …).
+    Builtin,
+}
+
+/// Where a diagnostic came from, so the devkit can group/filter them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticSource {
+    /// A cursor/parser finding (unknown `{$IF}`, dropped attribute, recovery
+    /// resync, lexer error in an active region).
+    Parse,
+    /// A DFM↔PAS linker finding (dangling component, missing handler, …).
+    Dfm,
+}
+
+/// One diagnostic in the unit's unified list (parse + dfm), for
+/// `textDocument/publishDiagnostics`.
+#[derive(Debug, Clone)]
+pub struct UnifiedDiagnostic {
+    pub source: DiagnosticSource,
+    /// The `.pas` source location the finding refers to, when one exists. Parse
+    /// findings always carry one. A DFM finding carries a pas location only when
+    /// it names a concrete pas member (e.g. a type mismatch points at the
+    /// field); a finding whose only anchor is a byte offset INTO the dfm file
+    /// leaves this `None` (its dfm-side offset is exposed via [`Self::dfm_offset`])
+    /// — never a fabricated pas location (the never-wrong rule).
+    pub location: Option<CodeLocation>,
+    /// For a DFM finding, the byte offset into the dfm file. `None` for parse
+    /// findings.
+    pub dfm_offset: Option<usize>,
+    pub message: String,
+}
