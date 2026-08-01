@@ -49,9 +49,11 @@ fn format_symbol(kind: SymbolKind, name: &str) -> String {
 /// A type member. Qualifies with the owning type (`TFoo.Bar`) and renders the
 /// facts the parser captured:
 /// - a field/property with a known simple type → `Owner.Name: T;`;
-/// - a method → `procedure Owner.Name; virtual;` (return type unknown from the
-///   member index → no `: T`, so a function still renders as `procedure`-shaped
-///   without a fabricated return type — the directives ARE known and shown);
+/// - a method → `function Owner.Name: T; virtual;` when the member index carries
+///   a simple return type (`type_key` = `Some`, a FUNCTION), or
+///   `procedure Owner.Name; virtual;` when it does not (`type_key` = `None`, a
+///   PROCEDURE — or a function whose return type is not a simple key, in which
+///   case we never fabricate one). The directives ARE known and shown;
 /// - an anonymous/complex type (`type_key` None) → kind + qualified name only.
 /// A leading visibility keyword is prefixed as a comment-free modifier when it
 /// is a meaningful, non-`Unspecified` value.
@@ -73,10 +75,17 @@ fn format_member(info: &HoverInfo, kind: MemberKind, name: &str) -> String {
         },
         MemberKind::Method => {
             let directives = format_directives(info);
-            // The member index does not distinguish procedure vs. function
-            // return type, so render the neutral `procedure`-shaped signature
-            // and append the KNOWN directives — never a fabricated return type.
-            format!("procedure {qualified};{directives}")
+            // `type_key` carries a method's simple return type (parser sets it via
+            // `routine_return_type_key`): `Some` for a FUNCTION with a simple
+            // return type, `None` for a PROCEDURE (or a function whose return type
+            // is not a simple key — never fabricated). Render `function …: T;` vs
+            // `procedure …;` accordingly, then the KNOWN directives.
+            match type_suffix(info) {
+                Some(return_type) => {
+                    format!("function {qualified}: {return_type};{directives}")
+                }
+                None => format!("procedure {qualified};{directives}"),
+            }
         }
         MemberKind::NestedConst => match type_suffix(info) {
             Some(type_name) => format!("const {qualified}: {type_name};"),
@@ -163,15 +172,33 @@ mod tests {
     }
 
     #[test]
-    fn method_shows_directives_not_a_fabricated_return_type() {
+    fn procedure_member_shows_directives_and_no_return_type() {
+        // A PROCEDURE member carries `type_key = None` → `procedure`, no `: T`.
         let mut hover = info(CompletionKind::Member(MemberKind::Method));
         hover.display = globals::intern("Greet");
         hover.owner_type = Some(globals::intern("TUser"));
+        hover.type_key = None;
         hover.directives = vec![globals::intern("virtual")];
         let text = format_hover(&hover);
         assert!(text.contains("procedure TUser.Greet; virtual;"), "{text}");
         // no invented `: SomeType`
         assert!(!text.contains(':'), "no fabricated return type: {text}");
+    }
+
+    #[test]
+    fn function_member_shows_function_keyword_and_return_type() {
+        // A FUNCTION member carries `type_key = Some(ret)` → `function` keyword and
+        // the resolved `: <return type>`, plus the known directives.
+        let mut hover = info(CompletionKind::Member(MemberKind::Method));
+        hover.display = globals::intern("Compute");
+        hover.owner_type = Some(globals::intern("TUser"));
+        hover.type_key = Some(globals::intern("Integer"));
+        hover.directives = vec![globals::intern("virtual")];
+        let text = format_hover(&hover);
+        assert!(
+            text.contains("function TUser.Compute: Integer; virtual;"),
+            "{text}"
+        );
     }
 
     #[test]
