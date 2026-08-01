@@ -610,7 +610,7 @@ impl ProjectSession {
         if let Some(owner) = meta.interface().find(owner_key) {
             return owner
                 .find_member(member_key)
-                .map(|member| member_hover(member, owner_key, occurrence));
+                .map(|member| member_hover(member, owner.name, occurrence));
         }
         let loader = self.make_loader();
         for import in imports_reversed(meta) {
@@ -618,7 +618,7 @@ impl ProjectSession {
                 if let Some(owner) = imported.interface().find(owner_key) {
                     return owner
                         .find_member(member_key)
-                        .map(|member| member_hover(member, owner_key, occurrence));
+                        .map(|member| member_hover(member, owner.name, occurrence));
                 }
             }
         }
@@ -1073,10 +1073,11 @@ fn symbol_hover(
 }
 
 /// Build [`crate::query::HoverInfo`] from a type member, carrying its declared
-/// type key (when simple), directives, visibility and owning type.
+/// type key (when simple), directives, visibility and the owner's DISPLAY name
+/// (`owner_display`, so hover reads `TUser.Greet`, not the folded `TUSER`).
 fn member_hover(
     member: &crate::unit_cache::MemberSymbol,
-    owner_key: Identifier,
+    owner_display: Identifier,
     occurrence: CodeLocation,
 ) -> crate::query::HoverInfo {
     crate::query::HoverInfo {
@@ -1085,7 +1086,7 @@ fn member_hover(
         type_key: member.type_key,
         directives: member.directives.clone(),
         visibility: member.visibility,
-        owner_type: Some(owner_key),
+        owner_type: Some(owner_display),
         occurrence,
     }
 }
@@ -1500,7 +1501,12 @@ mod tests {
             .hover_info(client_key, boss.location.span.start)
             .expect("hover over the Boss field");
         assert_eq!(hover.kind, CompletionKind::Member(MemberKind::Field));
-        assert_eq!(hover.owner_type, Some(session.context.intern_key("TManager")));
+        // owner_type carries the owner's DISPLAY name (`TManager`), not the
+        // folded lookup key.
+        assert_eq!(
+            hover.owner_type.map(crate::globals::resolve),
+            Some("TManager")
+        );
         assert_eq!(
             hover.type_key,
             Some(session.context.intern_key("TUser")),

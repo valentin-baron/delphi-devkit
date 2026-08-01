@@ -105,8 +105,10 @@ pub struct HoverInfo {
     /// The declaration's visibility (only meaningful for a member; a top-level
     /// symbol carries `Unspecified`).
     pub visibility: Visibility,
-    /// The owning type's key when the symbol is a member (`Owner.Member`),
-    /// `None` for a top-level symbol.
+    /// The owning type's DISPLAY name when the symbol is a member
+    /// (`Owner.Member`) — as written at the owner's declaration, so the hover
+    /// reads `TUser.Greet`, not the folded lookup key `TUSER.Greet`. `None` for
+    /// a top-level symbol.
     pub owner_type: Option<Identifier>,
     /// The span of the OCCURRENCE under the cursor (not the declaration) — the
     /// devkit maps this to the hover's highlight range in the requesting

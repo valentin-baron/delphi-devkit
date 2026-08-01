@@ -1,5 +1,6 @@
 mod diagnostics;
 mod documents;
+mod hover;
 mod locations;
 mod positions;
 mod session;
@@ -285,6 +286,70 @@ impl DelphiLsp {
         }
     }
 
+    /// Resolve hover for `(uri, position)`: the symbol under the cursor → its
+    /// declared facts (kind, type, directives, visibility, owner) → markdown.
+    ///
+    /// Same async/lock discipline as `resolve_definition`: the buffer text is
+    /// copied out under the store lock, the parser query runs on `spawn_blocking`
+    /// with the session lock via `blocking_lock()` (never across `.await`). The
+    /// hover's highlight range is the OCCURRENCE span under the cursor, mapped
+    /// through the requesting document's OWN line index (the occurrence is in
+    /// this buffer). No honest facts → `None`, never a fabricated signature.
+    async fn resolve_hover(&self, uri: Url, position: Position) -> Option<Hover> {
+        let path = session::uri_to_path(&uri)?;
+
+        let text = {
+            let store = self.documents.lock().await;
+            store.get(&uri)?.text().to_string()
+        };
+
+        let inputs = session::resolve_active_project_inputs().await;
+        self.session
+            .ensure_open(
+                inputs.dproj,
+                inputs.configuration,
+                inputs.platform,
+                inputs.profile,
+                inputs.standard_source_paths,
+            )
+            .await;
+
+        let session_handle = self.session.handle();
+        let parse_path = session::document_path(&path);
+        let result = tokio::task::spawn_blocking(move || {
+            let index = positions::LineIndex::new(text);
+            let offset = index.offset_of(position) as u32;
+            let mut guard = session_handle.blocking_lock();
+            let project_session = guard.as_mut()?;
+            let (_, meta) = project_session.parse_buffer(&parse_path, index.text()).ok()?;
+            let unit_key = meta?.name();
+            let info = project_session.hover_info(unit_key, offset)?;
+            // The occurrence span is in THIS buffer, so its range maps through
+            // this document's own line index (already built as `index`).
+            let range = Range {
+                start: index.position_of(info.occurrence.span.start as usize),
+                end: index.position_of(info.occurrence.span.end as usize),
+            };
+            let markdown = hover::format_hover(&info);
+            Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: markdown,
+                }),
+                range: Some(range),
+            })
+        })
+        .await;
+
+        match result {
+            Ok(hover) => hover,
+            Err(join_error) => {
+                lsp_error!(self.client, "hover task failed: {}", join_error);
+                None
+            }
+        }
+    }
+
     async fn projects_compile(
         &self,
         params: CompileProjectParams,
@@ -459,8 +524,8 @@ impl LanguageServer for DelphiLsp {
         // Advertise ONLY what this server backs: incremental text document sync
         // (so the editor streams open/change/close of buffers), pushed
         // diagnostics (publishDiagnostics needs no capability flag), plus the
-        // go-to-definition provider wired in Task 9. The remaining feature
-        // providers — completion, references, hover, rename, signatureHelp,
+        // go-to-definition and hover providers wired in Task 9. The remaining
+        // feature providers — completion, references, rename, signatureHelp,
         // semanticTokens — stay OFF; a capability is claimed only once backed.
         return Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -468,6 +533,7 @@ impl LanguageServer for DelphiLsp {
                     TextDocumentSyncKind::INCREMENTAL,
                 )),
                 definition_provider: Some(OneOf::Left(true)),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -544,6 +610,18 @@ impl LanguageServer for DelphiLsp {
             .resolve_definition(uri, position)
             .await
             .map(GotoDefinitionResponse::Array))
+    }
+
+    // ─── Hover ──────────────────────────────────────────────────────────
+    //
+    // Resolve the symbol under the cursor to its declared facts (kind, type,
+    // directives, visibility, owner) — cross-unit through the same machinery as
+    // definition — and format them as markdown. No honest facts → `None`, never
+    // a fabricated signature.
+    async fn hover(&self, params: HoverParams) -> jsonrpc::Result<Option<Hover>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        Ok(self.resolve_hover(uri, position).await)
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
