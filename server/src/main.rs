@@ -5,6 +5,7 @@ mod documents;
 mod hover;
 mod locations;
 mod positions;
+mod semantic;
 mod session;
 mod signature;
 
@@ -563,6 +564,64 @@ impl DelphiLsp {
         }
     }
 
+    /// Resolve `textDocument/semanticTokens/full` for `uri`: the whole buffer's
+    /// classified tokens, delta-encoded for LSP.
+    ///
+    /// Same async/lock discipline as `resolve_definition`: the buffer text is
+    /// copied out under the store lock, the parser query + encoding run on
+    /// `spawn_blocking` with the session lock via `blocking_lock()` (never held
+    /// across `.await`). The parser's `semantic_tokens` query already emits a
+    /// token ONLY when the classification is certain (an unresolved identifier is
+    /// omitted); this handler only ENCODES — split-per-line + UTF-16 + delta — so
+    /// the never-a-wrong-color guarantee is preserved. The tokens' spans are into
+    /// THIS buffer's source, so they map through this document's own line index.
+    ///
+    /// Returns `None` when there is no session/meta (the editor shows nothing);
+    /// an empty token list is a legitimate answer (e.g. an empty document).
+    async fn resolve_semantic_tokens(&self, uri: Url) -> Option<SemanticTokensResult> {
+        let path = session::uri_to_path(&uri)?;
+
+        let text = {
+            let store = self.documents.lock().await;
+            store.get(&uri)?.text().to_string()
+        };
+
+        let inputs = session::resolve_active_project_inputs().await;
+        self.session
+            .ensure_open(
+                inputs.dproj,
+                inputs.configuration,
+                inputs.platform,
+                inputs.profile,
+                inputs.standard_source_paths,
+            )
+            .await;
+
+        let session_handle = self.session.handle();
+        let parse_path = session::document_path(&path);
+        let result = tokio::task::spawn_blocking(move || {
+            let index = positions::LineIndex::new(text);
+            let mut guard = session_handle.blocking_lock();
+            let project_session = guard.as_mut()?;
+            let (_, meta) = project_session.parse_buffer(&parse_path, index.text()).ok()?;
+            let unit_key = meta?.name();
+            let data = semantic::resolve_semantic_tokens(project_session, unit_key, &index);
+            Some(SemanticTokensResult::Tokens(SemanticTokens {
+                result_id: None,
+                data,
+            }))
+        })
+        .await;
+
+        match result {
+            Ok(tokens) => tokens,
+            Err(join_error) => {
+                lsp_error!(self.client, "semanticTokens task failed: {}", join_error);
+                None
+            }
+        }
+    }
+
     async fn projects_compile(
         &self,
         params: CompileProjectParams,
@@ -781,6 +840,23 @@ impl LanguageServer for DelphiLsp {
                     retrigger_characters: Some(vec![",".to_string()]),
                     work_done_progress_options: WorkDoneProgressOptions::default(),
                 }),
+                // semanticTokens (Full): syntax highlighting backed by the
+                // parser's `semantic_tokens` query. ADDITIVE over TextMate — the
+                // query emits a token only when the classification is CERTAIN (an
+                // unresolved identifier is omitted), so a semantic color is never
+                // wrong. The advertised LEGEND is `semantic::legend()`, the SAME
+                // ordered arrays the delta encoder indexes into (one source of
+                // truth). Range is not advertised (Full only).
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(
+                        SemanticTokensOptions {
+                            work_done_progress_options: WorkDoneProgressOptions::default(),
+                            legend: semantic::legend(),
+                            range: Some(false),
+                            full: Some(SemanticTokensFullOptions::Bool(true)),
+                        },
+                    ),
+                ),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -920,6 +996,22 @@ impl LanguageServer for DelphiLsp {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         Ok(self.resolve_signature_help(uri, position).await)
+    }
+
+    // ─── Semantic tokens (syntax highlighting) ─────────────────────────────
+    //
+    // Whole-buffer classified tokens, delta-encoded. ADDITIVE over the editor's
+    // TextMate grammar: the parser query emits a token only when the
+    // classification is CERTAIN, so an unresolved identifier is OMITTED (its
+    // TextMate color shows) — never a wrong semantic color. Multi-line spans are
+    // split per line and lengths are UTF-16, in `semantic::encode`. The parser
+    // work + encoding run on `spawn_blocking` behind the session lock.
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> jsonrpc::Result<Option<SemanticTokensResult>> {
+        let uri = params.text_document.uri;
+        Ok(self.resolve_semantic_tokens(uri).await)
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
