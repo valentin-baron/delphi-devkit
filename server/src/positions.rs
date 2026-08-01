@@ -61,6 +61,11 @@ impl LineIndex {
 
     /// Number of lines. A document with no trailing newline has one more line
     /// than it has newlines; a trailing `\n` adds a final empty line.
+    ///
+    /// Exercised by the position round-trip tests today; feature providers that
+    /// clamp a requested line to the document bound (e.g. folding/semantic-token
+    /// ranges) use it in a later task. Kept as the index's public API.
+    #[allow(dead_code)]
     pub fn line_count(&self) -> u32 {
         self.line_starts.len() as u32
     }

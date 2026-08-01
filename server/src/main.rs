@@ -122,6 +122,20 @@ impl DelphiLsp {
         };
 
         // Ensure the project session is open (blocking open, off-executor).
+        //
+        // Sequencing note (finding 4): `ensure_open` releases the session lock
+        // before the parse below re-acquires it in a separate `spawn_blocking`.
+        // A concurrent `analyze` could, in that window, re-open the session for a
+        // different identity. This is safe under the current model: there is ONE
+        // active project per process (the parser's interner/arena are process
+        // globals, so only one session can exist at a time — see `session`), and
+        // every concurrent `analyze` resolves the SAME active-project inputs, so
+        // any interleaved re-open targets the identical `(dproj, config,
+        // platform)` and is a no-op (`ensure_open` returns early on an unchanged
+        // identity). Folding open+parse under a single lock acquisition would
+        // require threading the parse closure through the SessionManager; the
+        // window is documented rather than restructured because it cannot
+        // currently swap in a different-project session mid-parse.
         let inputs = session::resolve_active_project_inputs().await;
         self.session
             .ensure_open(

@@ -131,14 +131,21 @@ impl DocumentStore {
         self.documents.get(uri)
     }
 
+    // Store-introspection accessors used by tests today; wired to feature
+    // providers (definition/hover/references decide "is this file open?" before
+    // reading from the store vs. disk) in a later task. Kept as the store's
+    // intended public API rather than deleted.
+    #[allow(dead_code)]
     pub fn is_open(&self, uri: &Url) -> bool {
         self.documents.contains_key(uri)
     }
 
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.documents.len()
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.documents.is_empty()
     }

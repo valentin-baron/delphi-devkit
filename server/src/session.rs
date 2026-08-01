@@ -88,6 +88,14 @@ impl SessionManager {
     ///
     /// Runs the (blocking) open on a blocking thread and never holds the lock
     /// across `.await`.
+    ///
+    /// Sequencing note (finding 4): this releases the session lock before the
+    /// caller's parse re-acquires it. That window cannot swap in a
+    /// *different-project* session under the current model — one active project
+    /// per process (process-global interner/arena) and every concurrent caller
+    /// resolves the same inputs, so an interleaved re-open targets the identical
+    /// identity and returns early here. See `DelphiLsp::analyze` for the full
+    /// argument.
     pub async fn ensure_open(
         &self,
         dproj: Option<PathBuf>,
@@ -409,13 +417,20 @@ fn fallback_inputs() -> ProjectInputs {
         profile: CompilerProfile {
             compiler_version: 36.0,
             rtl_version: None,
+            // Keep this set aligned with `compiler_profile(.., "Win32")`: the
+            // VERxxx condition + compiler-family symbols + the full Win32
+            // auto-define set (CPU386/CPUX86/CPU32BITS), so a fallback buffer
+            // parses under the same defines a real Win32 project would.
             defines: vec![
                 "VER360".to_string(),
+                "CONDITIONALEXPRESSIONS".to_string(),
+                "UNICODE".to_string(),
+                "ASSEMBLER".to_string(),
                 "MSWINDOWS".to_string(),
                 "WIN32".to_string(),
+                "CPU386".to_string(),
                 "CPUX86".to_string(),
-                "UNICODE".to_string(),
-                "CONDITIONALEXPRESSIONS".to_string(),
+                "CPU32BITS".to_string(),
             ],
         },
         standard_source_paths: Vec::new(),
