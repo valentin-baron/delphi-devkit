@@ -233,6 +233,13 @@ fn pop_matching(stack: &mut Vec<Frame>, open: u8) {
 /// identifier's LAST dotted segment (so `symbol_at` resolves the member name of
 /// `Obj.Method(`). `None` when no identifier precedes the `(` (a grouping paren,
 /// or a `)(` / `](` chain we do not treat as a named call).
+///
+/// LIMITATION (honest None): an EXPLICIT generic instantiation call
+/// `Foo<Integer>(...)` yields no callee here — the byte immediately before the
+/// `(` is `>`, not an identifier byte, so no name is walked back. This is an
+/// honest `None` (no wrong signature), just undocumented before; the
+/// non-instantiated `Foo(...)` form resolves normally. (Sibling to the
+/// instance-receiver limitation noted in `signature.rs`.)
 fn callee_before(bytes: &[u8], paren_index: usize) -> Option<usize> {
     // Skip whitespace immediately before the `(`.
     let mut position = paren_index;
