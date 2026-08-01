@@ -1,10 +1,16 @@
+mod documents;
 mod positions;
+
+use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::io::{stdin, stdout};
+use tokio::sync::Mutex;
 use tower_lsp::{Client, async_trait, jsonrpc};
 use tower_lsp::{LanguageServer, LspService, Server};
 use tower_lsp::lsp_types::*;
+
+use documents::DocumentStore;
 
 use ddk_core::lsp_types::*;
 use ddk_core::projects::*;
@@ -13,14 +19,29 @@ use ddk_core::format::Formatter;
 use ddk_core::files::dproj as dproj_cache;
 use ddk_core::try_finish_event;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct DelphiLsp {
     client: Client,
+    /// Open-document store (editor buffers). Behind an async mutex: every
+    /// access is a short critical section (insert/replace/read text) that never
+    /// spans a blocking parse — the parse runs on a `spawn_blocking` task AFTER
+    /// the text has been copied out, so the lock is never held across `.await`.
+    documents: Arc<Mutex<DocumentStore>>,
 }
 
 impl DelphiLsp {
     pub fn new(client: Client) -> Self {
-        return DelphiLsp { client }
+        DelphiLsp {
+            client,
+            documents: Arc::new(Mutex::new(DocumentStore::new())),
+        }
+    }
+
+    /// Analyze an open document and publish its diagnostics. The parse/session
+    /// wiring is added in a later step; for now this is the single hook the
+    /// lifecycle handlers call so publishing is centralized.
+    async fn analyze(&self, _uri: Url, _version: i32) {
+        // Session-backed parse + publishDiagnostics wired in a subsequent step.
     }
 
     async fn projects_compile(
@@ -194,8 +215,19 @@ impl LanguageServer for DelphiLsp {
                 ddk_core::encoding::set_encoding(enc);
             }
         }
+        // Advertise ONLY what this task backs: incremental text document sync
+        // (so the editor streams open/change/close of buffers) plus pushed
+        // diagnostics (publishDiagnostics needs no capability flag). Every
+        // feature provider — definition, completion, references, hover, rename,
+        // signatureHelp, semanticTokens — stays OFF; those are later tasks and
+        // must not be claimed before they are implemented.
         return Ok(InitializeResult {
-            capabilities: ServerCapabilities::default(), // none
+            capabilities: ServerCapabilities {
+                text_document_sync: Some(TextDocumentSyncCapability::Kind(
+                    TextDocumentSyncKind::INCREMENTAL,
+                )),
+                ..ServerCapabilities::default()
+            },
             server_info: Some(ServerInfo {
                 name: "DDK - Delphi Server".to_string(),
                 version: Some("0.1.0".to_string()),
@@ -220,6 +252,50 @@ impl LanguageServer for DelphiLsp {
             NotifyError::notify_json(&self.client, format!("Failed to apply configuration changes: {}", error), &settings).await;
         }
         try_finish_event!(self.client, settings, ());
+    }
+
+    // ─── Text document lifecycle ────────────────────────────────────────
+    //
+    // The store is the authoritative text for open buffers (unsaved edits live
+    // only here). Each handler takes the store lock for a short critical
+    // section, updates the buffer, and drops the lock. Analysis (parse →
+    // diagnostics) is wired on top in a later step; the lock is never held
+    // across the (blocking) parse.
+
+    async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        let document = params.text_document;
+        {
+            let mut store = self.documents.lock().await;
+            store.open(document.uri.clone(), document.version, document.text.clone());
+        }
+        self.analyze(document.uri, document.version).await;
+    }
+
+    async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        let uri = params.text_document.uri;
+        let version = params.text_document.version;
+        let updated = {
+            let mut store = self.documents.lock().await;
+            store.apply_change(&uri, version, params.content_changes)
+        };
+        // Only re-analyze when the change actually updated the buffer (an
+        // unopened document or a stale-version change yields `None`).
+        if updated.is_some() {
+            self.analyze(uri, version).await;
+        }
+    }
+
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        let uri = params.text_document.uri;
+        {
+            let mut store = self.documents.lock().await;
+            store.close(&uri);
+        }
+        // Clear diagnostics for the closed document: the editor keeps showing
+        // the last published set until we send an empty one.
+        self.client
+            .publish_diagnostics(uri, Vec::new(), None)
+            .await;
     }
 }
 
