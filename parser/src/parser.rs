@@ -64,7 +64,11 @@ fn is_unrecoverable(error: &ParseError) -> bool {
 /// The source location an error points at, if it carries one — the diagnostic
 /// anchor for recovery. `None` when the error has no intrinsic location (the
 /// caller falls back to the cursor's last position).
-fn error_location(error: &ParseError) -> Option<CodeLocation> {
+///
+/// Public so the session/LSP layer can anchor a hard-parse-failure squiggle at
+/// the actual error site (a precise `Error` diagnostic) instead of always
+/// falling back to the top of the document.
+pub fn error_location(error: &ParseError) -> Option<CodeLocation> {
     match error {
         ParseError::Cursor(CursorError::Lex(location))
         | ParseError::Cursor(CursorError::Condition { location, .. })

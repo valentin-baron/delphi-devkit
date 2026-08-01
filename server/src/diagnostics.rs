@@ -70,6 +70,41 @@ fn to_lsp(diagnostic: &UnifiedDiagnostic, buffer_file: FileId, index: &LineIndex
     }
 }
 
+/// Build the single `ERROR`-severity diagnostic for a hard, unrecoverable parse
+/// failure of the buffer being analyzed (the buffer no longer parses at all, so
+/// the prior granular set is stale and this one honest finding REPLACES it).
+///
+/// `span` is the failure's byte span in THIS buffer when the error carried an
+/// in-buffer location; the range is mapped exactly through `index`. When the
+/// error had no location, or its span falls outside this buffer's bytes (e.g. it
+/// originated in an included file), we anchor at the top of the document rather
+/// than fabricate a wrong specific range — the same never-a-wrong-answer rule as
+/// [`to_lsp`]. This is the sole producer of a `DiagnosticSeverity::ERROR` from a
+/// hard `parse_buffer` failure (giving [`Severity::Error`] a real producer).
+pub fn parse_failure_diagnostic(
+    message: &str,
+    span: Option<(usize, usize)>,
+    index: &LineIndex,
+) -> Diagnostic {
+    let text_len = index.text().len();
+    let range = match span {
+        Some((start, end)) if start <= end && end <= text_len => Range {
+            start: index.position_of(start),
+            end: index.position_of(end),
+        },
+        // No location, or a span outside this buffer → honest top-of-document
+        // anchor, never a fabricated specific range.
+        _ => top_of_document(),
+    };
+    Diagnostic {
+        range,
+        severity: Some(DiagnosticSeverity::ERROR),
+        source: Some(source_label(DiagnosticSource::Parse).to_string()),
+        message: format!("failed to parse: {message}"),
+        ..Diagnostic::default()
+    }
+}
+
 /// A zero-length range at the very top of the document — the best-effort
 /// unit-level anchor for a finding that has no honest range in this buffer.
 fn top_of_document() -> Range {

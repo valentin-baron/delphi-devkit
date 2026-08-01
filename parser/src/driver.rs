@@ -43,30 +43,44 @@ use crate::watcher::{
     ReverseDependencyIndex, WatchError, apply_invalidation,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct SessionError {
     pub message: String,
+    /// The source location the failure points at, when it carries one — the
+    /// anchor an LSP layer uses to place a precise squiggle for a hard parse
+    /// failure. `None` when the failure has no intrinsic location (I/O, cache,
+    /// watcher errors), in which case the caller anchors at the top of the
+    /// document. Only [`ProjectSession::parse_buffer`] / `parse_source_file`
+    /// populate it (from [`crate::parser::error_location`]); every other
+    /// construction site leaves it `None`.
+    pub location: Option<CodeLocation>,
+}
+
+impl SessionError {
+    /// A message-only error with no source location (I/O, cache, watcher).
+    pub fn message(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            location: None,
+        }
+    }
 }
 
 impl From<ContextError> for SessionError {
     fn from(error: ContextError) -> Self {
-        Self { message: error.0 }
+        Self::message(error.0)
     }
 }
 
 impl From<CachePersistError> for SessionError {
     fn from(error: CachePersistError) -> Self {
-        Self {
-            message: error.message,
-        }
+        Self::message(error.message)
     }
 }
 
 impl From<WatchError> for SessionError {
     fn from(error: WatchError) -> Self {
-        Self {
-            message: error.message,
-        }
+        Self::message(error.message)
     }
 }
 
@@ -215,8 +229,8 @@ impl ProjectSession {
         &mut self,
         path: impl AsRef<Path>,
     ) -> Result<(ParseOutcome, Option<Arc<UnitMeta>>), SessionError> {
-        let file = self.arena.load(path).map_err(|error| SessionError {
-            message: format!("{}: {}", error.path.display(), error.message),
+        let file = self.arena.load(path).map_err(|error| {
+            SessionError::message(format!("{}: {}", error.path.display(), error.message))
         })?;
         let inserts_before = self.context.unit_cache.insert_count();
 
@@ -228,6 +242,7 @@ impl ProjectSession {
         let (outcome, meta) =
             pipeline::parse_and_cache(self.arena, &self.context, file, Some(loader))
                 .map_err(|error| SessionError {
+                    location: crate::parser::error_location(&error),
                     message: format!("parse failed: {error:?}"),
                 })?;
 
@@ -287,6 +302,7 @@ impl ProjectSession {
         let (outcome, meta) =
             pipeline::parse_and_cache(self.arena, &self.context, file, Some(loader)).map_err(
                 |error| SessionError {
+                    location: crate::parser::error_location(&error),
                     message: format!("parse failed: {error:?}"),
                 },
             )?;

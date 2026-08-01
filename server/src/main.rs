@@ -66,6 +66,21 @@ fn claim_publish_slot(published: &mut HashMap<Url, i32>, uri: &Url, version: i32
     }
 }
 
+/// The result of the blocking parse+diagnostics work in [`DelphiLsp::analyze`],
+/// carried out of the `spawn_blocking` task so the async layer can log (needs
+/// the `Client`) and publish under the version guard.
+enum AnalyzeOutcome {
+    /// A normal diagnostics set to publish (an empty vec CLEARS the buffer's
+    /// squiggles — no session, non-unit source, or clean parse).
+    Publish(Vec<Diagnostic>),
+    /// A hard, unrecoverable parse failure: publish `diagnostics` (a single
+    /// ERROR finding replacing the stale set) and log `message`.
+    ParseFailure {
+        diagnostics: Vec<Diagnostic>,
+        message: String,
+    },
+}
+
 impl DelphiLsp {
     pub fn new(client: Client) -> Self {
         DelphiLsp {
@@ -161,37 +176,51 @@ impl DelphiLsp {
             let Some(project_session) = guard.as_mut() else {
                 // No session (unresolvable + fallback failed) → clear
                 // diagnostics rather than leaving a stale set.
-                return Ok(Some(Vec::new()));
+                return AnalyzeOutcome::Publish(Vec::new());
             };
             match project_session.parse_buffer(&parse_path, index.text()) {
                 Ok((_, Some(meta))) => {
                     let unit_key = meta.name();
                     let buffer_file = meta.ast.name.location.file;
                     let unified = project_session.diagnostics(unit_key);
-                    Ok(Some(diagnostics::to_lsp_diagnostics(&unified, buffer_file, &index)))
+                    AnalyzeOutcome::Publish(diagnostics::to_lsp_diagnostics(
+                        &unified,
+                        buffer_file,
+                        &index,
+                    ))
                 }
                 // A non-unit source (program/library/package) produces no
                 // importable meta and thus no unit-keyed diagnostics here; clear.
-                Ok((_, None)) => Ok(Some(Vec::new())),
-                // A hard parse failure (unrecoverable directive structure): do
-                // not fabricate — publish nothing new (leave the prior set until
-                // the next successful parse). `Some(None)` signals "skip publish",
-                // but the error itself must be visible (see below).
-                Err(error) => Err(error),
+                Ok((_, None)) => AnalyzeOutcome::Publish(Vec::new()),
+                // A hard, unrecoverable parse failure: the buffer no longer
+                // parses at all, so the prior granular set is stale. Do NOT keep
+                // it and do NOT stay silent — REPLACE it with a single honest
+                // ERROR diagnostic ("failed to parse: <reason>") anchored at the
+                // error's actual location when it carries one (else top-of-doc).
+                // This is the sole producer of a hard-failure ERROR squiggle.
+                Err(error) => {
+                    let span = error
+                        .location
+                        .map(|location| (location.span.start as usize, location.span.end as usize));
+                    let diagnostic =
+                        diagnostics::parse_failure_diagnostic(&error.message, span, &index);
+                    AnalyzeOutcome::ParseFailure {
+                        diagnostics: vec![diagnostic],
+                        message: error.message,
+                    }
+                }
             }
         })
         .await;
 
         let lsp_diagnostics = match result {
-            Ok(Ok(Some(lsp_diagnostics))) => lsp_diagnostics,
-            // A recovered "nothing to publish" (unreachable today: the blocking
-            // task returns Some(..) or Err(..)) — keep the previous set.
-            Ok(Ok(None)) => return,
-            // Parse error → keep the previous diagnostics (skip publish), but
-            // surface the SessionError so a failing buffer is not silent.
-            Ok(Err(error)) => {
-                lsp_error!(self.client, "parse of {} failed: {}", uri, error.message);
-                return;
+            Ok(AnalyzeOutcome::Publish(lsp_diagnostics)) => lsp_diagnostics,
+            // Hard parse failure: publish the single ERROR diagnostic (replacing
+            // the stale set) AND still log — a failing buffer is now both visible
+            // to the user (a squiggle) and recorded in the log.
+            Ok(AnalyzeOutcome::ParseFailure { diagnostics, message }) => {
+                lsp_error!(self.client, "parse of {} failed: {}", uri, message);
+                diagnostics
             }
             Err(join_error) => {
                 lsp_error!(self.client, "analyze task failed: {}", join_error);
@@ -1103,6 +1132,74 @@ mod lifecycle_tests {
         assert_eq!(hints[0].source.as_deref(), Some("delphi-analysis"));
         // the hint sits on the uses-clause line (line index 2).
         assert_eq!(hints[0].range.start.line, 2);
+    }
+
+    /// A buffer edited into a genuinely UN-parseable state (an unrecoverable
+    /// conditional-directive structure) must not go silent: the hard-`Err` arm
+    /// of `analyze` REPLACES the stale set with a single `ERROR`-severity
+    /// diagnostic ("failed to parse: <reason>"). This exercises the exact steps
+    /// that arm runs — `parse_buffer` returns `Err`, and the failure is mapped to
+    /// the ERROR diagnostic via [`crate::diagnostics::parse_failure_diagnostic`]
+    /// — proving `Severity::Error` now has a real producer and the buffer gets a
+    /// squiggle instead of only a log line.
+    #[test]
+    fn unrecoverable_buffer_publishes_single_error_diagnostic() {
+        use crate::diagnostics::parse_failure_diagnostic;
+
+        let mut session = build_fallback();
+        // An unterminated `{$IFDEF}` (no matching `{$ENDIF}`) is an unrecoverable
+        // directive-structure error: the conditional-compilation skeleton the
+        // token cursor relies on is broken, so the parse fails hard rather than
+        // recovering. This is the "editing a file into a genuinely un-parseable
+        // state" case.
+        let text = "unit Broken;\ninterface\n{$IFDEF FOO}\ntype TThing = class end;\nimplementation\nend.";
+        let index = LineIndex::new(text.to_string());
+        let path = std::env::temp_dir().join("ddk-server-e2e").join("Broken.pas");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        // The parse fails hard — no meta, an `Err` carrying the failure message
+        // (and, when available, the error's source location).
+        let error = match session.parse_buffer(&path, index.text()) {
+            Err(error) => error,
+            Ok(_) => panic!("an unterminated {{$IFDEF}} is an unrecoverable parse failure"),
+        };
+
+        // Reproduce the hard-`Err` arm of `analyze`: map the failure to the
+        // single ERROR diagnostic that REPLACES the stale set.
+        let span = error
+            .location
+            .map(|location| (location.span.start as usize, location.span.end as usize));
+        let diagnostic = parse_failure_diagnostic(&error.message, span, &index);
+
+        // ERROR severity (the previously-dead `Severity::Error` now has a real
+        // producer), a "failed to parse" message, and the parse source label.
+        assert_eq!(
+            diagnostic.severity,
+            Some(DiagnosticSeverity::ERROR),
+            "an unrecoverable parse failure publishes an ERROR diagnostic: {diagnostic:?}"
+        );
+        assert!(
+            diagnostic.message.starts_with("failed to parse:"),
+            "the message states the parse failure: {diagnostic:?}"
+        );
+        assert_eq!(diagnostic.source.as_deref(), Some("delphi"));
+        // The unrecoverable class of failure (broken conditional-directive
+        // structure) is the one `parse_and_cache` surfaces as a hard `Err`, and
+        // that variant carries NO intrinsic location — so the anchor honestly
+        // falls back to the top of the document (never a fabricated specific
+        // range). The location THREADING is still wired (see `SessionError`), so
+        // any future hard failure that DOES carry a location gets a precise
+        // squiggle; for today's directive failure, top-of-document is correct.
+        assert_eq!(
+            diagnostic.range,
+            tower_lsp::lsp_types::Range::default(),
+            "no intrinsic location → honest top-of-document anchor: {diagnostic:?}"
+        );
+        // The published set is exactly this one honest finding — not empty (which
+        // would leave NO feedback) and not the stale prior set.
+        let published = vec![diagnostic];
+        assert_eq!(published.len(), 1, "exactly one replacing ERROR diagnostic");
+        assert!(published.iter().all(|d| d.severity == Some(DiagnosticSeverity::ERROR)));
     }
 
     /// A clean buffer produces an empty diagnostic set (didChange to valid code

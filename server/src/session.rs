@@ -158,9 +158,9 @@ impl SessionManager {
             Err(join_error) => {
                 // The blocking task panicked or was cancelled — never propagate,
                 // degrade to no session.
-                self.clear_on_error(SessionError {
-                    message: format!("session open task failed: {join_error}"),
-                })
+                self.clear_on_error(SessionError::message(format!(
+                    "session open task failed: {join_error}"
+                )))
                 .await;
                 false
             }
@@ -244,15 +244,14 @@ fn build_fallback_session(
     // identity canonicalizes the project path, so the placeholder file must
     // exist on disk — create it (idempotently) before building the identity.
     let scratch_base = std::env::temp_dir().join("ddk-server").join("fallback-cache");
-    std::fs::create_dir_all(&scratch_base).map_err(|error| SessionError {
-        message: format!("cannot create fallback cache dir: {error}"),
-    })?;
+    std::fs::create_dir_all(&scratch_base)
+        .map_err(|error| SessionError::message(format!("cannot create fallback cache dir: {error}")))?;
     let synthetic_dproj = scratch_base.join(format!("{configuration}-{platform}.dproj"));
     if !synthetic_dproj.exists() {
         // A minimal placeholder; its only role is to give the cache identity a
         // canonicalizable, project-stable path. Never parsed.
-        std::fs::write(&synthetic_dproj, b"<Project/>").map_err(|error| SessionError {
-            message: format!("cannot create fallback dproj placeholder: {error}"),
+        std::fs::write(&synthetic_dproj, b"<Project/>").map_err(|error| {
+            SessionError::message(format!("cannot create fallback dproj placeholder: {error}"))
         })?;
     }
     let identity = CacheIdentity {
@@ -262,7 +261,7 @@ fn build_fallback_session(
         compiler_version: 36.0,
     };
     let store = CacheStore::in_directory(&scratch_base, &identity)
-        .map_err(|error| SessionError { message: error.message })?;
+        .map_err(|error| SessionError::message(error.message))?;
 
     Ok(ProjectSession::from_parts(
         Arc::new(context),
