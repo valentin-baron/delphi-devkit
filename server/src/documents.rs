@@ -42,7 +42,7 @@ impl Document {
 
 /// The set of currently open documents. Lives behind the server's lock; every
 /// mutation is a single notification handler, so no document is read mid-edit.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct DocumentStore {
     documents: HashMap<Url, Document>,
 }

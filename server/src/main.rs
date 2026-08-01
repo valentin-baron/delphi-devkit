@@ -213,6 +213,78 @@ impl DelphiLsp {
         self.publish_if_newer(uri, lsp_diagnostics, version).await;
     }
 
+    /// Resolve go-to-definition for `(uri, position)`.
+    ///
+    /// Steps (all the parser work on a single `spawn_blocking` task, the session
+    /// lock taken with `blocking_lock()` and never held across `.await`):
+    /// 1. copy the open buffer's text out under the store lock; build its
+    ///    `LineIndex`; map `position` → a byte offset (the buffer's own text);
+    /// 2. clone the document store (cheap — a handful of open buffers) so the
+    ///    blocking task can consult it for open TARGET files without holding the
+    ///    async store lock across the parse;
+    /// 3. parse the buffer to obtain its unit key (`meta.name()`), then
+    ///    `symbol_at(offset)` → `definition(...)`;
+    /// 4. map each resulting `CodeLocation` to an LSP `Location` via Deliverable
+    ///    A, using the TARGET file's own text.
+    ///
+    /// Empty (no symbol under the cursor, or unresolved) → `None`: never a wrong
+    /// jump.
+    async fn resolve_definition(
+        &self,
+        uri: Url,
+        position: Position,
+    ) -> Option<Vec<Location>> {
+        let path = session::uri_to_path(&uri)?;
+
+        // The open buffer's authoritative text (unsaved edits live only here).
+        let text = {
+            let store = self.documents.lock().await;
+            store.get(&uri)?.text().to_string()
+        };
+        // Snapshot the document store so the blocking task can tell whether a
+        // TARGET file is open (reusing its live line index) without taking the
+        // async store lock across the parse.
+        let documents = { self.documents.lock().await.clone() };
+
+        // Ensure a session is open for the active project (same as `analyze`).
+        let inputs = session::resolve_active_project_inputs().await;
+        self.session
+            .ensure_open(
+                inputs.dproj,
+                inputs.configuration,
+                inputs.platform,
+                inputs.profile,
+                inputs.standard_source_paths,
+            )
+            .await;
+
+        let session_handle = self.session.handle();
+        let parse_path = session::document_path(&path);
+        let result = tokio::task::spawn_blocking(move || {
+            let index = positions::LineIndex::new(text);
+            let offset = index.offset_of(position) as u32;
+            let mut guard = session_handle.blocking_lock();
+            let project_session = guard.as_mut()?;
+            // Parse the buffer to get its unit key; a non-unit source (program/
+            // library/package) yields no importable meta → no definition here.
+            let (_, meta) = project_session.parse_buffer(&parse_path, index.text()).ok()?;
+            let unit_key = meta?.name();
+            // Identifier under the cursor → its declaration site(s), each mapped
+            // to an LSP Location from the TARGET file's own text. Unresolved or
+            // unmappable → None (never a fabricated jump).
+            locations::resolve_definition_locations(project_session, &documents, unit_key, offset)
+        })
+        .await;
+
+        match result {
+            Ok(mapped) => mapped,
+            Err(join_error) => {
+                lsp_error!(self.client, "definition task failed: {}", join_error);
+                None
+            }
+        }
+    }
+
     async fn projects_compile(
         &self,
         params: CompileProjectParams,
@@ -384,17 +456,18 @@ impl LanguageServer for DelphiLsp {
                 ddk_core::encoding::set_encoding(enc);
             }
         }
-        // Advertise ONLY what this task backs: incremental text document sync
-        // (so the editor streams open/change/close of buffers) plus pushed
-        // diagnostics (publishDiagnostics needs no capability flag). Every
-        // feature provider — definition, completion, references, hover, rename,
-        // signatureHelp, semanticTokens — stays OFF; those are later tasks and
-        // must not be claimed before they are implemented.
+        // Advertise ONLY what this server backs: incremental text document sync
+        // (so the editor streams open/change/close of buffers), pushed
+        // diagnostics (publishDiagnostics needs no capability flag), plus the
+        // go-to-definition provider wired in Task 9. The remaining feature
+        // providers — completion, references, hover, rename, signatureHelp,
+        // semanticTokens — stay OFF; a capability is claimed only once backed.
         return Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::INCREMENTAL,
                 )),
+                definition_provider: Some(OneOf::Left(true)),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -452,6 +525,25 @@ impl LanguageServer for DelphiLsp {
         if updated.is_some() {
             self.analyze(uri, version).await;
         }
+    }
+
+    // ─── Navigation: go-to-definition ──────────────────────────────────
+    //
+    // Map (Url, Position) → the identifier under the cursor → its declaration
+    // site(s), each turned into an LSP Location computed from the TARGET file's
+    // own text. An unresolved target (no symbol, or a definition the parser
+    // cannot place) yields `None` — the editor performs no jump, never a wrong
+    // one. The parser work runs on `spawn_blocking` behind the session lock.
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> jsonrpc::Result<Option<GotoDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        Ok(self
+            .resolve_definition(uri, position)
+            .await
+            .map(GotoDefinitionResponse::Array))
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {

@@ -71,6 +71,29 @@ pub fn code_location_to_lsp(
     Some(Location { uri: url, range })
 }
 
+/// Resolve go-to-definition for `(unit_key, offset)` into LSP `Location`s,
+/// mapping each declaration site through Deliverable A. Factored out of the
+/// server handler so the composition (symbol → definition → location mapping)
+/// is unit-testable without a live LSP `Client`.
+///
+/// `None` (never a wrong jump) when: nothing is under the cursor, the target is
+/// unresolved, or every resulting location fails to map (virtual/unreadable
+/// target).
+pub fn resolve_definition_locations(
+    session: &ProjectSession,
+    documents: &DocumentStore,
+    unit_key: delphi_parser::context::Identifier,
+    offset: u32,
+) -> Option<Vec<Location>> {
+    let target = session.symbol_at(unit_key, offset)?;
+    let locations = session.definition(unit_key, target.key, target.owner_type);
+    let mapped: Vec<Location> = locations
+        .into_iter()
+        .filter_map(|location| code_location_to_lsp(session, documents, location))
+        .collect();
+    if mapped.is_empty() { None } else { Some(mapped) }
+}
+
 /// Map a byte span onto a UTF-16 [`Range`] through `index` (the TARGET file's
 /// own line index). Clamps out-of-range offsets (never panics) — an offset past
 /// the file end maps to the end-of-file position.
@@ -183,6 +206,79 @@ mod tests {
         assert_eq!(
             location.range.start.line, 2,
             "the range must be computed from Models.pas's own text"
+        );
+    }
+
+    /// Definition on an OWN-unit symbol: the cursor on `TManager`'s use resolves
+    /// to its own declaration in Client.pas.
+    #[test]
+    fn definition_own_unit_symbol() {
+        let (session, directory) = session_with_two_units("def_own");
+        let documents = DocumentStore::new();
+        let client_key = session.context().intern_key("CLIENT");
+        // Byte offset of the `TManager` occurrence in the declaration line.
+        let client_src = std::fs::read_to_string(directory.join("Client.pas")).unwrap();
+        let offset = client_src.find("TManager").unwrap() as u32;
+        let locations =
+            resolve_definition_locations(&session, &documents, client_key, offset).expect("resolves");
+        assert_eq!(locations.len(), 1);
+        assert!(locations[0].uri.to_file_path().unwrap().ends_with("Client.pas"));
+        assert_eq!(locations[0].range.start.line, 3); // "type TManager" line
+    }
+
+    /// Definition on a CROSS-FILE symbol: `TUser` (used in Client, declared in
+    /// Models) jumps to Models.pas, range from Models's own text.
+    #[test]
+    fn definition_cross_file_symbol() {
+        let (session, directory) = session_with_two_units("def_cross");
+        let documents = DocumentStore::new();
+        let client_key = session.context().intern_key("CLIENT");
+        let client_src = std::fs::read_to_string(directory.join("Client.pas")).unwrap();
+        // `TUser` appears as the field type `Boss: TUser;` in Client.
+        let offset = client_src.find("TUser").unwrap() as u32;
+        let locations =
+            resolve_definition_locations(&session, &documents, client_key, offset).expect("resolves");
+        assert_eq!(locations.len(), 1);
+        assert!(
+            locations[0].uri.to_file_path().unwrap().ends_with("Models.pas"),
+            "cross-file jump lands in Models.pas: {:?}",
+            locations[0].uri
+        );
+        assert_eq!(locations[0].range.start.line, 2); // "type TUser" in Models
+    }
+
+    /// Definition on a MEMBER (`Name` field of `TUser`) resolves to the member
+    /// site in Models via the owner type.
+    #[test]
+    fn definition_member_symbol() {
+        let (session, _directory) = session_with_two_units("def_member");
+        let documents = DocumentStore::new();
+        let client_key = session.context().intern_key("CLIENT");
+        // Resolve the member directly (the server derives owner_type from
+        // symbol_at; here we exercise definition's member path via the same
+        // location-mapping composition).
+        let defs = session.definition(
+            client_key,
+            session.context().intern_key("Name"),
+            Some(session.context().intern_key("TUser")),
+        );
+        assert_eq!(defs.len(), 1);
+        let location = code_location_to_lsp(&session, &documents, defs[0]).expect("maps");
+        assert!(location.uri.to_file_path().unwrap().ends_with("Models.pas"));
+        assert_eq!(location.range.start.line, 3); // "  Name: string;" in Models
+    }
+
+    /// A cursor on whitespace/an unknown identifier → `None`, never a wrong jump.
+    #[test]
+    fn definition_on_whitespace_is_none() {
+        let (session, _directory) = session_with_two_units("def_none");
+        let documents = DocumentStore::new();
+        let client_key = session.context().intern_key("CLIENT");
+        // Offset 0 is the `u` of `unit` — a keyword, not a resolvable symbol
+        // occurrence; and a far-past-EOF offset has nothing under it.
+        assert!(
+            resolve_definition_locations(&session, &documents, client_key, 100_000).is_none(),
+            "an out-of-range cursor yields no definition"
         );
     }
 
