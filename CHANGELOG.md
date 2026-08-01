@@ -6,6 +6,11 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ## [Unreleased]
 
+### Added
+
+- **ObjectPascal syntax highlighting (TextMate grammar)**: the `objectpascal` language now ships an original `source.objectpascal` TextMate grammar, so base coloring covers comments, single-quoted strings (with `''` escapes and `#char`/`#$hex` codes), numbers (`$hex`, `%binary`, decimal, floats with exponent), case-insensitive keywords (control/declaration/word-operators), built-in types, and operators/punctuation. Compiler directives `{$…}` / `(*$…*)` are scoped distinctly (`keyword.control.directive`), not as plain comments. Contextual keywords (`name`/`index`/`read`/`write`/…) are deliberately left uncolored in identifier position; the LSP semantic-token layer refines identifiers on top.
+- **LSP cache persistence**: the language server now persists its parsed-unit snapshot to `%LOCALAPPDATA%`. On `textDocument/didSave` the saved file is parsed from disk (so it and its imports become persistable on-disk units) and the snapshot is written; the server also saves on `shutdown` (best-effort). Actively-edited unsaved buffers are never persisted (they cannot survive a save/load round-trip by design). Long sessions therefore keep a warm cache across restarts.
+
 ## [2.5.1] - 2026-07-31
 
 ### Added
