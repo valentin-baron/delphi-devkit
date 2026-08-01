@@ -7,7 +7,7 @@
 //! chain-local. Concurrent chains share only the process-wide cache, where
 //! a duplicate parse is the accepted benign race.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -18,23 +18,69 @@ use crate::source::SourceArena;
 use crate::unit_cache::CacheEntry;
 use crate::unit_resolution::resolve_unit;
 
-/// How the loader answers a cache MISS in [`UnitLoader::interface_of`].
+/// The default per-chain transitive-load budget for a [`LoadMode::Full`] parse
+/// ([`UnitLoader::with_store`] / [`UnitLoader::new`]) — the cap that keeps a
+/// `didSave`, a navigation/query cross-unit resolution and a batch/indexing
+/// parse from cascading into the WHOLE `{$IF Declared/SizeOf}` dependency
+/// closure (be.core + the RTL/VCL source tree → the ~14GB Task-15/21 OOM).
 ///
-/// - [`LoadMode::Full`]: the historical behavior — on a miss, reload the unit's
-///   AST from its per-unit snapshot (hash-validated) or, failing that, resolve
-///   the source, read it and PARSE it (which recursively force-loads that unit's
-///   own `{$IF Declared/SizeOf}` dependency closure). This is what batch parses,
-///   navigation, didSave and the query handlers want.
-/// - [`LoadMode::ResidentOnly`]: answer ONLY from what is ALREADY resident in the
-///   moka RAM cache. A miss returns [`LoadOutcome::NotFound`] WITHOUT touching
-///   disk, the resolver, the arena or the parser — so parsing an editor buffer
-///   never cascades into force-loading its whole cross-unit closure (the Task-15
-///   OOM). A cross-unit `{$IF Declared/SizeOf}` whose target is not yet resident
-///   answers Unknown (→ the safe AssumeFalse tri-state), NEVER a wrong result.
+/// A Full parse may force-load AT MOST this many units transitively across the
+/// entire nested chain (a shared counter — see [`UnitLoader::loads_done`]);
+/// beyond it a cache MISS that would parse degrades to [`LoadOutcome::NotFound`]
+/// (→ Unknown → the safe AssumeFalse tri-state), NEVER a fabricated answer. This
+/// lets go-to-def load the target plus a bounded few, and `didSave` parse the
+/// saved unit plus a bounded closure, at a peak RAM of ~N × per-unit instead of
+/// the whole closure. Cross-unit precision beyond N degrades to Unknown and
+/// recovers as the cache warms (future batch indexing).
+///
+/// Chosen at 32: comfortably above a typical single unit's directly-forced
+/// `{$IF Declared/SizeOf}` set (which is a handful), so real navigation and save
+/// stay precise, while orders of magnitude below the thousands of units in the
+/// full RTL/VCL/be.core closure that caused the OOM.
+pub const MAX_TRANSITIVE_LOADS: usize = 32;
+
+/// How the loader answers a cache MISS in [`UnitLoader::interface_of`] —
+/// generalized from the Task-21 `Full`/`ResidentOnly` two-state into a per-chain
+/// transitive-load BUDGET.
+///
+/// - [`LoadMode::Budgeted(n)`]: on a miss, reload the unit's AST from its
+///   per-unit snapshot (hash-validated) or, failing that, resolve the source,
+///   read it and PARSE it (which recursively force-loads that unit's own `{$IF
+///   Declared/SizeOf}` dependency closure) — BUT only while fewer than `n` such
+///   force-loads have happened on THIS chain (the shared [`UnitLoader::loads_done`]
+///   counter). Once the budget is exhausted a miss-that-would-parse degrades to
+///   [`LoadOutcome::NotFound`] (→ Unknown → safe AssumeFalse), NEVER a fabricated
+///   result. A CACHE HIT is always served for free and never counts against the
+///   budget. This bounds every `didSave` / navigation / batch parse's transitive
+///   force-load closure (the Task-15/21 OOM fix); the default budget is
+///   [`MAX_TRANSITIVE_LOADS`].
+///
+/// [`LoadMode::ResidentOnly`] (the editor buffer parse,
+/// [`crate::driver::ProjectSession::parse_buffer`]) is exactly `Budgeted(0)`:
+/// a miss NEVER parses, answering ONLY from what is already resident in the moka
+/// RAM cache — so opening a unit never cascades into force-loading its whole
+/// cross-unit closure. For clarity it stays a named constructor
+/// ([`UnitLoader::with_store_resident_only`]) but shares the single budget path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadMode {
-    Full,
-    ResidentOnly,
+    /// A cache miss may reload/parse until `loads_done` reaches this budget,
+    /// then degrades to [`LoadOutcome::NotFound`]. `Budgeted(0)` is the
+    /// resident-only editor behavior (never parses on a miss).
+    Budgeted(usize),
+}
+
+impl LoadMode {
+    /// The full miss-resolution budget for `didSave` / navigation / batch parses.
+    pub const FULL: LoadMode = LoadMode::Budgeted(MAX_TRANSITIVE_LOADS);
+    /// Resident-only: never parse on a miss (editor buffer parse, Task-15/21).
+    pub const RESIDENT_ONLY: LoadMode = LoadMode::Budgeted(0);
+
+    /// The transitive-load budget this mode permits.
+    fn budget(self) -> usize {
+        match self {
+            LoadMode::Budgeted(budget) => budget,
+        }
+    }
 }
 
 pub struct UnitLoader {
@@ -61,11 +107,20 @@ pub struct UnitLoader {
     /// re-read/re-parsed only when the file hash changed. `None` for batch
     /// parses / tests with no durable store — those always re-parse on a miss.
     store: Option<Arc<crate::cache_store::CacheStore>>,
-    /// Miss-resolution mode (see [`LoadMode`]). [`LoadMode::Full`] for every
+    /// Miss-resolution mode (see [`LoadMode`]): the per-chain transitive-load
+    /// budget. [`LoadMode::FULL`] (budget [`MAX_TRANSITIVE_LOADS`]) for every
     /// constructor except [`Self::with_store_resident_only`], which the editor
-    /// buffer parse ([`crate::driver::ProjectSession::parse_buffer`]) uses so a
-    /// buffer parse never force-loads its cross-unit closure.
+    /// buffer parse ([`crate::driver::ProjectSession::parse_buffer`]) uses with
+    /// [`LoadMode::RESIDENT_ONLY`] (budget 0 — never parses on a miss).
     mode: LoadMode,
+    /// Transitive force-loads spent on THIS parse chain so far. Shared across the
+    /// WHOLE nested chain (the self-referential `Rc` hands the SAME `UnitLoader`
+    /// to every nested parse), so a `{$IF Declared}` five levels deep counts
+    /// against the same budget as the top-level parse — the cascade is bounded
+    /// end-to-end, not per-level. A CACHE HIT never touches this; only a miss
+    /// that actually reloads-from-disk or parses increments it. `Cell` because
+    /// the loader is shared behind `&self` on a single (non-`Send`) chain.
+    loads_done: Cell<usize>,
 }
 
 impl UnitLoader {
@@ -79,14 +134,15 @@ impl UnitLoader {
 
     /// Like [`Self::new`], but also threads the durable [`CacheStore`] so a
     /// cache miss reloads from the per-unit file before re-parsing (Task 16 C).
-    /// Full mode.
+    /// [`LoadMode::FULL`] — a bounded transitive-load budget of
+    /// [`MAX_TRANSITIVE_LOADS`] (didSave, navigation/query, batch parses).
     pub fn with_store(
         arena: &'static SourceArena,
         context: Arc<ProjectContext>,
         reverse_index: Option<Arc<crate::watcher::ReverseDependencyIndex>>,
         store: Option<Arc<crate::cache_store::CacheStore>>,
     ) -> Rc<Self> {
-        Self::with_store_and_mode(arena, context, reverse_index, store, LoadMode::Full)
+        Self::with_store_and_mode(arena, context, reverse_index, store, LoadMode::FULL)
     }
 
     /// Like [`Self::with_store`], but in [`LoadMode::ResidentOnly`]: a cache miss
@@ -103,7 +159,7 @@ impl UnitLoader {
         reverse_index: Option<Arc<crate::watcher::ReverseDependencyIndex>>,
         store: Option<Arc<crate::cache_store::CacheStore>>,
     ) -> Rc<Self> {
-        Self::with_store_and_mode(arena, context, reverse_index, store, LoadMode::ResidentOnly)
+        Self::with_store_and_mode(arena, context, reverse_index, store, LoadMode::RESIDENT_ONLY)
     }
 
     fn with_store_and_mode(
@@ -122,7 +178,16 @@ impl UnitLoader {
             reverse_index,
             store,
             mode,
+            loads_done: Cell::new(0),
         })
+    }
+
+    /// Transitive force-loads spent on this chain so far (test/diagnostic
+    /// accessor). A CACHE HIT never increments this; only a miss that actually
+    /// reloads-from-disk or parses does — so it is the exact count the budget
+    /// caps, and the load-cap bound-proof test asserts against it.
+    pub fn loads_done(&self) -> usize {
+        self.loads_done.get()
     }
 }
 
@@ -139,16 +204,28 @@ impl InterfaceLoader for UnitLoader {
             return LoadOutcome::Cycle;
         }
 
-        // ResidentOnly mode (editor buffer parse, Task-15): the cache-miss above
-        // is the answer. Do NOT reload-from-disk, resolve, arena-load or parse —
-        // any of those would drag the buffer's cross-unit `{$IF Declared/SizeOf}`
-        // closure into memory (the 14GB OOM). A not-yet-resident target answers
-        // Unknown (→ AssumeFalse), never a wrong result. The cache hit and the
-        // cycle check above still apply: a resident import IS served (and its
-        // dependency recorded by the caller), cycle-safety is preserved.
-        if self.mode == LoadMode::ResidentOnly {
+        // Per-chain transitive-load BUDGET (Task-15/21/22). The cache HIT above
+        // was served free; reaching here means this miss would reload-from-disk
+        // or parse — a transitive force-load that materializes another unit's
+        // closure. Cap it: once this chain has spent its budget, degrade to
+        // NotFound (→ Unknown → safe AssumeFalse) WITHOUT reload/resolve/arena/
+        // parse, so a `didSave`/navigation/batch parse can never cascade into the
+        // whole `{$IF Declared/SizeOf}` closure (be.core + RTL/VCL → the 14GB
+        // OOM). `Budgeted(0)` (RESIDENT_ONLY, editor buffer parse) is the special
+        // case where the FIRST miss is already over budget, so nothing is ever
+        // force-loaded — exactly the Task-21 resident-only behavior. The cycle
+        // check ABOVE runs first, so cycle-safety is unaffected by exhaustion; a
+        // resident import is still served (and recorded) regardless of budget.
+        // A budget-exhausted miss is NEVER a wrong answer, only a less-precise
+        // Unknown that recovers as the cache warms.
+        if self.loads_done.get() >= self.mode.budget() {
             return LoadOutcome::NotFound;
         }
+        // Charge this force-load against the chain budget BEFORE performing it, so
+        // the reload-from-disk path below (which also materializes a unit) counts
+        // exactly like a re-parse. A cache hit never reaches here, so a hit is
+        // never charged (cache-hit-is-free).
+        self.loads_done.set(self.loads_done.get() + 1);
 
         // Lazy reload-from-disk (Task 16 C): BEFORE resolving the name and
         // re-parsing from source, try the per-unit snapshot. `load_unit`
