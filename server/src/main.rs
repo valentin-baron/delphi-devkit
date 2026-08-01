@@ -346,6 +346,63 @@ impl DelphiLsp {
         }
     }
 
+    /// Resolve `textDocument/references` for `(uri, position)`.
+    ///
+    /// Same async/lock discipline as `resolve_definition`: the buffer text is
+    /// copied out under the store lock, the parser queries run on
+    /// `spawn_blocking` with the session lock via `blocking_lock()` (never held
+    /// across `.await`). The identifier under the cursor → its folded key →
+    /// `session.references(key)`, an OVER-APPROXIMATING candidate set (documented
+    /// in `locations::resolve_references`): each occurrence's `Range` is computed
+    /// from its OWN file's text, honoring `include_declaration`. No target under
+    /// the cursor → `None`; a target with no occurrences → an empty `Vec`. This
+    /// is READ-ONLY; the over-approximation is why rename is not advertised.
+    async fn resolve_references(
+        &self,
+        uri: Url,
+        position: Position,
+        include_declaration: bool,
+    ) -> Option<Vec<Location>> {
+        let path = session::uri_to_path(&uri)?;
+
+        let text = {
+            let store = self.documents.lock().await;
+            store.get(&uri)?.text().to_string()
+        };
+
+        let inputs = session::resolve_active_project_inputs().await;
+        self.session
+            .ensure_open(
+                inputs.dproj,
+                inputs.configuration,
+                inputs.platform,
+                inputs.profile,
+                inputs.standard_source_paths,
+            )
+            .await;
+
+        let session_handle = self.session.handle();
+        let parse_path = session::document_path(&path);
+        let result = tokio::task::spawn_blocking(move || {
+            let index = positions::LineIndex::new(text);
+            let offset = index.offset_of(position) as u32;
+            let mut guard = session_handle.blocking_lock();
+            let project_session = guard.as_mut()?;
+            let (_, meta) = project_session.parse_buffer(&parse_path, index.text()).ok()?;
+            let unit_key = meta?.name();
+            locations::resolve_references(project_session, unit_key, offset, include_declaration)
+        })
+        .await;
+
+        match result {
+            Ok(mapped) => mapped,
+            Err(join_error) => {
+                lsp_error!(self.client, "references task failed: {}", join_error);
+                None
+            }
+        }
+    }
+
     async fn projects_compile(
         &self,
         params: CompileProjectParams,
@@ -519,10 +576,14 @@ impl LanguageServer for DelphiLsp {
         }
         // Advertise ONLY what this server backs: incremental text document sync
         // (so the editor streams open/change/close of buffers), pushed
-        // diagnostics (publishDiagnostics needs no capability flag), plus the
-        // go-to-definition and hover providers wired in Task 9. The remaining
-        // feature providers — completion, references, rename, signatureHelp,
-        // semanticTokens — stay OFF; a capability is claimed only once backed.
+        // diagnostics (publishDiagnostics needs no capability flag), the
+        // go-to-definition and hover providers wired in Task 9, and the
+        // find-references provider wired in Task 10 (read-only, honest candidate
+        // set). The remaining feature providers — completion, rename,
+        // signatureHelp, semanticTokens — stay OFF; a capability is claimed only
+        // once backed. rename is DELIBERATELY not advertised (parser SESSION.md
+        // ledger #42): the reference set is scope-unresolved, so no provably
+        // correct+complete rename exists yet.
         return Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
@@ -530,6 +591,15 @@ impl LanguageServer for DelphiLsp {
                 )),
                 definition_provider: Some(OneOf::Left(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
+                // references is READ-ONLY and honest: it returns an
+                // OVER-APPROXIMATING candidate set (the scope-unresolved usage
+                // index) the user visually reviews. rename stays OFF: renaming
+                // that candidate set could rewrite an unrelated same-named
+                // identifier (destructive), and renaming only the provable
+                // subset would leave impl-section uses dangling — neither is
+                // provably correct+complete without scope resolution (parser
+                // SESSION.md ledger #42).
+                references_provider: Some(OneOf::Left(true)),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -618,6 +688,24 @@ impl LanguageServer for DelphiLsp {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         Ok(self.resolve_hover(uri, position).await)
+    }
+
+    // ─── Find references ───────────────────────────────────────────────
+    //
+    // Map (Url, Position) → the identifier under the cursor → every recorded
+    // occurrence of its folded key across cached units, each mapped to a
+    // Location from its OWN file's text. This is an OVER-APPROXIMATING candidate
+    // set (the usage index is scope-unresolved) — acceptable for a read-only
+    // "find all references" the user reviews, and documented as such. Honors
+    // `context.include_declaration`. No symbol under the cursor → `None`. The
+    // parser work runs on `spawn_blocking` behind the session lock.
+    async fn references(&self, params: ReferenceParams) -> jsonrpc::Result<Option<Vec<Location>>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let include_declaration = params.context.include_declaration;
+        Ok(self
+            .resolve_references(uri, position, include_declaration)
+            .await)
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {

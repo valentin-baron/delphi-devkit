@@ -95,6 +95,60 @@ pub fn resolve_definition_locations(
     if mapped.is_empty() { None } else { Some(mapped) }
 }
 
+/// Resolve `textDocument/references` for `(unit_key, offset)` into LSP
+/// `Location`s. Factored out of the server handler so the composition (symbol →
+/// references → per-file location mapping) is unit-testable without a live LSP
+/// `Client`.
+///
+/// HONESTY / OVER-APPROXIMATION (documented, and it is why this is READ-ONLY):
+/// `session.references(key)` returns a CANDIDATE set — every textual occurrence
+/// of the folded key across cached units. It is scope-unresolved, so it may
+/// include an unrelated same-named identifier (a local `Result`, a different
+/// unit's `Name`) and never misses a real occurrence in a cached unit. That is
+/// acceptable for "find all references" the user visually reviews; it is NOT a
+/// proven binding set and MUST NOT drive a destructive edit (see rename, which
+/// is deliberately not advertised).
+///
+/// Each `Occurrence.location` is a span in its OWN unit's file, so its `Range`
+/// is computed from THAT file's own text via [`code_location_to_lsp`] — never
+/// the requesting document's line index. `include_declaration = false` drops the
+/// occurrence(s) at the declaration site of the resolved symbol.
+///
+/// `None` (never a fabricated result) when nothing resolvable is under the
+/// cursor. An empty `Vec` when a target resolves but has no mappable
+/// occurrences.
+pub fn resolve_references(
+    session: &ProjectSession,
+    unit_key: delphi_parser::context::Identifier,
+    offset: u32,
+    include_declaration: bool,
+) -> Option<Vec<Location>> {
+    let target = session.symbol_at(unit_key, offset)?;
+    // The declaration span(s) of the resolved symbol — used only to DROP the
+    // declaration occurrence(s) when `include_declaration` is false. Computed
+    // from the same `definition` machinery so the dropped span matches exactly
+    // the declaration site the references index recorded.
+    let declaration_spans: Vec<CodeLocation> = if include_declaration {
+        Vec::new()
+    } else {
+        session.definition(unit_key, target.key, target.owner_type)
+    };
+
+    let mapped: Vec<Location> = session
+        .references(target.key)
+        .into_iter()
+        .filter(|occurrence| {
+            include_declaration
+                || !declaration_spans.iter().any(|declaration| {
+                    declaration.file == occurrence.location.file
+                        && declaration.span == occurrence.location.span
+                })
+        })
+        .filter_map(|occurrence| code_location_to_lsp(session, occurrence.location))
+        .collect();
+    Some(mapped)
+}
+
 /// Map a byte span onto a UTF-16 [`Range`] through `index` (the TARGET file's
 /// own line index). Clamps out-of-range offsets (never panics) — an offset past
 /// the file end maps to the end-of-file position.
@@ -327,6 +381,117 @@ mod tests {
         assert!(
             resolve_definition_locations(&session, client_key, 100_000).is_none(),
             "an out-of-range cursor yields no definition"
+        );
+    }
+
+    // ─── Deliverable A: textDocument/references ─────────────────────────
+    //
+    // references is READ-ONLY and OVER-APPROXIMATING (documented on
+    // `resolve_references`): a candidate set the user reviews. These tests prove
+    // the LSP-boundary contract: cross-unit occurrences, per-occurrence ranges
+    // computed from each occurrence's OWN file, include_declaration honored, and
+    // empty/None on no target.
+
+    /// Like `session_with_two_units`, but parses BOTH Models and Client so both
+    /// units are cached and thus both contribute to the reference index (the
+    /// index spans CACHED units — a unit merely imported for definition
+    /// resolution but never parsed contributes no occurrences). Mirrors the
+    /// parser's own `references_across_units_and_purge_on_invalidation` setup.
+    fn session_with_both_units_parsed(tag: &str) -> (ProjectSession, std::path::PathBuf) {
+        let (mut session, directory) = session_with_two_units(tag);
+        session
+            .parse_source_file(directory.join("Models.pas"))
+            .unwrap();
+        (session, directory)
+    }
+
+    /// A cross-unit symbol (`TUser`, declared in Models, used in Client) yields
+    /// occurrences in BOTH files, each mapped to a Location whose Url + Range are
+    /// its own file's. Models's declaration is on line 5 (0-based); Client's use
+    /// (`Boss: TUser`) is on line 4 — the ranges must land in their OWN files, so
+    /// this is a discriminating multi-file assertion.
+    #[test]
+    fn references_cross_unit_include_declaration() {
+        let (session, directory) = session_with_both_units_parsed("refs_cross");
+        let client_key = session.context().intern_key("CLIENT");
+        // Offset of the `TUser` occurrence in Client (`Boss: TUser;`).
+        let client_src = std::fs::read_to_string(directory.join("Client.pas")).unwrap();
+        let offset = client_src.find("TUser").unwrap() as u32;
+
+        let locations =
+            resolve_references(&session, client_key, offset, true).expect("resolves a target");
+        // Occurrences span both files.
+        let in_models = locations
+            .iter()
+            .any(|location| location.uri.to_file_path().unwrap().ends_with("Models.pas"));
+        let in_client = locations
+            .iter()
+            .any(|location| location.uri.to_file_path().unwrap().ends_with("Client.pas"));
+        assert!(in_models, "the declaration in Models is a reference: {locations:?}");
+        assert!(in_client, "the use in Client is a reference: {locations:?}");
+        // The declaration occurrence sits on Models line 5 (its own file's text).
+        let models_declaration = locations
+            .iter()
+            .find(|location| location.uri.to_file_path().unwrap().ends_with("Models.pas"))
+            .unwrap();
+        assert_eq!(
+            models_declaration.range.start.line, 5,
+            "Models occurrence range comes from Models's own text: {models_declaration:?}"
+        );
+    }
+
+    /// `include_declaration = false` drops the declaration-site occurrence(s) but
+    /// keeps the impl/interface-body uses. With the declaration excluded, no
+    /// occurrence may sit on the declaration span (Models line 5), yet the Client
+    /// use must remain.
+    #[test]
+    fn references_exclude_declaration_drops_only_the_declaration() {
+        let (session, directory) = session_with_both_units_parsed("refs_excl");
+        let client_key = session.context().intern_key("CLIENT");
+        let client_src = std::fs::read_to_string(directory.join("Client.pas")).unwrap();
+        let offset = client_src.find("TUser").unwrap() as u32;
+
+        let with_decl =
+            resolve_references(&session, client_key, offset, true).expect("resolves");
+        let without_decl =
+            resolve_references(&session, client_key, offset, false).expect("resolves");
+
+        // Excluding the declaration yields strictly fewer occurrences.
+        assert!(
+            without_decl.len() < with_decl.len(),
+            "excluding the declaration must drop at least one occurrence: with={with_decl:?} without={without_decl:?}"
+        );
+        // The declaration site (Models.pas line 5) is present WITH the flag and
+        // ABSENT without it — the exact occurrence that was dropped.
+        let declaration_present = |set: &[Location]| {
+            set.iter().any(|location| {
+                location.uri.to_file_path().unwrap().ends_with("Models.pas")
+                    && location.range.start.line == 5
+            })
+        };
+        assert!(declaration_present(&with_decl), "declaration present when included");
+        assert!(
+            !declaration_present(&without_decl),
+            "declaration dropped when excluded: {without_decl:?}"
+        );
+        // The Client use survives regardless.
+        assert!(
+            without_decl
+                .iter()
+                .any(|location| location.uri.to_file_path().unwrap().ends_with("Client.pas")),
+            "a non-declaration use survives exclusion: {without_decl:?}"
+        );
+    }
+
+    /// A cursor with no resolvable symbol under it (far past EOF) → `None`, never
+    /// a fabricated reference list.
+    #[test]
+    fn references_on_no_target_is_none() {
+        let (session, _directory) = session_with_two_units("refs_none");
+        let client_key = session.context().intern_key("CLIENT");
+        assert!(
+            resolve_references(&session, client_key, 100_000, true).is_none(),
+            "an out-of-range cursor resolves no target → None"
         );
     }
 
