@@ -2,11 +2,12 @@
 
 tower-lsp server wiring the [`delphi-parser`](../parser) analysis engine to an
 editor. This document describes the **document-lifecycle foundation** (Task 8)
-plus the language features layered on it: **definition + hover** (Task 9) and
-**find-references** (Task 10). The remaining features (completion / rename /
-signatureHelp / semanticTokens) are **separate later tasks**; a capability is
-advertised only once it is actually backed. **rename** in particular is
-*deliberately deferred* (not just unimplemented) — see "Why rename is deferred".
+plus the language features layered on it: **definition + hover** (Task 9),
+**find-references** (Task 10), and **completion + signature help** (Task 11). The
+remaining features (rename / semanticTokens) are **separate later tasks**; a
+capability is advertised only once it is actually backed. **rename** in
+particular is *deliberately deferred* (not just unimplemented) — see "Why rename
+is deferred".
 
 ## Modules
 
@@ -18,7 +19,10 @@ advertised only once it is actually backed. **rename** in particular is
 | `diagnostics.rs` | Maps the parser's `UnifiedDiagnostic`s to LSP `Diagnostic`s. Only a location **in the analyzed buffer** gets an exact byte-mapped range; a DFM-only offset (or a location in another file) is anchored at the top of the document — **never a fabricated pas range**. |
 | `locations.rs` | `code_location_to_lsp`: maps a parser `CodeLocation` (a byte span into *some* parsed file) to an LSP `Location`, computing the `Range` from the **TARGET file's own text** — the open-document `LineIndex` when that file is a buffer, else a `LineIndex` built from `arena.content(file)`. Returns `None` (never a fabricated `Location`) for a virtual/non-file target or unreadable content. Shared navigation primitive for definition/hover/**references**. Also `resolve_references`: the folded key under the cursor → every recorded occurrence across cached units, each mapped through its OWN file's text, honoring `include_declaration` — an **over-approximating candidate set** (see below). |
 | `hover.rs` | Formats the parser's `HoverInfo` into a fenced `delphi` hover signature. Renders only facts the parser captured — a field/property's known type, a method's directives, the owning type — and shows **kind only** when the declared type is anonymous (`type_key` None): **never a fabricated type/return type**. |
-| `main.rs` | tower-lsp handlers: `initialize` capabilities, `didOpen`/`didChange`/`didClose` → `analyze` → `publishDiagnostics`, plus `textDocument/definition`, `textDocument/hover`, and `textDocument/references`. |
+| `completion.rs` | Maps the parser's context-sensitive `completions` to LSP `CompletionItem`s (kind → `CompletionItemKind`, a short type/kind `detail`). Pure translation — the parser guarantees **member-only after `.`** (or an empty list on an unresolved receiver) and the top-level set otherwise, so **no top-level symbol can leak into a member list**. |
+| `call_context.rs` | `enclosing_call(text, cursor)`: a **forward single-pass** lexing scan that finds the enclosing unclosed `(` and the **active parameter** (top-level comma count), correctly skipping strings (`'…'`, `''` escape), comments (`{…}`, `(*…*)`, `//…`) and balanced `()[]`. Text-only (`callee_offset`, `active_parameter`); `None` when the cursor is in no call, or inside a string/comment. Exhaustively tested (nesting, comma-in-string, comments, multi-line, no-call, index brackets, dotted callee). |
+| `signature.rs` | Composes the callee offset → the parser `signature_help_at` query → an LSP `SignatureHelp`. Per-parameter labels, active parameter **clamped** to each signature's arity. **Never a fabricated signature**: an unresolved / non-routine callee → `None`. |
+| `main.rs` | tower-lsp handlers: `initialize` capabilities, `didOpen`/`didChange`/`didClose` → `analyze` → `publishDiagnostics`, plus `textDocument/definition`, `textDocument/hover`, `textDocument/references`, `textDocument/completion`, and `textDocument/signatureHelp`. |
 
 ## Capabilities advertised
 
@@ -46,9 +50,31 @@ advertised only once it is actually backed. **rename** in particular is
   **not** claim precision it lacks. Only units that have been parsed/cached
   contribute occurrences.
 
-The remaining feature providers — completion / **rename** / signatureHelp /
-semanticTokens — stay **off**; a capability is only advertised once it is
-actually backed. See below for why **rename is deliberately deferred**.
+- `completionProvider` — `textDocument/completion`, trigger character `.`,
+  `resolveProvider: false`. Context-sensitive via the parser's `completions`:
+  **after `.`** the receiver type's **members only** (an unresolvable receiver →
+  an **empty** list, never a wrong member set); **otherwise** the top-level set
+  (builtins + own interface symbols visible at the cursor + imported units'
+  symbols). Each result is translated 1:1 to a `CompletionItem` with a mapped
+  `CompletionItemKind` — the translation cannot leak a top-level symbol into a
+  member list.
+- `signatureHelpProvider` — `textDocument/signatureHelp`, trigger characters
+  `(` and `,`, retrigger `,`. The **enclosing call** is found by a text scan that
+  skips strings/comments/nested brackets (`call_context.rs`); its callee is
+  resolved own-then-imports through the **same loader as definition**, its
+  parameters + return type read from the **AST** (`RoutineType`). Procedures have
+  no return; untyped (`var Buffer`) and defaulted (`X: Integer = 0`) params are
+  handled; **overloads** return one signature each. An unresolved / non-routine
+  callee → **None**, **never a fabricated signature**. **Limitation:** an
+  *instance*-variable receiver (`Obj.Method(`) resolves only when the derived
+  index carries the variable's declared type; a **static** `TType.Method(`
+  receiver and an unqualified top-level call always resolve. Distinguishing the
+  best overload for the current arguments needs argument type-checking the query
+  layer does not do, so `activeSignature` defaults to `0` (the editor cycles).
+
+The remaining feature providers — **rename** / semanticTokens — stay **off**; a
+capability is only advertised once it is actually backed. See below for why
+**rename is deliberately deferred**.
 
 ### Why rename is deferred (not advertised)
 
@@ -134,11 +160,12 @@ from the LSP notifications, not a second OS watcher.
 
 ## Deferred to later feature tasks
 
-- **definition, hover, and references are now wired** (Tasks 9–10). The
-  remaining language-feature providers (completion / signatureHelp /
-  semanticTokens) are still deferred — the parser query API
-  (`ProjectSession::{symbol_at, definition, hover_info, references, completions}`)
-  already exists; only the LSP request handlers + capabilities remain.
+- **definition, hover, references, completion, and signatureHelp are now wired**
+  (Tasks 9–11). The remaining language-feature providers (**semanticTokens**) are
+  still deferred. The parser query API
+  (`ProjectSession::{symbol_at, definition, hover_info, references, completions,
+  signature_help, signature_help_at}`) backs each; only the semanticTokens
+  handler + capability remain.
 - **rename is deferred, not merely unimplemented** (Task 10 Deliverable B): a
   correct+complete rename requires scope-resolved bindings the parser does not
   yet have (over-approximation over-renames; declaration-only under-renames).

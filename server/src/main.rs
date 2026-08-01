@@ -1,9 +1,12 @@
+mod call_context;
+mod completion;
 mod diagnostics;
 mod documents;
 mod hover;
 mod locations;
 mod positions;
 mod session;
+mod signature;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -403,6 +406,134 @@ impl DelphiLsp {
         }
     }
 
+    /// Resolve `textDocument/completion` for `(uri, position)`.
+    ///
+    /// Same async/lock discipline as `resolve_definition`: the buffer text is
+    /// copied out under the store lock, the parser query runs on
+    /// `spawn_blocking` with the session lock via `blocking_lock()` (never held
+    /// across `.await`). The parser's context-sensitive `completions` query
+    /// guarantees the never-a-wrong-answer contract: a member access after `.`
+    /// returns ONLY the receiver type's members (an unresolved receiver → an
+    /// empty list, never a wrong member set); any other context → the top-level
+    /// set (builtins + own + imports). This handler only TRANSLATES each result
+    /// to a `CompletionItem`, so the member-only guarantee is preserved.
+    ///
+    /// Returns `None` when there is no session/meta (the editor shows nothing);
+    /// an empty list is a legitimate answer (unresolved member receiver).
+    async fn resolve_completion(
+        &self,
+        uri: Url,
+        position: Position,
+    ) -> Option<Vec<CompletionItem>> {
+        let path = session::uri_to_path(&uri)?;
+
+        let text = {
+            let store = self.documents.lock().await;
+            store.get(&uri)?.text().to_string()
+        };
+
+        let inputs = session::resolve_active_project_inputs().await;
+        self.session
+            .ensure_open(
+                inputs.dproj,
+                inputs.configuration,
+                inputs.platform,
+                inputs.profile,
+                inputs.standard_source_paths,
+            )
+            .await;
+
+        let session_handle = self.session.handle();
+        let parse_path = session::document_path(&path);
+        let result = tokio::task::spawn_blocking(move || {
+            let index = positions::LineIndex::new(text);
+            let offset = index.offset_of(position) as u32;
+            let mut guard = session_handle.blocking_lock();
+            let project_session = guard.as_mut()?;
+            let (_, meta) = project_session.parse_buffer(&parse_path, index.text()).ok()?;
+            let unit_key = meta?.name();
+            Some(completion::resolve_completions(project_session, unit_key, offset))
+        })
+        .await;
+
+        match result {
+            Ok(items) => items,
+            Err(join_error) => {
+                lsp_error!(self.client, "completion task failed: {}", join_error);
+                None
+            }
+        }
+    }
+
+    /// Resolve `textDocument/signatureHelp` for `(uri, position)`.
+    ///
+    /// Steps (all parser work on one `spawn_blocking` task, session lock via
+    /// `blocking_lock()`, never across `.await`):
+    /// 1. copy the buffer text; build its `LineIndex`; map `position` → a byte
+    ///    offset;
+    /// 2. detect the enclosing call context from the RAW TEXT via
+    ///    [`call_context::enclosing_call`] — the callee's byte offset (the dotted
+    ///    identifier before the unclosed `(`) and the active parameter index
+    ///    (top-level commas, skipping strings/comments/nested parens);
+    /// 3. parse the buffer for its unit key, resolve the callee via `symbol_at`
+    ///    at the callee offset, then the parser `signature_help` query;
+    /// 4. build the LSP `SignatureHelp`.
+    ///
+    /// NEVER fabricates: no enclosing call, no resolvable callee, or a callee
+    /// that is not a routine → `None` (the editor shows nothing).
+    async fn resolve_signature_help(
+        &self,
+        uri: Url,
+        position: Position,
+    ) -> Option<SignatureHelp> {
+        let path = session::uri_to_path(&uri)?;
+
+        let text = {
+            let store = self.documents.lock().await;
+            store.get(&uri)?.text().to_string()
+        };
+
+        let inputs = session::resolve_active_project_inputs().await;
+        self.session
+            .ensure_open(
+                inputs.dproj,
+                inputs.configuration,
+                inputs.platform,
+                inputs.profile,
+                inputs.standard_source_paths,
+            )
+            .await;
+
+        let session_handle = self.session.handle();
+        let parse_path = session::document_path(&path);
+        let result = tokio::task::spawn_blocking(move || {
+            let index = positions::LineIndex::new(text);
+            let offset = index.offset_of(position) as u32;
+            // Call-context detection on the RAW buffer text (byte offsets),
+            // before any parser resolution. No enclosing call → no signature.
+            let context = call_context::enclosing_call(index.text(), offset as usize)?;
+            let mut guard = session_handle.blocking_lock();
+            let project_session = guard.as_mut()?;
+            let (_, meta) = project_session.parse_buffer(&parse_path, index.text()).ok()?;
+            let unit_key = meta?.name();
+            signature::resolve_signature_help(
+                project_session,
+                unit_key,
+                context.callee_offset as u32,
+                context.active_parameter,
+            )
+        })
+        .await;
+
+        match result {
+            Ok(help) => help,
+            Err(join_error) => {
+                lsp_error!(self.client, "signatureHelp task failed: {}", join_error);
+                None
+            }
+        }
+    }
+
     async fn projects_compile(
         &self,
         params: CompileProjectParams,
@@ -579,11 +710,13 @@ impl LanguageServer for DelphiLsp {
         // diagnostics (publishDiagnostics needs no capability flag), the
         // go-to-definition and hover providers wired in Task 9, and the
         // find-references provider wired in Task 10 (read-only, honest candidate
-        // set). The remaining feature providers — completion, rename,
-        // signatureHelp, semanticTokens — stay OFF; a capability is claimed only
-        // once backed. rename is DELIBERATELY not advertised (parser SESSION.md
-        // ledger #42): the reference set is scope-unresolved, so no provably
-        // correct+complete rename exists yet.
+        // set), and the completion + signatureHelp providers wired in Task 11
+        // (both honest: completion is member-only after `.`, signatureHelp never
+        // fabricates). The remaining feature providers — rename, semanticTokens —
+        // stay OFF; a capability is claimed only once backed. rename is
+        // DELIBERATELY not advertised (parser SESSION.md ledger #42): the
+        // reference set is scope-unresolved, so no provably correct+complete
+        // rename exists yet.
         return Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
@@ -600,6 +733,25 @@ impl LanguageServer for DelphiLsp {
                 // provably correct+complete without scope resolution (parser
                 // SESSION.md ledger #42).
                 references_provider: Some(OneOf::Left(true)),
+                // completion: context-sensitive, backed by the parser's
+                // never-wrong `completions` query. Trigger on `.` (member
+                // access); the editor also invokes it on Ctrl+Space. No resolve
+                // step — every item is fully built up front.
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec![".".to_string()]),
+                    resolve_provider: Some(false),
+                    ..CompletionOptions::default()
+                }),
+                // signatureHelp: backed by the parser's `signature_help` query
+                // reading params/return from the AST. Trigger on `(` (call open)
+                // and `,` (next argument); retrigger on `,` so the active
+                // parameter updates as the user types further arguments. Never a
+                // fabricated signature: an unresolved callee → no help.
+                signature_help_provider: Some(SignatureHelpOptions {
+                    trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+                    retrigger_characters: Some(vec![",".to_string()]),
+                    work_done_progress_options: WorkDoneProgressOptions::default(),
+                }),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -706,6 +858,39 @@ impl LanguageServer for DelphiLsp {
         Ok(self
             .resolve_references(uri, position, include_declaration)
             .await)
+    }
+
+    // ─── Completion ────────────────────────────────────────────────────
+    //
+    // Context-sensitive completion. The parser's `completions` query decides the
+    // set (member-only after `.`, else top-level); this handler maps each result
+    // to a `CompletionItem`. An unresolved member receiver yields an empty list
+    // (never a wrong member set), no session/meta yields `None`.
+    async fn completion(
+        &self,
+        params: CompletionParams,
+    ) -> jsonrpc::Result<Option<CompletionResponse>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        Ok(self
+            .resolve_completion(uri, position)
+            .await
+            .map(CompletionResponse::Array))
+    }
+
+    // ─── Signature help ────────────────────────────────────────────────
+    //
+    // Detect the enclosing call context from the raw buffer text (skipping
+    // strings/comments/nested parens), resolve the callee via the SAME machinery
+    // as definition, and read its params/return from the AST. Never fabricates:
+    // no call, no resolvable routine → `None`.
+    async fn signature_help(
+        &self,
+        params: SignatureHelpParams,
+    ) -> jsonrpc::Result<Option<SignatureHelp>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        Ok(self.resolve_signature_help(uri, position).await)
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
