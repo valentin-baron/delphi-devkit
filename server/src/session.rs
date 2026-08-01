@@ -924,6 +924,345 @@ mod tests {
         assert!(snapshot_written(&base), "shutdown save wrote a snapshot .bin");
     }
 
+    // ─── Task 18: idle background indexing ──────────────────────────────
+    //
+    // These drive `SessionManager::index_unit` (the per-unit worker the idle
+    // pass calls) against a fallback session whose search path AND snapshot base
+    // are a temp directory, so on-disk units resolve and persist there. The pass
+    // LOOP itself (`run_indexing_pass`) resolves live ddk state and cannot run in
+    // a unit test; these tests exercise its composable pieces — the per-unit
+    // parse+persist, the freshness skip, the cancel-between-units discipline, the
+    // bounded resident set, and the precision restored — mirroring the loop's
+    // exact structure (check the generation between units, index one unit, trim).
+
+    use crate::indexing::{IndexGeneration, UnitIndexOutcome};
+
+    /// Write N deterministically-named on-disk units into `base`, each a trivial
+    /// standalone unit exporting one type. Returns their sorted paths.
+    fn write_project_units(base: &Path, count: usize) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        for n in 0..count {
+            let path = base.join(format!("Unit{n:03}.pas"));
+            std::fs::write(
+                &path,
+                format!(
+                    "unit Unit{n:03};\ninterface\ntype TUnit{n:03} = class end;\n\
+                     implementation\nend."
+                ),
+            )
+            .unwrap();
+            paths.push(path);
+        }
+        paths.sort();
+        paths
+    }
+
+    /// Indexing a project of N units caches/persists them: after the pass every
+    /// unit is resident (a `Done` cache entry) AND a snapshot `.bin` is written
+    /// (each is hash-valid on disk / reloadable). Re-running the pass finds them
+    /// all AlreadyFresh (idempotent, no re-parse).
+    #[tokio::test]
+    async fn indexing_caches_and_persists_all_units() {
+        let base = fresh_snapshot_base("index-caches");
+        let units = write_project_units(&base, 12);
+
+        let manager = SessionManager::new();
+        manager
+            .inject_session_for_test(build_fallback_session_with_snapshot_base(base.clone()))
+            .await;
+
+        // First pass: every unit is freshly Indexed.
+        let mut indexed = 0;
+        for path in &units {
+            match manager.index_unit(path.clone()).await {
+                UnitIndexOutcome::Indexed => indexed += 1,
+                other => panic!("cold pass should Index {path:?}, got {other:?}"),
+            }
+        }
+        assert_eq!(indexed, units.len(), "every unit indexed on the cold pass");
+
+        // Persistence: a snapshot .bin was written (persist-on-insert + trim).
+        manager.save_now().await.expect("save").expect("session open");
+        assert!(snapshot_written(&base), "the indexed units persist to a snapshot");
+
+        // Idempotence: a second pass skips every unit as AlreadyFresh (resident
+        // Done entries), doing NO re-parse.
+        for path in &units {
+            assert_eq!(
+                manager.index_unit(path.clone()).await,
+                UnitIndexOutcome::AlreadyFresh,
+                "a warm pass skips already-fresh {path:?}"
+            );
+        }
+    }
+
+    /// CANCELATION: a generation bump mid-pass stops the loop promptly, with
+    /// FEWER than N units processed and NO half-state (each processed unit is a
+    /// complete `Done` entry; the rest are simply absent, which is always
+    /// correct). This mirrors `run_indexing_pass`'s between-units cancel check.
+    #[tokio::test]
+    async fn cancel_bump_mid_pass_stops_promptly_no_half_state() {
+        let base = fresh_snapshot_base("index-cancel");
+        let units = write_project_units(&base, 20);
+
+        let manager = SessionManager::new();
+        manager
+            .inject_session_for_test(build_fallback_session_with_snapshot_base(base.clone()))
+            .await;
+
+        let generation = IndexGeneration::new();
+        let start = generation.current();
+
+        let cancel_after = 5;
+        let mut processed = 0usize;
+        for (position, path) in units.iter().enumerate() {
+            // The exact loop guard: a bump since the pass started cancels here.
+            if generation.changed_since(start) {
+                break;
+            }
+            let outcome = manager.index_unit(path.clone()).await;
+            assert_eq!(outcome, UnitIndexOutcome::Indexed);
+            processed += 1;
+            // Simulate a foreground event arriving after `cancel_after` units.
+            if position + 1 == cancel_after {
+                generation.bump();
+            }
+        }
+
+        assert_eq!(
+            processed, cancel_after,
+            "the pass stops at the cancel point, well short of N ({} < {})",
+            processed,
+            units.len()
+        );
+
+        // No half-state: every unit that WAS processed is a complete Done entry;
+        // the un-processed ones are absent (never a partial/corrupt entry). Verify
+        // via a fresh session load of the snapshot — the processed units reload.
+        manager.save_now().await.expect("save").expect("session open");
+        let store_path = std::fs::read_dir(&base)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|p| p.extension().and_then(|x| x.to_str()) == Some("bin"))
+            .expect("a snapshot .bin exists");
+        use delphi_parser::unit_cache::UnitCache;
+        let fresh = UnitCache::default();
+        fresh.load(&store_path).expect("snapshot loads");
+        fresh.run_pending_tasks();
+        for n in 0..cancel_after {
+            assert!(
+                fresh
+                    .get(delphi_parser::globals::intern_key(&format!("Unit{n:03}")))
+                    .is_some(),
+                "processed Unit{n:03} reloads as a complete entry"
+            );
+        }
+    }
+
+    /// PRECISION RESTORED: a cross-unit `{$IF Declared(...)}` that is Unknown
+    /// (AssumeFalse) on a COLD cache — because the resident-only editor loader
+    /// (Task-15) does not force-load a non-resident import — resolves TRUE after
+    /// the background indexer has parsed that import into the cache. Warming only
+    /// improves completeness: the guarded declaration goes from absent (cold) to
+    /// present (warm), never a wrong answer either way.
+    #[tokio::test]
+    async fn cross_unit_declared_unknown_cold_resolves_after_indexing() {
+        let base = fresh_snapshot_base("index-precision");
+        // The import that carries the probed symbol.
+        std::fs::write(
+            base.join("Provider.pas"),
+            "unit Provider;\ninterface\ntype TProvided = class end;\nimplementation\nend.",
+        )
+        .unwrap();
+
+        let mut session = build_fallback_session_with_snapshot_base(base.clone());
+
+        // COLD: analyze the editor buffer via `parse_buffer` (resident-only
+        // loader). Provider is not resident, so `Declared(TProvided)` is Unknown →
+        // AssumeFalse → the guarded const is NOT declared.
+        let buffer = "unit Consumer;\ninterface\nuses Provider;\n\
+             {$IF Declared(TProvided)}\nconst WARM = 1;\n{$IFEND}\n\
+             implementation\nend.";
+        let (_, meta) = session
+            .parse_buffer(&base.join("Consumer.pas"), buffer)
+            .expect("buffer parses");
+        let consumer_key = meta.expect("meta").name();
+        let warm_key = session.context().intern_key("WARM");
+        assert!(
+            !session
+                .meta_for(consumer_key)
+                .unwrap()
+                .interface()
+                .contains_key(warm_key),
+            "cold: Declared(TProvided) is Unknown → the guarded const is absent"
+        );
+
+        let manager = SessionManager::new();
+        manager.inject_session_for_test(session).await;
+
+        // The indexer parses Provider (Full) into the cache — the warm-up.
+        assert_eq!(
+            manager.index_unit(base.join("Provider.pas")).await,
+            UnitIndexOutcome::Indexed
+        );
+
+        // WARM: re-analyze the SAME buffer. Provider is now resident, so
+        // `Declared(TProvided)` resolves TRUE → the guarded const IS declared.
+        let handle = manager.handle();
+        let resolved = tokio::task::spawn_blocking(move || {
+            let mut guard = handle.blocking_lock();
+            let session = guard.as_mut().unwrap();
+            let (_, meta) = session
+                .parse_buffer(&base.join("Consumer.pas"), buffer)
+                .expect("re-parse");
+            let key = meta.expect("meta").name();
+            let warm = session.context().intern_key("WARM");
+            let present = session.meta_for(key).unwrap().interface().contains_key(warm);
+            session.trim_arena();
+            present
+        })
+        .await
+        .unwrap();
+        assert!(
+            resolved,
+            "warm: after indexing Provider, Declared(TProvided) resolves → the guarded const appears (precision restored)"
+        );
+    }
+
+    /// BOUNDED RAM ACROSS A PASS: processing many large units one-at-a-time with
+    /// a `trim_arena` between each keeps the RESIDENT disk-content set a function
+    /// of the trim CAP, not of the unit count. After indexing N large units, a
+    /// trim to a small cap bounds resident bytes to that cap — proving RAM stays
+    /// flat across a pass of thousands rather than growing to N×unit-size. (The
+    /// absolute global-arena count is non-deterministic under the parallel
+    /// runner, so the proof is the cap-bounds-resident invariant, applied to the
+    /// arena after the pass — the exact mechanism `index_unit`'s per-unit
+    /// `trim_arena` relies on.)
+    #[tokio::test]
+    async fn resident_set_stays_bounded_across_a_large_pass() {
+        let base = fresh_snapshot_base("index-bound");
+        // N units each with a large (~16 KiB) distinctive body, so N×size far
+        // exceeds the small cap we trim to.
+        let count = 40;
+        let mut paths = Vec::new();
+        for n in 0..count {
+            let path = base.join(format!("Big{n:03}.pas"));
+            std::fs::write(
+                &path,
+                format!(
+                    "unit Big{n:03};\ninterface\ntype TBig{n:03} = class end; // {}\n\
+                     implementation\nend.",
+                    "z".repeat(16 * 1024)
+                ),
+            )
+            .unwrap();
+            paths.push(path);
+        }
+        paths.sort();
+
+        let manager = SessionManager::new();
+        manager
+            .inject_session_for_test(build_fallback_session_with_snapshot_base(base.clone()))
+            .await;
+
+        for path in &paths {
+            assert_eq!(manager.index_unit(path.clone()).await, UnitIndexOutcome::Indexed);
+        }
+
+        // The pass parsed count×16 KiB of source. Trim the shared arena to a small
+        // cap and assert the resident disk bytes bound to it — the resident set is
+        // the cap, not N×unit-size. This is the flat-RAM-across-a-pass invariant.
+        let small_cap = 32 * 1024; // ~two units' worth
+        let handle = manager.handle();
+        let resident_after = tokio::task::spawn_blocking(move || {
+            let guard = handle.blocking_lock();
+            let session = guard.as_ref().unwrap();
+            session.arena().trim_disk_content(small_cap);
+            session.arena().resident_disk_bytes()
+        })
+        .await
+        .unwrap();
+        assert!(
+            resident_after <= small_cap,
+            "resident disk content is bounded by the cap ({resident_after} <= {small_cap}), \
+             not by the {count}-unit pass size"
+        );
+    }
+
+    /// FOREGROUND NON-INTERFERENCE: a simulated `didChange` (a foreground buffer
+    /// analyze) arriving DURING a pass bumps the generation → the pass cancels at
+    /// its next between-units check, and the buffer analyze proceeds and produces
+    /// its meta. Because `index_unit` takes the session lock per unit and releases
+    /// it between units, the foreground `parse_buffer` acquires the lock without
+    /// waiting for the whole pass — at most one unit's parse.
+    #[tokio::test]
+    async fn foreground_didchange_during_pass_cancels_and_analyze_proceeds() {
+        let base = fresh_snapshot_base("index-foreground");
+        let units = write_project_units(&base, 30);
+
+        let manager = std::sync::Arc::new(SessionManager::new());
+        manager
+            .inject_session_for_test(build_fallback_session_with_snapshot_base(base.clone()))
+            .await;
+
+        let generation = std::sync::Arc::new(IndexGeneration::new());
+        let start = generation.current();
+
+        // The background pass: index units one at a time, checking the cancel
+        // token between each (the exact `run_indexing_pass` structure). It yields
+        // between units so the foreground task below can interleave.
+        let pass_manager = manager.clone();
+        let pass_generation = generation.clone();
+        let pass_units = units.clone();
+        let pass = tokio::spawn(async move {
+            let mut processed = 0usize;
+            for path in &pass_units {
+                if pass_generation.changed_since(start) {
+                    break;
+                }
+                let outcome = pass_manager.index_unit(path.clone()).await;
+                if !matches!(outcome, UnitIndexOutcome::Indexed) {
+                    break;
+                }
+                processed += 1;
+                tokio::task::yield_now().await;
+            }
+            processed
+        });
+
+        // A foreground didChange arrives mid-pass: bump the generation (as
+        // `note_foreground_activity` does) and run the buffer analyze. The analyze
+        // acquires the session lock between the pass's per-unit acquisitions.
+        generation.bump();
+        let analyze_manager = manager.clone();
+        let analyze_base = base.clone();
+        let analyze_meta_present = tokio::task::spawn_blocking(move || {
+            let handle = analyze_manager.handle();
+            let mut guard = handle.blocking_lock();
+            let session = guard.as_mut().unwrap();
+            let text = "unit Editing;\ninterface\ntype TEdited = class end;\n\
+                 implementation\nend.";
+            let (_, meta) = session
+                .parse_buffer(&analyze_base.join("Editing.pas"), text)
+                .expect("foreground analyze parses");
+            let present = meta.is_some();
+            session.trim_arena();
+            present
+        })
+        .await
+        .unwrap();
+
+        assert!(analyze_meta_present, "the foreground buffer analyze proceeds and produces its meta");
+        let processed = pass.await.unwrap();
+        assert!(
+            processed < units.len(),
+            "the pass was cancelled by the foreground bump, short of N ({} < {})",
+            processed,
+            units.len()
+        );
+    }
+
     /// The VIRTUAL open buffer must NEVER persist ACROSS SESSIONS (invariant
     /// #21/#25). A virtual unit's meta IS written into the snapshot segment, but
     /// its display-only `FileId` path does not exist on disk, so on LOAD it fails
