@@ -1262,14 +1262,27 @@ impl ProjectSession {
     ///   nothing (its usage set / import resolution is not trustworthy);
     /// - a uses entry whose unit was CONSULTED AS A DEPENDENCY (`{$IF
     ///   Declared/SizeOf}` reached into its interface) is a real use → skip;
-    /// - a uses entry that the loader does NOT resolve to `Loaded` (missing
-    ///   source / DCU-only / cycle / parse failure) cannot be PROVEN unused →
-    ///   skip;
+    /// - a uses entry whose interface is NOT ALREADY in the cache cannot be
+    ///   PROVEN unused WITHOUT parsing it — and parsing it here would drag the
+    ///   whole `uses` graph of a real VCL/RTL-using unit into memory on every
+    ///   `analyze` (the Task-15 OOM). So this check is CACHE-ONLY: an import
+    ///   with no cached interface is SKIPPED (never flagged), exactly like an
+    ///   unresolvable one. This only ever makes the hint MISS a genuinely-unused
+    ///   import (until something else parses it), never false-flag one — the
+    ///   conservative direction the whole analysis already obeys;
     /// - a uses entry ANY of whose exported keys (its own unit key included)
     ///   appears in the over-approximating usage set is "possibly used" → skip.
-    /// Only a loadable, non-dependency, non-cycle import ZERO of whose exports is
-    /// referenced is flagged — and only ever as a [`UnusedUnit`] the caller
-    /// surfaces as a HINT with the side-effect caveat, never a removal claim.
+    /// Only an ALREADY-CACHED, non-dependency, non-cycle import ZERO of whose
+    /// exports is referenced is flagged — and only ever as a [`UnusedUnit`] the
+    /// caller surfaces as a HINT with the side-effect caveat, never a removal
+    /// claim.
+    ///
+    /// FORCE-LOAD DISCIPLINE (Task-15): `analyze` calls `diagnostics()` which
+    /// calls this on the hot path. It must therefore NEVER parse an uncached
+    /// import — `analyze` of a unit parses ONLY that unit (plus its own
+    /// directive-forced loads during its own parse), never its whole `uses`
+    /// graph. The cache-only [`Self::meta_of`] lookup below is what enforces
+    /// that: it reads the cache and returns `None` on a miss, it never parses.
     pub fn unused_units(&self, unit_key: Identifier) -> Vec<UnusedUnit> {
         let Some(meta) = self.meta_of(unit_key) else {
             return Vec::new();
@@ -1292,7 +1305,6 @@ impl ProjectSession {
         let dependency_units: std::collections::HashSet<Identifier> =
             meta.dependencies.iter().map(|dependency| dependency.unit).collect();
 
-        let loader = self.make_loader();
         let mut flagged: Vec<UnusedUnit> = Vec::new();
         let mut seen: std::collections::HashSet<Identifier> = std::collections::HashSet::new();
 
@@ -1307,11 +1319,16 @@ impl ProjectSession {
             if dependency_units.contains(&import_key) {
                 continue;
             }
-            // Resolve its interface via the same loader as `definition`. Only a
-            // fully-loaded interface lets us prove non-reference; anything else
-            // (missing / DCU-only / cycle / failed) → cannot prove → skip.
-            let crate::parse_state::LoadOutcome::Loaded(imported) = loader.interface_of(import_key)
-            else {
+            // CACHE-ONLY interface lookup (Task-15 OOM fix). Deliberately NOT
+            // `loader.interface_of`, which parses on a cache miss: on the
+            // `analyze` hot path that would drag the entire `uses` graph of a
+            // real unit into memory. `meta_of` reads the cache and returns
+            // `None` on a miss — it never parses. An import whose interface is
+            // not already cached cannot be PROVEN unused without parsing it, so
+            // it is SKIPPED (never flagged) — conservative, consistent with the
+            // never-false-flag discipline (skipping only ever MISSES an unused
+            // hint, never invents one).
+            let Some(imported) = self.meta_of(import_key) else {
                 continue;
             };
             // The unit's own key can appear as a qualified `Unit.Symbol` usage;
@@ -3198,6 +3215,17 @@ mod tests {
         session
             .parse_source_file(directory.join("Consumer.pas"))
             .unwrap();
+        // Cache the imports' interfaces. unused-uses is CACHE-ONLY (Task-15 OOM
+        // fix): it never force-parses an import on the analyze hot path, so a
+        // uses entry is only evaluable once its interface is already cached
+        // (e.g. the user navigated into it). Pre-cache both here to exercise the
+        // flagging logic.
+        session
+            .parse_source_file(directory.join("Used.pas"))
+            .unwrap();
+        session
+            .parse_source_file(directory.join("Unused.pas"))
+            .unwrap();
         let key = session.context.intern_key("CONSUMER");
 
         let unused = session.unused_units(key);
@@ -3359,6 +3387,14 @@ mod tests {
         let mut session = query_session(&directory);
         session
             .parse_source_file(directory.join("Consumer.pas"))
+            .unwrap();
+        // Pre-cache the imports — unused-uses is cache-only (Task-15 OOM fix)
+        // and never force-parses an import on the analyze hot path.
+        session
+            .parse_source_file(directory.join("Used.pas"))
+            .unwrap();
+        session
+            .parse_source_file(directory.join("Unused.pas"))
             .unwrap();
         let key = session.context.intern_key("CONSUMER");
         let flagged: Vec<String> = session

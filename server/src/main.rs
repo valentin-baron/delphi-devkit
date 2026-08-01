@@ -1306,6 +1306,12 @@ mod lifecycle_tests {
         .unwrap();
 
         let mut session = build_fallback_session_with_search_path(directory.clone());
+        // unused-uses is CACHE-ONLY (Task-15 OOM fix): analyze never force-parses
+        // an import, so the imports must already be cached for the check to
+        // evaluate them. Parse them from disk first (as would happen once the
+        // user navigates into them).
+        session.parse_source_file(directory.join("Used.pas")).unwrap();
+        session.parse_source_file(directory.join("Unused.pas")).unwrap();
         let text = "unit Consumer;\ninterface\nuses Used, Unused;\n\
              implementation\n\
              procedure P;\nvar X: TUsed;\nbegin X := TUsed.Create; end;\n\
