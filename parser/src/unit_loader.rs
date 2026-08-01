@@ -18,6 +18,25 @@ use crate::source::SourceArena;
 use crate::unit_cache::CacheEntry;
 use crate::unit_resolution::resolve_unit;
 
+/// How the loader answers a cache MISS in [`UnitLoader::interface_of`].
+///
+/// - [`LoadMode::Full`]: the historical behavior — on a miss, reload the unit's
+///   AST from its per-unit snapshot (hash-validated) or, failing that, resolve
+///   the source, read it and PARSE it (which recursively force-loads that unit's
+///   own `{$IF Declared/SizeOf}` dependency closure). This is what batch parses,
+///   navigation, didSave and the query handlers want.
+/// - [`LoadMode::ResidentOnly`]: answer ONLY from what is ALREADY resident in the
+///   moka RAM cache. A miss returns [`LoadOutcome::NotFound`] WITHOUT touching
+///   disk, the resolver, the arena or the parser — so parsing an editor buffer
+///   never cascades into force-loading its whole cross-unit closure (the Task-15
+///   OOM). A cross-unit `{$IF Declared/SizeOf}` whose target is not yet resident
+///   answers Unknown (→ the safe AssumeFalse tri-state), NEVER a wrong result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadMode {
+    Full,
+    ResidentOnly,
+}
+
 pub struct UnitLoader {
     /// The process-global arena (`&'static`). Nested parses register their
     /// files here so serialized `FileId`s resolve consistently on save.
@@ -42,6 +61,11 @@ pub struct UnitLoader {
     /// re-read/re-parsed only when the file hash changed. `None` for batch
     /// parses / tests with no durable store — those always re-parse on a miss.
     store: Option<Arc<crate::cache_store::CacheStore>>,
+    /// Miss-resolution mode (see [`LoadMode`]). [`LoadMode::Full`] for every
+    /// constructor except [`Self::with_store_resident_only`], which the editor
+    /// buffer parse ([`crate::driver::ProjectSession::parse_buffer`]) uses so a
+    /// buffer parse never force-loads its cross-unit closure.
+    mode: LoadMode,
 }
 
 impl UnitLoader {
@@ -55,11 +79,39 @@ impl UnitLoader {
 
     /// Like [`Self::new`], but also threads the durable [`CacheStore`] so a
     /// cache miss reloads from the per-unit file before re-parsing (Task 16 C).
+    /// Full mode.
     pub fn with_store(
         arena: &'static SourceArena,
         context: Arc<ProjectContext>,
         reverse_index: Option<Arc<crate::watcher::ReverseDependencyIndex>>,
         store: Option<Arc<crate::cache_store::CacheStore>>,
+    ) -> Rc<Self> {
+        Self::with_store_and_mode(arena, context, reverse_index, store, LoadMode::Full)
+    }
+
+    /// Like [`Self::with_store`], but in [`LoadMode::ResidentOnly`]: a cache miss
+    /// answers [`LoadOutcome::NotFound`] WITHOUT reloading-from-disk, resolving,
+    /// arena-loading or parsing. This is the EDITOR buffer parse loader
+    /// ([`crate::driver::ProjectSession::parse_buffer`]): opening a unit parses
+    /// ONLY that unit — its cross-unit `{$IF Declared/SizeOf}` that are not
+    /// already resident answer Unknown (safe AssumeFalse), never force-parsing
+    /// the closure (Task-15 OOM). A resident hit is served exactly as in Full
+    /// mode (including recording the dependency).
+    pub fn with_store_resident_only(
+        arena: &'static SourceArena,
+        context: Arc<ProjectContext>,
+        reverse_index: Option<Arc<crate::watcher::ReverseDependencyIndex>>,
+        store: Option<Arc<crate::cache_store::CacheStore>>,
+    ) -> Rc<Self> {
+        Self::with_store_and_mode(arena, context, reverse_index, store, LoadMode::ResidentOnly)
+    }
+
+    fn with_store_and_mode(
+        arena: &'static SourceArena,
+        context: Arc<ProjectContext>,
+        reverse_index: Option<Arc<crate::watcher::ReverseDependencyIndex>>,
+        store: Option<Arc<crate::cache_store::CacheStore>>,
+        mode: LoadMode,
     ) -> Rc<Self> {
         Rc::new_cyclic(|weak| Self {
             arena,
@@ -69,6 +121,7 @@ impl UnitLoader {
             self_reference: weak.clone(),
             reverse_index,
             store,
+            mode,
         })
     }
 }
@@ -84,6 +137,17 @@ impl InterfaceLoader for UnitLoader {
 
         if self.active_units.borrow().contains(&unit_key) {
             return LoadOutcome::Cycle;
+        }
+
+        // ResidentOnly mode (editor buffer parse, Task-15): the cache-miss above
+        // is the answer. Do NOT reload-from-disk, resolve, arena-load or parse —
+        // any of those would drag the buffer's cross-unit `{$IF Declared/SizeOf}`
+        // closure into memory (the 14GB OOM). A not-yet-resident target answers
+        // Unknown (→ AssumeFalse), never a wrong result. The cache hit and the
+        // cycle check above still apply: a resident import IS served (and its
+        // dependency recorded by the caller), cycle-safety is preserved.
+        if self.mode == LoadMode::ResidentOnly {
+            return LoadOutcome::NotFound;
         }
 
         // Lazy reload-from-disk (Task 16 C): BEFORE resolving the name and

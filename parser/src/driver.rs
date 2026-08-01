@@ -337,7 +337,16 @@ impl ProjectSession {
             .set_virtual(path.as_ref().to_path_buf(), content.to_string());
         let inserts_before = self.context.unit_cache.insert_count();
 
-        let loader = UnitLoader::with_store(
+        // RESIDENT-ONLY loader (Task-15): the editor buffer parse must parse ONLY
+        // this buffer. A cross-unit `{$IF Declared/SizeOf}` whose target is not
+        // already resident in the RAM cache answers Unknown (safe AssumeFalse)
+        // instead of force-loading the whole {$IF}-dependency closure — which
+        // cascades through be.core + the RTL/VCL source tree and OOMs (14GB).
+        // `parse_source_file` (batch/navigation/didSave) and the query handlers
+        // (`make_loader`) stay Full: a single explicit navigation load is fine;
+        // only the buffer parse triggered the cascade. Cross-unit precision here
+        // improves as the cache warms.
+        let loader = UnitLoader::with_store_resident_only(
             self.arena,
             self.context.clone(),
             Some(self.index.clone()),
@@ -3916,6 +3925,122 @@ mod tests {
             .expect("symbol_at hits TThing in the buffer");
         assert_eq!(target.key, session.context.intern_key("TThing"));
         assert_eq!(target.kind, TargetKind::Declaration);
+    }
+
+    /// Task-15 no-cascade proof: a `parse_buffer` of a unit that `uses` and
+    /// `{$IF Declared(...)}`s an UNCACHED cross-unit unit must NOT force-parse
+    /// that import (the OOM cascade). The import stays absent from the cache
+    /// after the buffer parse, and the directive whose target lives ONLY in the
+    /// uncached import degrades to Unknown → AssumeFalse (safe, never a wrong
+    /// answer). Contrast with `parse_source_file`, which DOES force-load — proven
+    /// green by the `unit_loader::tests::declared_forces_lazy_import_parse` suite.
+    #[test]
+    fn parse_buffer_does_not_cascade_into_uncached_import() {
+        let directory = temp_directory("parse_buffer_no_cascade");
+        // The cross-unit dependency exists ON DISK but is NOT pre-cached.
+        std::fs::write(
+            directory.join("Dependency.pas"),
+            "unit Dependency; interface const Beacon = 1; implementation end.",
+        )
+        .unwrap();
+        // The editor buffer uses it and probes it with {$IF Declared}. In Full
+        // mode this forces Dependency's parse; in ResidentOnly (buffer) mode it
+        // must not — Beacon is not resident → Unknown → the {$ELSE} branch.
+        let source = "unit Editor; interface uses Dependency;\n\
+             {$IF Declared(Beacon)} const SawBeacon = True; {$ELSE} const NoBeacon = True; {$IFEND}\n\
+             implementation end.";
+
+        let mut session = query_session(&directory);
+        let dependency_key = session.context.intern_key("DEPENDENCY");
+        // Precondition: the import is not resident before the buffer parse.
+        assert!(
+            session.meta_of(dependency_key).is_none(),
+            "Dependency must not be cached before the buffer parse"
+        );
+
+        let (_, meta) = session
+            .parse_buffer(directory.join("Editor_unsaved.pas"), source)
+            .unwrap();
+        let meta = meta.expect("buffer meta");
+
+        // PROOF OF NO CASCADE: Dependency was NOT parsed into the cache by the
+        // buffer parse. (`run_pending_tasks` flushes any pending moka insert so a
+        // stray force-load could not hide behind lazy task processing.)
+        session.context.unit_cache.run_pending_tasks();
+        assert!(
+            session.meta_of(dependency_key).is_none(),
+            "parse_buffer must NOT force-load the uncached cross-unit import \
+             (Task-15 no-cascade): Dependency is still absent from the cache"
+        );
+
+        // And the {$IF Declared(Beacon)} degraded to Unknown → AssumeFalse: the
+        // {$ELSE} branch was taken (NoBeacon), NOT SawBeacon. Never a wrong
+        // answer — just a safe Unknown because Beacon was not resident.
+        let names: Vec<String> = meta
+            .interface()
+            .symbols
+            .iter()
+            .map(|symbol| crate::globals::resolve(symbol.key).to_string())
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "NOBEACON"),
+            "uncached cross-unit Declared degrades to AssumeFalse (else branch): {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name == "SAWBEACON"),
+            "the buffer parse must not have force-loaded Beacon: {names:?}"
+        );
+    }
+
+    /// Task-15 counterpart: a cross-unit `{$IF Declared(...)}` whose target is
+    /// ALREADY RESIDENT in the RAM cache IS used by a `parse_buffer`. Pre-caching
+    /// the import (via a `parse_source_file`, the Full path) makes it resident;
+    /// the subsequent buffer parse then resolves `Declared` against it — proving
+    /// ResidentOnly serves resident hits exactly like Full, and cross-unit
+    /// precision improves as the cache warms.
+    #[test]
+    fn parse_buffer_uses_resident_import() {
+        let directory = temp_directory("parse_buffer_resident");
+        std::fs::write(
+            directory.join("Dependency.pas"),
+            "unit Dependency; interface const Beacon = 1; implementation end.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        // Warm the cache: parse Dependency through the FULL path so it is resident.
+        session
+            .parse_source_file(directory.join("Dependency.pas"))
+            .unwrap();
+        let dependency_key = session.context.intern_key("DEPENDENCY");
+        assert!(
+            session.meta_of(dependency_key).is_some(),
+            "Dependency must be resident after parse_source_file"
+        );
+
+        // Now the editor buffer parse: Beacon IS resident → Declared resolves True.
+        let source = "unit Editor; interface uses Dependency;\n\
+             {$IF Declared(Beacon)} const SawBeacon = True; {$ELSE} const NoBeacon = True; {$IFEND}\n\
+             implementation end.";
+        let (_, meta) = session
+            .parse_buffer(directory.join("Editor_unsaved.pas"), source)
+            .unwrap();
+        let meta = meta.expect("buffer meta");
+
+        let names: Vec<String> = meta
+            .interface()
+            .symbols
+            .iter()
+            .map(|symbol| crate::globals::resolve(symbol.key).to_string())
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "SAWBEACON"),
+            "a RESIDENT cross-unit Declared must resolve (True branch): {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name == "NOBEACON"),
+            "resident Beacon must not fall to the else branch: {names:?}"
+        );
     }
 
     #[test]
