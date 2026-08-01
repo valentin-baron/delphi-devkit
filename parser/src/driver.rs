@@ -28,6 +28,7 @@ use crate::dfm_link::{DfmLinkResult, link_dfm};
 use crate::meta::{CodeLocation, FileId};
 use crate::query::{
     Completion, CompletionKind, DiagnosticSource, QueryTarget, TargetKind, UnifiedDiagnostic,
+    UnusedUnit,
 };
 use crate::parse_state::InterfaceLoader;
 use crate::references::{Occurrence, ReferenceIndex};
@@ -944,8 +945,92 @@ impl ProjectSession {
         completions
     }
 
-    /// The unit's unified diagnostics: parse findings + dfm-linker findings,
-    /// one queryable list for `textDocument/publishDiagnostics`.
+    /// CONSERVATIVE unused-uses analysis for `unit_key`: each `uses` entry
+    /// (interface AND implementation) whose imported unit contributes NO
+    /// referenced symbol to this unit. Resolves imports through the SAME
+    /// cycle-safe, dependency-recorded loader as [`Self::definition`].
+    ///
+    /// NEVER-FALSE-FLAG discipline (a false "unused" invites deleting a needed
+    /// unit and breaking the build — the highest-severity defect here):
+    /// - the importer being CYCLE-TAINTED taints the whole analysis → flag
+    ///   nothing (its usage set / import resolution is not trustworthy);
+    /// - a uses entry whose unit was CONSULTED AS A DEPENDENCY (`{$IF
+    ///   Declared/SizeOf}` reached into its interface) is a real use → skip;
+    /// - a uses entry that the loader does NOT resolve to `Loaded` (missing
+    ///   source / DCU-only / cycle / parse failure) cannot be PROVEN unused →
+    ///   skip;
+    /// - a uses entry ANY of whose exported keys (its own unit key included)
+    ///   appears in the over-approximating usage set is "possibly used" → skip.
+    /// Only a loadable, non-dependency, non-cycle import ZERO of whose exports is
+    /// referenced is flagged — and only ever as a [`UnusedUnit`] the caller
+    /// surfaces as a HINT with the side-effect caveat, never a removal claim.
+    pub fn unused_units(&self, unit_key: Identifier) -> Vec<UnusedUnit> {
+        let Some(meta) = self.meta_of(unit_key) else {
+            return Vec::new();
+        };
+        // A cycle-tainted parse has an untrustworthy import graph AND usage set;
+        // proving anything unused off it risks a false flag → flag nothing.
+        if meta.cycle_tainted {
+            return Vec::new();
+        }
+
+        // The importer's usage set: every folded symbol key that occurs anywhere
+        // in the unit (interface-body references + implementation occurrences).
+        // Over-approximating on purpose — a name-match spares the import (a false
+        // "used" is safe; a false "unused" is not).
+        let usage_keys: std::collections::HashSet<Identifier> =
+            meta.usages.iter().map(|usage| usage.symbol).collect();
+
+        // Units consulted as a DEPENDENCY (a `{$IF Declared(Foo.X)}`/`SizeOf`
+        // reached into Foo's interface). That IS a use — never flag such a unit.
+        let dependency_units: std::collections::HashSet<Identifier> =
+            meta.dependencies.iter().map(|dependency| dependency.unit).collect();
+
+        let loader = self.make_loader();
+        let mut flagged: Vec<UnusedUnit> = Vec::new();
+        let mut seen: std::collections::HashSet<Identifier> = std::collections::HashSet::new();
+
+        for used in uses_entries(&meta) {
+            let import_key = used.key;
+            // De-duplicate: a unit named in both interface and implementation
+            // uses is flagged at most once (its first — interface — entry).
+            if !seen.insert(import_key) {
+                continue;
+            }
+            // Consulted as a dependency → a real use.
+            if dependency_units.contains(&import_key) {
+                continue;
+            }
+            // Resolve its interface via the same loader as `definition`. Only a
+            // fully-loaded interface lets us prove non-reference; anything else
+            // (missing / DCU-only / cycle / failed) → cannot prove → skip.
+            let crate::parse_state::LoadOutcome::Loaded(imported) = loader.interface_of(import_key)
+            else {
+                continue;
+            };
+            // The unit's own key can appear as a qualified `Unit.Symbol` usage;
+            // a match on it means the unit is referenced. Include it alongside
+            // its exported symbol keys.
+            let referenced = usage_keys.contains(&import_key)
+                || imported
+                    .interface()
+                    .symbols
+                    .iter()
+                    .any(|symbol| usage_keys.contains(&symbol.key));
+            if referenced {
+                continue;
+            }
+            flagged.push(UnusedUnit {
+                unit: used.display,
+                location: used.location,
+            });
+        }
+        flagged
+    }
+
+    /// The unit's unified diagnostics: parse findings + dfm-linker findings +
+    /// the conservative unused-uses HINTS, one queryable list for
+    /// `textDocument/publishDiagnostics`.
     pub fn diagnostics(&self, unit_key: Identifier) -> Vec<UnifiedDiagnostic> {
         let mut all: Vec<UnifiedDiagnostic> = self
             .parse_diagnostics
@@ -962,6 +1047,20 @@ impl ProjectSession {
                     message: diagnostic.message(),
                 });
             }
+        }
+        // Conservative unused-uses hints (never an error/removal instruction).
+        for unused in self.unused_units(unit_key) {
+            all.push(UnifiedDiagnostic {
+                source: DiagnosticSource::Analysis,
+                severity: crate::token_cursor::Severity::Hint,
+                location: Some(unused.location),
+                dfm_offset: None,
+                message: format!(
+                    "unit '{}' is in the uses clause but none of its symbols are \
+                     referenced (it may still be needed for initialization side effects)",
+                    crate::globals::resolve(unused.unit)
+                ),
+            });
         }
         all
     }
@@ -1131,6 +1230,37 @@ impl ProjectSession {
 /// zero-length span covers nothing.
 fn span_covers(location: CodeLocation, position: u32) -> bool {
     location.span.start <= position && position < location.span.end
+}
+
+/// One `uses`-clause entry: its folded lookup key, its display spelling, and the
+/// exact source span of the name — the range the unused-uses hint highlights.
+struct UsesEntry {
+    key: Identifier,
+    display: Identifier,
+    location: CodeLocation,
+}
+
+/// Every `uses` entry of a unit, interface section first then implementation, in
+/// source order. Each carries the name's own span so a hint anchors exactly on
+/// the imported unit's name in the clause.
+fn uses_entries(meta: &UnitMeta) -> Vec<UsesEntry> {
+    let mut entries = Vec::new();
+    for clause in [
+        meta.ast.interface_uses.as_ref(),
+        meta.ast.implementation_uses.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for used in &clause.uses {
+            entries.push(UsesEntry {
+                key: used.name.key,
+                display: used.name.name,
+                location: used.name.location,
+            });
+        }
+    }
+    entries
 }
 
 /// A unit's imports in reverse uses order (later shadows earlier), read from the
@@ -2521,6 +2651,218 @@ mod tests {
         assert!(
             diagnostics.iter().any(|d| d.source == DiagnosticSource::Dfm),
             "the dangling Ghost component leaves a dfm diagnostic: {diagnostics:?}"
+        );
+    }
+
+    // ─── Part B: conservative unused-uses analysis ─────────────────────────
+
+    /// Set up a project directory with the three helper units the unused-uses
+    /// tests share: `Used` (exports `TUsed`), `Unused` (exports `TUnused`), and a
+    /// consumer written by the caller.
+    fn write_used_and_unused(directory: &Path) {
+        std::fs::write(
+            directory.join("Used.pas"),
+            "unit Used;\ninterface\ntype TUsed = class end;\nimplementation\nend.",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("Unused.pas"),
+            "unit Unused;\ninterface\ntype TUnused = class end;\nimplementation\nend.",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn unused_uses_flags_only_the_unreferenced_import() {
+        // Consumer uses BOTH Used and Unused but references only TUsed → exactly
+        // Unused is flagged, and only as a Hint from the Analysis source with the
+        // side-effect caveat (never an error/removal instruction).
+        let directory = temp_directory("unused_uses_basic");
+        write_used_and_unused(&directory);
+        std::fs::write(
+            directory.join("Consumer.pas"),
+            "unit Consumer;\ninterface\nuses Used, Unused;\n\
+             implementation\n\
+             procedure P;\nvar X: TUsed;\nbegin X := TUsed.Create; end;\n\
+             end.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session
+            .parse_source_file(directory.join("Consumer.pas"))
+            .unwrap();
+        let key = session.context.intern_key("CONSUMER");
+
+        let unused = session.unused_units(key);
+        let flagged: Vec<String> = unused
+            .iter()
+            .map(|u| crate::globals::resolve(u.unit).to_string())
+            .collect();
+        assert_eq!(flagged, ["Unused"], "only the unreferenced unit is flagged");
+
+        // surfaced as a HINT via the Analysis source with the caveat wording.
+        let diagnostics = session.diagnostics(key);
+        let hint = diagnostics
+            .iter()
+            .find(|d| d.source == DiagnosticSource::Analysis)
+            .expect("an unused-uses hint is published");
+        assert_eq!(hint.severity, crate::token_cursor::Severity::Hint);
+        assert!(hint.message.contains("Unused"));
+        assert!(
+            hint.message.contains("side effects"),
+            "the hint carries the side-effect caveat, not a removal instruction: {}",
+            hint.message
+        );
+        // NEVER flags the referenced unit.
+        assert!(
+            !flagged.iter().any(|name| name == "Used"),
+            "a referenced unit must never be flagged"
+        );
+        // the hint range is the uses entry span (non-degenerate).
+        let location = hint.location.expect("hint carries the uses-entry span");
+        assert!(location.span.end > location.span.start);
+    }
+
+    #[test]
+    fn unused_uses_spares_import_whose_name_matches_a_referenced_symbol() {
+        // The consumer references a name (`TShared`) that ALSO exists as an
+        // export of the imported unit. Even though the reference may really bind
+        // elsewhere, an export-key match spares the import — a false "used" is
+        // safe, a false "unused" is not.
+        let directory = temp_directory("unused_uses_name_match");
+        std::fs::write(
+            directory.join("Shared.pas"),
+            "unit Shared;\ninterface\ntype TShared = class end;\nimplementation\nend.",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("Consumer.pas"),
+            // A local type named TShared is what the body references; Shared also
+            // EXPORTS TShared, so the export-key match spares Shared.
+            "unit Consumer;\ninterface\nuses Shared;\n\
+             implementation\n\
+             type TShared = class end;\n\
+             procedure P;\nvar X: TShared;\nbegin X := nil; end;\n\
+             end.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session
+            .parse_source_file(directory.join("Consumer.pas"))
+            .unwrap();
+        let key = session.context.intern_key("CONSUMER");
+        let flagged: Vec<String> = session
+            .unused_units(key)
+            .iter()
+            .map(|u| crate::globals::resolve(u.unit).to_string())
+            .collect();
+        assert!(
+            flagged.is_empty(),
+            "a name-match on an export key spares the import: {flagged:?}"
+        );
+    }
+
+    #[test]
+    fn unused_uses_never_flags_an_unloadable_import() {
+        // The consumer imports a unit with NO source on the search path (DCU-only
+        // from our view). It cannot be loaded → cannot be proven unused → never
+        // flagged, even though nothing references it.
+        let directory = temp_directory("unused_uses_unloadable");
+        std::fs::write(
+            directory.join("Consumer.pas"),
+            "unit Consumer;\ninterface\nuses Vcl.Forms;\n\
+             implementation\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session
+            .parse_source_file(directory.join("Consumer.pas"))
+            .unwrap();
+        let key = session.context.intern_key("CONSUMER");
+        let flagged: Vec<String> = session
+            .unused_units(key)
+            .iter()
+            .map(|u| crate::globals::resolve(u.unit).to_string())
+            .collect();
+        assert!(
+            flagged.is_empty(),
+            "an unloadable import must never be flagged: {flagged:?}"
+        );
+    }
+
+    #[test]
+    fn unused_uses_never_flags_a_dependency_consulted_import() {
+        // Consumer imports Config only to consult it in `{$IF Declared(Answer)}`
+        // — no symbol of Config is otherwise referenced. That consult IS a use
+        // (Config is recorded as a dependency) → never flagged.
+        let directory = temp_directory("unused_uses_dependency");
+        std::fs::write(
+            directory.join("Config.pas"),
+            "unit Config;\ninterface\nconst Answer = 42;\nimplementation\nend.",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("Consumer.pas"),
+            "unit Consumer;\ninterface\nuses Config;\n\
+             {$IF Declared(Answer)} const HasAnswer = True; {$IFEND}\n\
+             implementation\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        let (_, meta) = session
+            .parse_source_file(directory.join("Consumer.pas"))
+            .unwrap();
+        let meta = meta.unwrap();
+        // Config was genuinely consulted as a dependency (proves the guard fired).
+        assert!(
+            meta.dependencies
+                .iter()
+                .any(|d| d.unit == session.context.intern_key("CONFIG")),
+            "Config must be recorded as a consulted dependency"
+        );
+        let key = session.context.intern_key("CONSUMER");
+        let flagged: Vec<String> = session
+            .unused_units(key)
+            .iter()
+            .map(|u| crate::globals::resolve(u.unit).to_string())
+            .collect();
+        assert!(
+            flagged.is_empty(),
+            "a dependency-consulted import is a real use, never flagged: {flagged:?}"
+        );
+    }
+
+    #[test]
+    fn unused_uses_covers_implementation_uses_too() {
+        // An UNREFERENCED unit in the IMPLEMENTATION uses clause is flagged just
+        // like an interface one; a referenced implementation import is spared.
+        let directory = temp_directory("unused_uses_impl");
+        write_used_and_unused(&directory);
+        std::fs::write(
+            directory.join("Consumer.pas"),
+            "unit Consumer;\ninterface\nimplementation\nuses Used, Unused;\n\
+             procedure P;\nvar X: TUsed;\nbegin X := TUsed.Create; end;\n\
+             end.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session
+            .parse_source_file(directory.join("Consumer.pas"))
+            .unwrap();
+        let key = session.context.intern_key("CONSUMER");
+        let flagged: Vec<String> = session
+            .unused_units(key)
+            .iter()
+            .map(|u| crate::globals::resolve(u.unit).to_string())
+            .collect();
+        assert_eq!(
+            flagged, ["Unused"],
+            "implementation-uses is analyzed too; the referenced import is spared"
         );
     }
 

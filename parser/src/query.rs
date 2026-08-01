@@ -188,3 +188,24 @@ pub struct UnifiedDiagnostic {
     pub dfm_offset: Option<usize>,
     pub message: String,
 }
+
+/// A `uses`-clause entry the CONSERVATIVE unused-uses analysis flagged: none of
+/// the imported unit's exported symbols appears anywhere in the importing unit's
+/// usage set.
+///
+/// HONESTY CONTRACT (binds hard — a FALSE "unused" invites the user to delete a
+/// needed unit and break the build). This is surfaced ONLY as a
+/// [`super::query::DiagnosticSource::Analysis`] HINT with a side-effect caveat,
+/// NEVER an error or a removal instruction. A unit is flagged ONLY when it is
+/// loadable, is not consulted as a dependency (e.g. for `{$IF Declared/SizeOf}`),
+/// the importer is not cycle-tainted, and ZERO of its exported keys (its own unit
+/// key included) appears in the usage set. Anything that cannot be PROVEN unused
+/// — an unloadable/DCU-only import, a name-match, a dependency consult, a cycle —
+/// is left un-flagged (a false "used" is safe; a false "unused" is not).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnusedUnit {
+    /// The imported unit's DISPLAY name, as written at the uses entry.
+    pub unit: Identifier,
+    /// The uses-clause entry's source span (the range the hint highlights).
+    pub location: CodeLocation,
+}
