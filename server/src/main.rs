@@ -5,12 +5,14 @@ mod documents;
 mod hover;
 mod locations;
 mod positions;
+mod progress;
 mod semantic;
 mod session;
 mod signature;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use tokio::io::{stdin, stdout};
@@ -69,6 +71,18 @@ struct DelphiLsp {
     /// this URL), the handler triggers a single `analyze` and retries once —
     /// never a re-parse loop.
     analyzed_units: Arc<Mutex<HashMap<Url, delphi_parser::context::Identifier>>>,
+    /// Whether the CLIENT advertised `window.work_done_progress` in `initialize`.
+    /// Server-initiated `window/workDoneProgress` is only emitted when this is
+    /// `true` (sending `$/progress` to a client that never advertised support is
+    /// a protocol violation). Set once in `initialize`, then read-only, so an
+    /// `AtomicBool` avoids a lock on the progress hot path. Default `false` (the
+    /// safe assumption before `initialize` runs — no progress until the client
+    /// says it supports it). See [`progress`].
+    client_supports_progress: Arc<AtomicBool>,
+    /// Mints process-unique progress tokens for server-initiated progress. Shared
+    /// so concurrent operations (multiple `analyze`s, task-18 indexing) never
+    /// collide on a token. See [`progress::ProgressTokens`].
+    progress_tokens: Arc<progress::ProgressTokens>,
 }
 
 /// The monotonic publish-slot decision, extracted so the out-of-order race is
@@ -116,7 +130,40 @@ impl DelphiLsp {
             session: Arc::new(SessionManager::new()),
             published_versions: Arc::new(Mutex::new(HashMap::new())),
             analyzed_units: Arc::new(Mutex::new(HashMap::new())),
+            // Default off: no progress is emitted until `initialize` records that
+            // the client advertised support.
+            client_supports_progress: Arc::new(AtomicBool::new(false)),
+            progress_tokens: Arc::new(progress::ProgressTokens::new()),
         }
+    }
+
+    /// Begin a server-initiated `window/workDoneProgress` titled `title` (with an
+    /// optional detail `message`), returning a [`progress::ProgressReporter`] the
+    /// caller drives to `report`/`end` — or `None` when the client does not
+    /// support progress or the create handshake failed.
+    ///
+    /// This is the reusable entry point Task 18's background indexing drives to
+    /// show "Indexing N/M (unit)": `begin("Delphi: indexing", None)` once, then
+    /// `reporter.report(Some(pct), Some("N/M (unit)"))` per unit, then
+    /// `reporter.end(None)`. It is BEST-EFFORT: a `None` return (or any failed
+    /// notification inside the reporter) never changes the caller's behaviour.
+    ///
+    /// Lock/async: this holds no document or session lock, so its awaits can be
+    /// interleaved with a running `spawn_blocking` parse without stalling it or
+    /// risking a lock-across-`.await`.
+    async fn begin_progress(
+        &self,
+        title: impl Into<String>,
+        message: Option<String>,
+    ) -> Option<progress::ProgressReporter> {
+        progress::begin(
+            &self.client,
+            &self.progress_tokens,
+            self.client_supports_progress.load(Ordering::Relaxed),
+            title,
+            message,
+        )
+        .await
     }
 
     /// Publish `diagnostics` for `(uri, version)` unless a NEWER (or equal) set
@@ -195,6 +242,24 @@ impl DelphiLsp {
             )
             .await;
 
+        // Begin a brief server-initiated progress so the editor shows the server
+        // is analyzing this buffer. The label is the file name (the unit name is
+        // only known AFTER the parse); a single parse is fast, so this is a short
+        // begin/end indicator, not a percentage stream. BEST-EFFORT: `None` (no
+        // progress) when the client doesn't support it or the create handshake
+        // failed — analyze runs identically either way. The reporter holds no
+        // lock, so its awaits never stall the parse below.
+        let unit_label = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| uri.to_string());
+        let progress = self
+            .begin_progress(
+                format!("Delphi: analyzing {unit_label}"),
+                Some(unit_label.clone()),
+            )
+            .await;
+
         // Parse the buffer and collect LSP diagnostics on a blocking thread.
         let session_handle = self.session.handle();
         let parse_path = session::document_path(&path);
@@ -259,6 +324,16 @@ impl DelphiLsp {
             outcome
         })
         .await;
+
+        // End the analyze progress now that the blocking parse has returned. Done
+        // here — BEFORE the branches below, which have their own early returns
+        // (join error, stale-version recheck) — so the indicator is cleared on
+        // EVERY path out of `analyze`, never leaving a spinner stuck in the
+        // editor. `end` is a no-op when there was no progress (client unsupported)
+        // and is best-effort (a failed notification never fails analyze).
+        if let Some(reporter) = progress {
+            reporter.end(None).await;
+        }
 
         let lsp_diagnostics = match result {
             Ok(AnalyzeOutcome::Publish { diagnostics, unit_key }) => {
@@ -826,6 +901,19 @@ impl LanguageServer for DelphiLsp {
                 ddk_core::encoding::set_encoding(enc);
             }
         }
+        // Record whether the CLIENT advertised support for handling progress
+        // notifications (`capabilities.window.work_done_progress`). The server
+        // ONLY emits server-initiated `window/workDoneProgress` when this is
+        // true — the client advertises support here, the server uses it. Missing
+        // → treated as unsupported (no progress emitted), the safe default.
+        let supports_progress = params
+            .capabilities
+            .window
+            .as_ref()
+            .and_then(|window| window.work_done_progress)
+            .unwrap_or(false);
+        self.client_supports_progress
+            .store(supports_progress, Ordering::Relaxed);
         // Advertise ONLY what this server backs: incremental text document sync
         // (so the editor streams open/change/close of buffers), pushed
         // diagnostics (publishDiagnostics needs no capability flag), the
