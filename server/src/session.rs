@@ -292,6 +292,13 @@ impl SessionManager {
             // the save so it is logged, not swallowed.
             let parse_result = project_session.parse_source_file(&path);
             let save_report = project_session.save_now()?;
+            // SAFE CHECKPOINT (Task-19): the disk parse ran and the snapshot is
+            // written — every owned result is built and no arena `&str`/`&[u8]`
+            // borrow is live. Still under the session `blocking_lock()`, before
+            // it releases. Bound the disk-content arena so a didSave that pulled
+            // a big `uses` graph into the arena does not leave it resident. See
+            // `ProjectSession::trim_arena` for the soundness argument.
+            project_session.trim_arena();
             match parse_result {
                 Ok(_) => Ok(Some(save_report)),
                 Err(parse_error) => Err(SessionError {

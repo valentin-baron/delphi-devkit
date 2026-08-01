@@ -209,7 +209,7 @@ impl DelphiLsp {
                     unit_key: None,
                 };
             };
-            match project_session.parse_buffer(&parse_path, index.text()) {
+            let outcome = match project_session.parse_buffer(&parse_path, index.text()) {
                 Ok((_, Some(meta))) => {
                     let unit_key = meta.name();
                     let buffer_file = meta.ast.name.location.file;
@@ -248,7 +248,15 @@ impl DelphiLsp {
                         message: error.message,
                     }
                 }
-            }
+            };
+            // SAFE CHECKPOINT (Task-19): the parse ran and the owned LSP
+            // diagnostics are built above — every `&str`/`&[u8]` borrow into the
+            // arena from this parse+diagnostics is dropped. Still under the
+            // session `blocking_lock()`, and the next parse/query cannot start
+            // until it releases, so bounding the disk-content arena here cannot
+            // UAF a live borrow. See `ProjectSession::trim_arena`.
+            project_session.trim_arena();
+            outcome
         })
         .await;
 
@@ -363,7 +371,13 @@ impl DelphiLsp {
             // Identifier under the cursor → its declaration site(s), each mapped
             // to an LSP Location from the TARGET file's own text. Unresolved or
             // unmappable → None (never a fabricated jump).
-            locations::resolve_definition_locations(project_session, unit_key, offset)
+            let located = locations::resolve_definition_locations(project_session, unit_key, offset);
+            // SAFE CHECKPOINT (Task-19): the query's LSP Locations are built into
+            // OWNED values above — every arena `&str` borrow is dropped. Bound the
+            // disk-content arena before releasing the session lock. See
+            // `ProjectSession::trim_arena` for why this can't UAF.
+            project_session.trim_arena();
+            located
         })
         .await;
 
@@ -400,21 +414,27 @@ impl DelphiLsp {
             let mut guard = session_handle.blocking_lock();
             let project_session = guard.as_mut()?;
             // Reuse the analyzed meta (no re-parse).
-            let info = project_session.hover_info(unit_key, offset)?;
-            // The occurrence span is in THIS buffer, so its range maps through
-            // this document's own line index (already built as `index`).
-            let range = Range {
-                start: index.position_of(info.occurrence.span.start as usize),
-                end: index.position_of(info.occurrence.span.end as usize),
-            };
-            let markdown = hover::format_hover(&info);
-            Some(Hover {
-                contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: markdown,
-                }),
-                range: Some(range),
-            })
+            let hover = project_session.hover_info(unit_key, offset).map(|info| {
+                // The occurrence span is in THIS buffer, so its range maps through
+                // this document's own line index (already built as `index`).
+                let range = Range {
+                    start: index.position_of(info.occurrence.span.start as usize),
+                    end: index.position_of(info.occurrence.span.end as usize),
+                };
+                let markdown = hover::format_hover(&info);
+                Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: markdown,
+                    }),
+                    range: Some(range),
+                }
+            });
+            // SAFE CHECKPOINT (Task-19): the owned Hover (String markdown) is
+            // built above — arena borrows dropped. Bound the arena before the
+            // lock releases. See `ProjectSession::trim_arena`.
+            project_session.trim_arena();
+            hover
         })
         .await;
 
@@ -458,7 +478,12 @@ impl DelphiLsp {
             let mut guard = session_handle.blocking_lock();
             let project_session = guard.as_mut()?;
             // Reuse the analyzed meta (no re-parse).
-            locations::resolve_references(project_session, unit_key, offset, include_declaration)
+            let references =
+                locations::resolve_references(project_session, unit_key, offset, include_declaration);
+            // SAFE CHECKPOINT (Task-19): owned LSP Locations built above → arena
+            // borrows dropped. Bound the arena. See `ProjectSession::trim_arena`.
+            project_session.trim_arena();
+            references
         })
         .await;
 
@@ -504,7 +529,11 @@ impl DelphiLsp {
             let mut guard = session_handle.blocking_lock();
             let project_session = guard.as_mut()?;
             // Reuse the analyzed meta (no re-parse).
-            Some(completion::resolve_completions(project_session, unit_key, offset))
+            let items = completion::resolve_completions(project_session, unit_key, offset);
+            // SAFE CHECKPOINT (Task-19): owned CompletionItems built above → arena
+            // borrows dropped. Bound the arena. See `ProjectSession::trim_arena`.
+            project_session.trim_arena();
+            Some(items)
         })
         .await;
 
@@ -555,12 +584,16 @@ impl DelphiLsp {
             let mut guard = session_handle.blocking_lock();
             let project_session = guard.as_mut()?;
             // Reuse the analyzed meta (no re-parse).
-            signature::resolve_signature_help(
+            let help = signature::resolve_signature_help(
                 project_session,
                 unit_key,
                 context.callee_offset as u32,
                 context.active_parameter,
-            )
+            );
+            // SAFE CHECKPOINT (Task-19): owned SignatureHelp built above → arena
+            // borrows dropped. Bound the arena. See `ProjectSession::trim_arena`.
+            project_session.trim_arena();
+            help
         })
         .await;
 
@@ -602,6 +635,10 @@ impl DelphiLsp {
             let project_session = guard.as_mut()?;
             // Reuse the analyzed meta (no re-parse).
             let data = semantic::resolve_semantic_tokens(project_session, unit_key, &index);
+            // SAFE CHECKPOINT (Task-19): the delta-encoded token data (owned
+            // numbers) is built above → arena borrows dropped. Bound the arena.
+            // See `ProjectSession::trim_arena`.
+            project_session.trim_arena();
             Some(SemanticTokensResult::Tokens(SemanticTokens {
                 result_id: None,
                 data,
@@ -1468,6 +1505,67 @@ mod lifecycle_tests {
             }
             last_file = Some(buffer_file);
         }
+    }
+
+    /// Task-19 at the server-analysis level: after a buffer is analyzed and its
+    /// on-disk imports are materialized into the arena, a `trim_arena` at the
+    /// checkpoint (the exact call the blocking analyze/read sections now make)
+    /// bounds the resident DISK content, and a subsequent query still resolves
+    /// correctly — the trimmed import re-reads from disk on demand, no panic.
+    #[test]
+    fn trim_arena_at_checkpoint_bounds_disk_content_and_query_still_resolves() {
+        let directory = std::env::temp_dir().join("ddk-server-trim19");
+        std::fs::create_dir_all(&directory).unwrap();
+        // A large on-disk import with a distinctive exported type.
+        std::fs::write(
+            directory.join("Imported19.pas"),
+            format!(
+                "unit Imported19;\ninterface\ntype TImported19 = class end; // {}\n\
+                 implementation\nend.",
+                "q".repeat(8192)
+            ),
+        )
+        .unwrap();
+        let mut session = build_fallback_session_with_search_path(directory.clone());
+        // Parse the import from disk so it becomes a resident on-disk arena entry.
+        session
+            .parse_source_file(directory.join("Imported19.pas"))
+            .unwrap();
+
+        // A consumer buffer that uses the import and references its type.
+        let text = "unit Consumer19;\ninterface\nuses Imported19;\n\
+             type TConsumer19 = class Field: TImported19; end;\n\
+             implementation\nend.";
+        let index = LineIndex::new(text.to_string());
+        let (_, meta) = session
+            .parse_buffer(&directory.join("Consumer19.pas"), index.text())
+            .unwrap();
+        let unit_key = meta.expect("unit meta").name();
+
+        // The import's disk content is resident before the trim.
+        let before = session.arena().resident_disk_bytes();
+        assert!(before > 8192, "the large import is resident before trim: {before}");
+
+        // CHECKPOINT trim to zero (the harshest cap): clears every resident DISK
+        // entry. This is what `trim_arena` does after a blocking section, when no
+        // arena borrow is live. resident_disk_bytes drops accordingly.
+        session.arena().trim_disk_content(0);
+        assert_eq!(
+            session.arena().resident_disk_bytes(),
+            0,
+            "trim(0) clears all resident disk content"
+        );
+
+        // A cross-unit definition query now RE-READS the trimmed import on demand
+        // and resolves correctly — no panic, right answer.
+        let t_imported = delphi_parser::globals::intern_key("TImported19");
+        let def = session.definition(unit_key, t_imported, None);
+        assert_eq!(def.len(), 1, "TImported19 resolves cross-unit after trim");
+        assert_eq!(
+            session.arena().location_text(def[0]),
+            "TImported19",
+            "the re-read import's span resolves to the type name"
+        );
     }
 
     /// A clean buffer produces an empty diagnostic set (didChange to valid code

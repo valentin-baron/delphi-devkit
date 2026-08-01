@@ -45,6 +45,17 @@ use crate::watcher::{
     ReverseDependencyIndex, WatchError, apply_invalidation,
 };
 
+/// Resident-disk-content cap for [`ProjectSession::trim_arena`] (Task-19): the
+/// most decoded text + raw bytes the process-global arena keeps materialized for
+/// DISK files between checkpoints. Chosen at 64 MiB — comfortably above one
+/// unit's transitive parse chain (so a single analyze never thrashes: it stays
+/// resident through the parse, is trimmed only afterward if the total is over
+/// budget), and well under the ~188 MiB the moka AST cache settles at (Task-16),
+/// so the arena stops being the dominant unbounded term without competing with
+/// the AST working set. Virtual (unsaved) buffers are outside this cap (bounded
+/// separately by Task-15 to one entry per open document).
+pub const ARENA_DISK_CONTENT_CAP: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, Default)]
 pub struct SessionError {
     pub message: String,
@@ -1426,6 +1437,33 @@ impl ProjectSession {
         self.arena
     }
 
+    /// Bound the process-global source arena's DISK-file text at a SAFE
+    /// CHECKPOINT (Task-19). LRU-evicts the coldest disk entries' resident
+    /// content+raw until it is at most [`ARENA_DISK_CONTENT_CAP`] bytes; a
+    /// cleared entry re-reads from disk on the next access. Virtual (unsaved
+    /// editor) buffers are never trimmed. Returns the bytes freed.
+    ///
+    /// CHECKPOINT DISCIPLINE (soundness-critical — see
+    /// [`SourceArena::trim_disk_content`]'s SOUNDNESS note): this must be called
+    /// ONLY when NO `&str`/`&[u8]` borrow into the arena is live — i.e. AFTER a
+    /// parse/query has completed and its OWNED results are built, still under the
+    /// LSP session `blocking_lock()`, before the blocking section returns. The
+    /// session lock serializes every parse/query, so a trim between them cannot
+    /// race one that holds an arena borrow. NEVER call it reactively inside a
+    /// parse (a borrow from an earlier file in the same parse chain may still be
+    /// live → use-after-free). The server invokes it at the end of the blocking
+    /// `analyze`/read sections; a batch/one-shot driver may call it after each
+    /// top-level `parse_source_file`. It is a no-op below the cap.
+    ///
+    /// Transient peak: one parse chain (a unit + its directive-forced includes/
+    /// imports) may materialize several files at once and briefly exceed the cap
+    /// DURING the chain; this trim afterwards brings it back down. Since the
+    /// eager-load fix bounds one analyze to ~one unit's chain, that transient
+    /// peak is small and bounded.
+    pub fn trim_arena(&self) -> usize {
+        self.arena.trim_disk_content(ARENA_DISK_CONTENT_CAP)
+    }
+
     pub fn index(&self) -> &ReverseDependencyIndex {
         &self.index
     }
@@ -2263,6 +2301,67 @@ mod tests {
         session.index.index_artifact(key, &meta);
         session.context.unit_cache.insert(key, Arc::new(meta));
         key
+    }
+
+    /// Task-19 soundness checkpoint: a parse that materializes SEVERAL files
+    /// (a consumer + its on-disk import), then a `trim_arena`-style trim at the
+    /// checkpoint, then queries on the parsed unit — no panic, correct results.
+    /// This exercises the exact ordering the LSP uses: parse (borrows dropped) →
+    /// trim (clears cold disk content) → query (re-reads on demand). Spans that
+    /// index a trimmed file must still resolve after the re-read.
+    #[test]
+    fn parse_then_trim_then_query_is_sound_and_correct() {
+        let directory = temp_directory("parse_trim_query");
+        // A referenced import with a distinctive type, padded large so its disk
+        // content is a meaningful chunk of resident bytes.
+        std::fs::write(
+            directory.join("Lib19.pas"),
+            format!(
+                "unit Lib19; interface type TLib = class end; // {}\nimplementation end.",
+                "p".repeat(4096)
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("Con19.pas"),
+            "unit Con19; interface uses Lib19;\n\
+             type TCon = class Field: TLib; end;\n\
+             implementation end.",
+        )
+        .unwrap();
+
+        let mut context = test_context();
+        Arc::get_mut(&mut context)
+            .unwrap()
+            .search_paths
+            .push(directory.clone());
+        let mut session =
+            ProjectSession::from_parts(context, store_in(&directory), Duration::from_secs(300));
+
+        // Parse the consumer: materializes Con19 AND its import Lib19 into the
+        // arena. All borrows from the parse are dropped when it returns.
+        let (_, meta) = session.parse_source_file(directory.join("Con19.pas")).unwrap();
+        let con_key = meta.expect("consumer meta").name();
+
+        // CHECKPOINT: trim to zero — clears every resident DISK entry. Safe here
+        // because no arena borrow is live (the parse returned). This is exactly
+        // what `trim_arena` does at a real checkpoint, at the harshest cap.
+        session.arena().trim_disk_content(0);
+
+        // Queries now re-read trimmed content on demand. A definition into Con19
+        // resolves its own type; a definition of TLib resolves cross-unit into
+        // the (trimmed, re-read) Lib19. Neither panics; both are correct.
+        let tcon = crate::globals::intern_key("TCon");
+        let tlib = crate::globals::intern_key("TLib");
+        let con_def = session.definition(con_key, tcon, None);
+        assert_eq!(con_def.len(), 1, "TCon resolves in Con19 after trim");
+        // `location_text` re-reads Con19's content and slices the span — proving
+        // a span into a trimmed file still resolves.
+        assert_eq!(session.arena().location_text(con_def[0]), "TCon");
+
+        let lib_def = session.definition(con_key, tlib, None);
+        assert_eq!(lib_def.len(), 1, "TLib resolves cross-unit into Lib19 after trim");
+        assert_eq!(session.arena().location_text(lib_def[0]), "TLib");
     }
 
     #[test]
