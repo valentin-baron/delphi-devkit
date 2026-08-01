@@ -209,6 +209,33 @@ pub enum CacheEntry {
     Failed(Arc<ParseError>),
 }
 
+// ─── Persistence hook (Task 16: evict-to-disk) ─────────────────────────────
+
+/// A sink that can write a single unit's [`UnitMeta`] to durable storage. The
+/// [`crate::cache_store::CacheStore`] implements it. Attached to a [`UnitCache`]
+/// via [`UnitCache::attach_persister`] so that:
+///   1. a freshly-parsed DISK unit is written on insert (on disk BEFORE it can
+///      be evicted), and
+///   2. moka's eviction listener persists an evicted `Done` entry that was
+///      somehow not yet persisted — making eviction always a safe, reloadable
+///      drop, never data loss.
+///
+/// The never-persist gate (virtual/tainted/recovered) lives INSIDE the
+/// implementation (`CacheStore::save_unit` returns `Ok(false)` for those), so
+/// the cache calls `persist` unconditionally for `Done` entries and the sink
+/// decides. `persist` is best-effort and MUST NOT panic: an IO failure is
+/// logged by the implementation, never propagated (an eviction cannot fail).
+pub trait UnitPersister: Send + Sync {
+    /// Persist this meta if it is persistable. Best-effort, log-not-panic.
+    fn persist(&self, meta: &UnitMeta);
+}
+
+/// Shared, write-once slot for the persister. `Arc`-cloned into the moka
+/// eviction closure (set at build time, BEFORE the store exists) so the closure
+/// reads whatever persister is later attached at session open. `OnceLock`
+/// because a cache is bound to exactly one store for its whole lifetime.
+type PersisterSlot = Arc<std::sync::OnceLock<Arc<dyn UnitPersister>>>;
+
 // ─── Cache ───────────────────────────────────────────────────────────────
 
 /// Size-aware cache of unit artifacts, keyed by case-folded unit name.
@@ -221,6 +248,11 @@ pub struct UnitCache {
     /// Exact insert counter. moka's `entry_count` is eventually consistent —
     /// unusable for "did this parse add anything" decisions (dirty tracking).
     inserts: std::sync::atomic::AtomicU64,
+    /// The durable per-unit sink (attached at session open). Shared with the
+    /// eviction listener so an evicted `Done` entry is persisted before it is
+    /// dropped from RAM. `None` (unset slot) → no persistence (batch parses,
+    /// tests that never attach a store) — eviction is then a plain drop.
+    persister: PersisterSlot,
 }
 
 impl Default for UnitCache {
@@ -240,16 +272,53 @@ impl std::fmt::Debug for UnitCache {
 
 impl UnitCache {
     pub fn with_capacity(max_bytes: u64) -> Self {
+        let persister: PersisterSlot = Arc::new(std::sync::OnceLock::new());
+        // The eviction listener captures a clone of the persister slot. moka
+        // sets the listener at BUILD time (before a store exists); the slot is
+        // filled later at session open, and the closure reads it then. An
+        // evicted `Done` entry is persisted here (belt-and-suspenders with
+        // persist-on-insert) so eviction can NEVER strand an unpersisted AST —
+        // it is always a safe drop, reloadable from disk. Best-effort and
+        // panic-free: `persist` (→ `save_unit`) logs, never panics, so an
+        // eviction cannot fail. `Failed` entries and evictions with no attached
+        // persister are ignored (nothing durable to write).
+        let eviction_slot = persister.clone();
         let entries = moka::sync::Cache::builder()
             .max_capacity(max_bytes)
             .weigher(|_, entry: &CacheEntry| match entry {
                 CacheEntry::Done(meta) => meta.estimated_bytes(),
                 CacheEntry::Failed(_) => 64,
             })
+            .eviction_listener(move |_key, entry, _cause| {
+                if let CacheEntry::Done(meta) = entry {
+                    if let Some(sink) = eviction_slot.get() {
+                        sink.persist(&meta);
+                    }
+                }
+            })
             .build();
         Self {
             entries,
             inserts: std::sync::atomic::AtomicU64::new(0),
+            persister,
+        }
+    }
+
+    /// Attach the durable per-unit sink. Called once at session open, after the
+    /// [`crate::cache_store::CacheStore`] exists. Idempotent-safe: a second
+    /// attach is ignored (the slot is write-once) — the cache is bound to one
+    /// store for its lifetime. After this, `insert` persists disk units eagerly
+    /// and eviction persists any not-yet-written `Done` entry.
+    pub fn attach_persister(&self, sink: Arc<dyn UnitPersister>) {
+        let _ = self.persister.set(sink);
+    }
+
+    /// Persist a meta through the attached sink, if any. Best-effort (the sink
+    /// logs, never panics) and a no-op when no sink is attached. The sink itself
+    /// applies the never-persist gate (virtual/tainted/recovered skipped).
+    fn persist_now(&self, meta: &Arc<UnitMeta>) {
+        if let Some(sink) = self.persister.get() {
+            sink.persist(meta);
         }
     }
 
@@ -258,6 +327,13 @@ impl UnitCache {
     }
 
     pub fn insert(&self, unit: Identifier, meta: Arc<UnitMeta>) {
+        // Persist-on-insert (Task 16): write a DISK unit to its per-unit file
+        // BEFORE it can be evicted, so an eviction is always a safe drop. The
+        // sink's never-persist gate skips virtual/tainted/recovered metas — the
+        // active editor buffer (virtual) is therefore never written here. A
+        // disk unit is parsed ONCE then cache-hit, so this is one write per
+        // unit, not per keystroke. No-op when no store is attached.
+        self.persist_now(&meta);
         self.entries.insert(unit, CacheEntry::Done(meta));
         self.inserts
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

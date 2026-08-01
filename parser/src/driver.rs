@@ -127,7 +127,10 @@ pub struct ProjectSession {
     /// The process-global arena (`&'static`). All files this session parses
     /// register here, so serialized `FileId`s resolve consistently on save.
     arena: &'static SourceArena,
-    store: CacheStore,
+    /// The durable snapshot store. Held behind `Arc` so the SAME instance serves
+    /// both the bulk save (`save_now`) and the per-unit persist sink attached to
+    /// the cache (persist-on-insert + evict-to-disk, Task 16).
+    store: Arc<CacheStore>,
     index: Arc<ReverseDependencyIndex>,
     watcher: Option<FileWatcher>,
     save_interval: Duration,
@@ -207,6 +210,15 @@ impl ProjectSession {
         store: CacheStore,
         save_interval: Duration,
     ) -> Self {
+        let store = Arc::new(store);
+        // Attach the per-unit persist sink to the cache (Task 16): from here a
+        // freshly-parsed DISK unit is written to its per-unit file on insert
+        // (before it can be evicted) and any not-yet-persisted `Done` entry is
+        // written on eviction — so an eviction is always a safe, reloadable drop
+        // and RAM holds only the working set. The sink's never-persist gate
+        // skips virtual/tainted/recovered metas (#21/#25). Cloning the `Arc`
+        // shares the ONE store instance with the bulk `save_now`.
+        context.unit_cache.attach_persister(store.clone());
         Self {
             context,
             arena: crate::globals::arena(),
@@ -2240,6 +2252,30 @@ mod tests {
         session.index.index_artifact(key, &meta);
         session.context.unit_cache.insert(key, Arc::new(meta));
         key
+    }
+
+    #[test]
+    fn persist_on_insert_writes_per_unit_file_for_disk_unit() {
+        // Deliverable B: inserting a freshly-parsed DISK unit persists it to its
+        // per-unit file immediately (before it could be evicted), so an eviction
+        // is always a safe, reloadable drop.
+        let directory = temp_directory("persist_on_insert");
+        let source = directory.join("Persisted.pas");
+        std::fs::write(&source, "unit Persisted;").unwrap();
+
+        let session =
+            ProjectSession::from_parts(test_context(), store_in(&directory), Duration::from_secs(300));
+        insert_artifact(&session, "Persisted", &source);
+
+        // the per-unit file exists on disk right after insert — no eviction, no
+        // bulk save needed
+        assert!(
+            session.store.unit_file_path("Persisted").exists(),
+            "a disk unit is persisted on insert"
+        );
+        // and it reloads hash-valid
+        let reloaded = session.store.load_unit("Persisted").expect("reloads");
+        assert_eq!(crate::globals::resolve(reloaded.name()), "PERSISTED");
     }
 
     #[test]

@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::unit_cache::{
-    CachePersistError, LoadReport, SaveReport, UnitCache, hash_bytes, is_persistable,
+    CachePersistError, LoadReport, SaveReport, UnitCache, UnitPersister, hash_bytes, is_persistable,
     load_valid_meta, serialize_meta,
 };
 use crate::unit_meta::UnitMeta;
@@ -294,6 +294,30 @@ impl CacheStore {
                     self.snapshot_path.display()
                 ),
             }),
+        }
+    }
+}
+
+/// The durable sink the [`UnitCache`] persists disk units through (persist-on-
+/// insert + evict-to-disk, Task 16). Best-effort and PANIC-FREE: `save_unit`'s
+/// never-persist gate turns virtual/tainted/recovered into `Ok(false)` (no
+/// write), and any IO error is logged, never propagated — an eviction cannot
+/// fail. Attach with `cache.attach_persister(Arc::new(store))`.
+impl UnitPersister for CacheStore {
+    fn persist(&self, meta: &UnitMeta) {
+        if let Err(error) = self.save_unit(meta) {
+            // Log-not-panic: a failed durable write means the unit re-parses on
+            // demand next time (correctness preserved), so it must never crash
+            // an eviction or an insert. Symmetric with the load side's tolerance
+            // of a missing/corrupt per-unit file.
+            let name = crate::globals::interner()
+                .try_resolve(&meta.name().spur())
+                .unwrap_or("<unresolved-identifier>")
+                .to_string();
+            eprintln!(
+                "delphi-parser: per-unit snapshot write failed for {name}: {}",
+                error.message
+            );
         }
     }
 }
