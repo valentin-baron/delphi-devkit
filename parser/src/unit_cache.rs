@@ -463,6 +463,56 @@ enum Validity {
     Unreadable,
 }
 
+// ─── Per-unit persistence primitives (shared by bulk + per-unit paths) ─────
+//
+// These encapsulate the three invariants every persistence path must obey, so
+// the bulk `save`/`load_into` and the per-unit `save_unit`/`load_unit`
+// (cache_store.rs) share ONE implementation and cannot drift:
+//   1. never-persist gate (virtual/tainted/recovered) — `is_persistable`;
+//   2. transparent-serde serialize (FileId→path, Spur→string) — `serialize_meta`;
+//   3. transparent-serde deserialize + hash-validation — `load_valid_meta`.
+
+/// May this meta be written to disk at all? A `cycle_tainted` or `recovered`
+/// parse is INCOMPLETE and must never persist as a clean interface (a fresh
+/// full parse may differ) — the never-wrong discipline for the durable cache.
+/// A VIRTUAL (unsaved editor) buffer must also never persist (#21/#25): its
+/// source stamp hashed DECODED content, so it does not match its own on-disk
+/// bytes — detected here as "own source hash does not validate against the file
+/// on disk". A unit whose own source file is missing/unreadable is likewise not
+/// persistable (nothing to validate against on reload). Dependencies/includes
+/// are NOT re-validated here — those staleness checks happen on LOAD; this gate
+/// only rejects the three never-persist categories.
+pub fn is_persistable(meta: &UnitMeta) -> bool {
+    if meta.cycle_tainted || meta.recovered {
+        return false;
+    }
+    // Own source must be a real on-disk file whose raw bytes still hash to the
+    // recorded stamp. A virtual buffer fails this (decoded-content hash ≠ disk
+    // read, or the display path is not a real file) → never persisted (#21/#25).
+    matches!(hash_file(&meta.source_path), Ok(hash) if hash == meta.source_hash)
+}
+
+/// Transparent-serde serialize of a single meta into its own byte segment.
+/// `Identifier`s and `FileId`s inside serialize as strings/paths through the
+/// process globals; a foreign `FileId`/`Spur` yields a serde error (never a
+/// panic — M2), returned to the caller to record as a skip.
+pub fn serialize_meta(meta: &UnitMeta) -> Result<Vec<u8>, String> {
+    bincode::serialize(meta).map_err(|error| error.to_string())
+}
+
+/// Deserialize one meta segment (transparent serde re-registers FileIds /
+/// re-interns Spurs) and hash-validate it against current file contents. Panic
+/// free: a corrupt segment or unregisterable path is a clean `None` (never a
+/// crash — M2). Returns `Some(meta)` ONLY when the meta decodes AND is
+/// hash-fresh (own source + dfm + includes + dependencies + their includes).
+pub fn load_valid_meta(segment: &[u8]) -> Option<UnitMeta> {
+    let meta: UnitMeta = bincode::deserialize(segment).ok()?;
+    match validate_meta(&meta) {
+        Validity::Fresh => Some(meta),
+        Validity::Stale | Validity::Unreadable => None,
+    }
+}
+
 /// Hash-validate a loaded meta against current file contents: own source,
 /// includes, dependency sources and their includes. Any mismatch → `Stale`;
 /// any missing/unreadable file → `Unreadable`.
