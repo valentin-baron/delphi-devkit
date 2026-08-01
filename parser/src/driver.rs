@@ -691,6 +691,62 @@ impl ProjectSession {
         Vec::new()
     }
 
+    /// Signature help for the callee at byte `callee_offset` — the higher-level
+    /// entry the LSP server calls. Resolves the callee identifier and its owner
+    /// (for a member call) itself, so the server only supplies a text offset.
+    ///
+    /// Resolution, in order (each honest, never fabricated):
+    /// 1. `symbol_at(callee_offset)` → the callee's folded key. Nothing there →
+    ///    empty.
+    /// 2. If that occurrence already carries an `owner_type` (a member
+    ///    declaration/`Type.Member` usage the index linked), use it.
+    /// 3. Else, if a `.` immediately precedes the callee (a `Receiver.Method(`
+    ///    call), resolve the RECEIVER's type via the SAME machinery completion
+    ///    uses ([`Self::member_receiver_at`]) — a static `TType.Method(` (the
+    ///    receiver is a type) resolves; an instance receiver whose declared type
+    ///    the index does not carry does NOT (→ no owner, and a top-level lookup
+    ///    that fails yields empty, never a wrong signature).
+    /// 4. Else treat it as a top-level routine.
+    ///
+    /// The receiver-type resolution for INSTANCE variables is limited by the
+    /// derived index not carrying a top-level symbol's declared type (same
+    /// limitation as member completion on an instance receiver); such a call
+    /// yields no signature rather than a fabricated one.
+    pub fn signature_help_at(
+        &self,
+        unit_key: Identifier,
+        callee_offset: u32,
+    ) -> Vec<crate::query::SignatureInfo> {
+        let Some(meta) = self.meta_of(unit_key) else {
+            return Vec::new();
+        };
+        let Some(target) = self.symbol_at(unit_key, callee_offset) else {
+            return Vec::new();
+        };
+
+        // (2) an owner the index already linked (a member declaration site, or a
+        // `Type.Member` usage that recorded its owner).
+        if let Some(owner_key) = target.owner_type {
+            return self.member_signatures(&meta, owner_key, target.key);
+        }
+
+        // (3) a `Receiver.` member call: resolve the receiver's type (static type
+        // receiver resolves; unresolved receiver → no owner). Position the
+        // receiver search at the callee's own start so the `.` before it gates.
+        if let Some(receiver_type) = self.member_receiver_at(&meta, callee_offset) {
+            let signatures = self.member_signatures(&meta, receiver_type, target.key);
+            if !signatures.is_empty() {
+                return signatures;
+            }
+            // A resolved receiver whose type has no such method → empty (never a
+            // wrong signature), do NOT fall through to a top-level name clash.
+            return Vec::new();
+        }
+
+        // (4) top-level routine (own then imports).
+        self.signature_help(unit_key, target.key, None)
+    }
+
     /// Signatures of `method_key` on type `owner_key`: resolve the owner (own
     /// interface first, then imports) and read its matching `Member::Method`
     /// routine(s). Empty if the owner or method is unresolved (never fabricated).
@@ -2216,6 +2272,44 @@ mod tests {
                 .any(|signature| signature.label == "procedure Same(S: string)"),
             "the string overload: {signatures:?}"
         );
+    }
+
+    #[test]
+    fn signature_help_at_resolves_top_level_and_static_receiver_by_offset() {
+        // The higher-level offset entry: resolve the callee (and, for a
+        // `Type.Method(` static call, its receiver type) from a byte offset.
+        let directory = temp_directory("sig_help_at");
+        std::fs::write(
+            directory.join("Api.pas"),
+            "unit Api;\ninterface\n\
+             type TApi = class\npublic\n\
+               class function Fetch(Id: Integer): string;\n\
+             end;\n\
+             procedure Ping(Host: string);\n\
+             implementation\n\
+             procedure Use;\nbegin\n  Ping('h');\n  TApi.Fetch(1);\nend;\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("Api.pas")).unwrap();
+        let key = session.context.intern_key("API");
+        let content = std::fs::read_to_string(directory.join("Api.pas")).unwrap();
+
+        // top-level routine at its call site
+        let ping_offset = content.rfind("Ping(").unwrap() as u32;
+        let ping = session.signature_help_at(key, ping_offset);
+        assert_eq!(ping.len(), 1, "{ping:?}");
+        assert_eq!(ping[0].label, "procedure Ping(Host: string)");
+
+        // static method call `TApi.Fetch(` → resolve receiver TApi, then Fetch
+        let fetch_offset = content.rfind("Fetch(").unwrap() as u32;
+        let fetch = session.signature_help_at(key, fetch_offset);
+        assert_eq!(fetch.len(), 1, "static receiver resolves: {fetch:?}");
+        assert_eq!(fetch[0].label, "function Fetch(Id: Integer): string");
+
+        // an offset with no resolvable callee → empty (never fabricated)
+        assert!(session.signature_help_at(key, 100_000).is_empty());
     }
 
     #[test]
