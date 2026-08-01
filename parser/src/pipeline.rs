@@ -13,6 +13,33 @@ use crate::source::SourceArena;
 use crate::unit_cache::{SourceStamp, hash_bytes, hash_file};
 use crate::unit_meta::UnitMeta;
 
+/// Test-only probe counting real source parses (see [`parse_and_cache`]). Lets a
+/// test assert the Task-16 reload-on-miss path did NOT re-parse on a hash match
+/// and DID re-parse after the source changed.
+///
+/// THREAD-LOCAL by design: cargo runs each test on its own thread and a parse
+/// runs synchronously on the calling (test) thread, so a thread-local counter
+/// isolates this test's parses from every other test parsing in parallel — a
+/// process-global counter would be polluted by concurrent tests and make the
+/// delta non-deterministic.
+#[cfg(test)]
+pub mod parse_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PARSES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn note_parse() {
+        PARSES.with(|count| count.set(count.get() + 1));
+    }
+
+    /// Count of `parse_and_cache` source parses on the CURRENT thread so far.
+    pub fn count() -> u64 {
+        PARSES.with(|count| count.get())
+    }
+}
+
 /// Hash stamp for a parsed file. Disk files hash their RAW on-disk bytes
 /// (matches load-time validation, which also hashes raw). The bytes come from
 /// the arena's retained copy read at parse time — one read, no TOCTOU window
@@ -109,6 +136,13 @@ pub fn parse_and_cache(
     file: FileId,
     loader: Option<std::rc::Rc<dyn InterfaceLoader>>,
 ) -> Result<(ParseOutcome, Option<Arc<UnitMeta>>), ParseError> {
+    // Test-only probe: count how many times a source is actually PARSED. The
+    // Task-16 reload-on-miss path (loader.interface_of → store.load_unit) must
+    // NOT increment this on a hash match (it deserializes the AST from disk),
+    // but MUST increment it after the source bytes change (hash mismatch → real
+    // re-parse). Cheap relaxed counter; compiled only under test.
+    #[cfg(test)]
+    parse_probe::note_parse();
     let outcome = parse_file_full(arena, context.clone(), file, loader.clone())?;
     // Take the byproducts we need before consuming `source`.
     let includes = outcome.seen_includes.clone();

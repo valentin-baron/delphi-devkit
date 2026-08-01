@@ -2266,6 +2266,79 @@ mod tests {
     }
 
     #[test]
+    fn reload_on_miss_does_not_reparse_on_hash_match_but_reparses_after_change() {
+        // Deliverable E: an evicted imported unit reloads from disk (NO re-parse)
+        // on a hash match, and IS re-parsed after its source bytes change.
+        let directory = temp_directory("reload_on_miss");
+        std::fs::write(
+            directory.join("Lib.pas"),
+            "unit Lib; interface const Marker = 1; implementation end.",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("App.pas"),
+            "unit App; interface uses Lib;\n\
+             {$IF Declared(Marker)} const Uses1 = True; {$IFEND}\n\
+             implementation end.",
+        )
+        .unwrap();
+
+        // A context whose search path finds Lib, so App's `uses Lib` resolves.
+        let mut context = test_context();
+        Arc::get_mut(&mut context)
+            .unwrap()
+            .search_paths
+            .push(directory.clone());
+        let mut session =
+            ProjectSession::from_parts(context, store_in(&directory), Duration::from_secs(300));
+
+        let lib_key = crate::globals::intern_key("Lib");
+
+        // First parse of App: parses App AND its import Lib. Lib is persisted on
+        // insert (disk unit).
+        session.parse_source_file(directory.join("App.pas")).unwrap();
+        assert!(session.store.unit_file_path("Lib").exists(), "Lib persisted on insert");
+
+        // Evict Lib from RAM only (its per-unit file survives on disk).
+        session.context.unit_cache.invalidate(lib_key);
+        session.context.unit_cache.run_pending_tasks();
+        assert!(session.context.unit_cache.get(lib_key).is_none(), "Lib evicted from RAM");
+
+        // Re-parse App with Lib evicted, source UNCHANGED. App re-parses (+1);
+        // the loader's interface_of(Lib) must RELOAD Lib from disk, NOT re-parse
+        // it. So the parse-probe advances by exactly 1 (App only).
+        let before = crate::pipeline::parse_probe::count();
+        session.parse_source_file(directory.join("App.pas")).unwrap();
+        let after_match = crate::pipeline::parse_probe::count();
+        assert_eq!(
+            after_match - before,
+            1,
+            "hash match: only App re-parses, Lib reloads from disk (no re-parse)"
+        );
+        // Lib is back in RAM (reloaded), proving the reload path ran.
+        assert!(session.context.unit_cache.get(lib_key).is_some());
+
+        // Now CHANGE Lib's source bytes and evict it again. The per-unit file's
+        // recorded hash no longer matches → reload rejected → Lib IS re-parsed.
+        std::fs::write(
+            directory.join("Lib.pas"),
+            "unit Lib; interface const Marker = 1; const Extra = 2; implementation end.",
+        )
+        .unwrap();
+        session.context.unit_cache.invalidate(lib_key);
+        session.context.unit_cache.run_pending_tasks();
+
+        let before_change = crate::pipeline::parse_probe::count();
+        session.parse_source_file(directory.join("App.pas")).unwrap();
+        let after_change = crate::pipeline::parse_probe::count();
+        assert_eq!(
+            after_change - before_change,
+            2,
+            "hash mismatch: App AND Lib both re-parse (stale reload rejected)"
+        );
+    }
+
+    #[test]
     fn persist_on_insert_writes_per_unit_file_for_disk_unit() {
         // Deliverable B: inserting a freshly-parsed DISK unit persists it to its
         // per-unit file immediately (before it could be evicted), so an eviction

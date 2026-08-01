@@ -519,6 +519,131 @@ mod tests {
         store.discard().unwrap(); // idempotent
     }
 
+    /// A large disk-backed meta with a real source file whose length is set as
+    /// the weigher proxy, so it weighs a lot (drives eviction under a small cap).
+    fn big_meta(directory: &Path, unit_name: &str) -> UnitMeta {
+        // ~64 KiB of real source on disk so both the source_len proxy AND the
+        // hash validation on reload are genuine.
+        let mut source = format!("unit {unit_name}; interface\n");
+        for index in 0..1500 {
+            source.push_str(&format!("const C{index} = {index}; // padding line here\n"));
+        }
+        source.push_str("implementation end.");
+        let unit_path = write_file(directory, &format!("{unit_name}.pas"), &source);
+        let arena = crate::globals::arena();
+        let file = arena.load(&unit_path).unwrap();
+        let name = QualifiedName {
+            name: crate::globals::intern(unit_name),
+            key: crate::globals::intern_key(unit_name),
+            location: CodeLocation { file, span: Span::new(0, unit_name.len()) },
+        };
+        UnitMeta::new(
+            Unit {
+                name,
+                interface_uses: None,
+                interface_declarations: Vec::new(),
+                implementation_uses: None,
+            },
+            false,
+            unit_path.to_path_buf(),
+            hash_file(&unit_path).unwrap(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .with_source_len(source.len().min(u32::MAX as usize) as u32)
+    }
+
+    #[test]
+    fn eviction_bounds_entry_count_and_each_evicted_unit_reloads() {
+        // Deliverable E: many large units under a SMALL capacity → moka evicts
+        // (entry_count stays bounded, not N) AND every unit is reloadable from
+        // its per-unit file (persist-on-insert made it durable before eviction).
+        use crate::unit_cache::UnitCache;
+
+        let directory = test_directory("eviction_bounded");
+        let project = write_file(&directory, "P.dproj", "<x/>");
+        let store = Arc::new(CacheStore::in_directory(&directory, &identity_for(&project)).unwrap());
+
+        // 1 MiB cap; each unit weighs ~64KiB*8 ≈ 512KiB, so only a couple fit.
+        let cache = UnitCache::with_capacity(1024 * 1024);
+        cache.attach_persister(store.clone());
+
+        let count = 40;
+        let mut names = Vec::new();
+        for index in 0..count {
+            let name = format!("Evict{index}");
+            let meta = big_meta(&directory, &name);
+            cache.insert(meta.name(), Arc::new(meta));
+            names.push(name);
+        }
+        cache.run_pending_tasks();
+
+        // BOUNDED: the cache holds far fewer than all N (eviction happened).
+        let resident = cache.entry_count();
+        assert!(
+            resident < count as u64,
+            "cache must evict under a small cap: {resident} resident of {count}"
+        );
+        assert!(resident > 0, "some working set stays resident");
+
+        // Each unit — resident or evicted — reloads from its per-unit file,
+        // hash-valid. This proves eviction was a SAFE drop (durable first).
+        for name in &names {
+            let reloaded = store
+                .load_unit(name)
+                .unwrap_or_else(|| panic!("evicted unit {name} must reload from disk"));
+            assert_eq!(
+                crate::globals::fold_identifier(&crate::globals::resolve(reloaded.name()).to_string()),
+                crate::globals::fold_identifier(name)
+            );
+        }
+    }
+
+    #[test]
+    fn virtual_unit_is_never_persisted_on_insert_or_eviction() {
+        // Deliverable E / #21/#25: a VIRTUAL (non-validating source) unit is
+        // never written — not on insert, not on eviction. We insert it alongside
+        // many big disk units that FORCE eviction, then assert its per-unit file
+        // never appears.
+        use crate::unit_cache::UnitCache;
+
+        let directory = test_directory("virtual_never_persist");
+        let project = write_file(&directory, "P.dproj", "<x/>");
+        let store = Arc::new(CacheStore::in_directory(&directory, &identity_for(&project)).unwrap());
+        let cache = UnitCache::with_capacity(1024 * 1024);
+        cache.attach_persister(store.clone());
+
+        // a "virtual-like" meta: real name/FileId, but its source_hash does not
+        // validate against disk (the shape of an unsaved editor buffer).
+        let mut virtual_meta = named_meta(&directory, "VirtualBuf");
+        virtual_meta.source_hash ^= 0xABCD_1234;
+        let virtual_key = virtual_meta.name();
+        cache.insert(virtual_key, Arc::new(virtual_meta));
+        assert!(
+            !store.unit_file_path("VirtualBuf").exists(),
+            "a virtual unit is never persisted on insert (#21/#25)"
+        );
+
+        // now force heavy eviction with big disk units; the virtual entry may be
+        // evicted too — it must STILL never be written.
+        for index in 0..40 {
+            let meta = big_meta(&directory, &format!("Filler{index}"));
+            cache.insert(meta.name(), Arc::new(meta));
+        }
+        cache.run_pending_tasks();
+        // trigger any deferred eviction listener work
+        for index in 0..40 {
+            let _ = cache.get(crate::globals::intern_key(&format!("Filler{index}")));
+        }
+        cache.run_pending_tasks();
+
+        assert!(
+            !store.unit_file_path("VirtualBuf").exists(),
+            "a virtual unit is never persisted on eviction either (#21/#25)"
+        );
+    }
+
     #[test]
     fn roundtrip_through_store() {
         let directory = test_directory("roundtrip");
