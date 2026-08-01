@@ -21,8 +21,10 @@ use std::time::{Duration, Instant};
 
 use std::collections::HashMap;
 
+use crate::ast::TypeExpression;
 use crate::cache_store::{CacheIdentity, CacheStore};
 use crate::context::{CompilerProfile, ContextError, Identifier, ProjectContext};
+use crate::token::Token;
 use crate::dfm::parse_dfm;
 use crate::dfm_link::{DfmLinkResult, link_dfm};
 use crate::meta::{CodeLocation, FileId};
@@ -810,6 +812,268 @@ impl ProjectSession {
         }
     }
 
+    /// Classified tokens over `unit_key`'s source, for `textDocument/semanticTokens`
+    /// (task 13). Lexes the unit's own source ONCE (spans into that file), then
+    /// classifies each token, emitting a [`crate::query::SemanticToken`] ONLY when
+    /// the classification is CERTAIN:
+    ///
+    /// - LEXICAL (precise, from the lexer): comments → Comment; string/char-code
+    ///   literals → String; int/float literals → Number; reserved words →
+    ///   Keyword; `{$…}` directives → Macro; operators/punctuation → Operator.
+    ///   Trivia (whitespace/newline) produces no token.
+    /// - DECLARATION/MEMBER/PARAMETER NAMES (precise, structural): an identifier
+    ///   token whose span exactly covers a declaration/member/parameter NAME site
+    ///   (via [`Self::symbol_at`] and the own-unit AST) → that site's kind + the
+    ///   `declaration` modifier.
+    /// - IDENTIFIER USAGES (best-effort, OMIT when unsure): any other identifier
+    ///   token is resolved through the SAME cross-unit machinery as `hover_info`;
+    ///   it is emitted ONLY if it resolves UNAMBIGUOUSLY to a known kind, else it
+    ///   is OMITTED (no token — the editor's TextMate color shows). An unknown
+    ///   identifier is NEVER given a class.
+    ///
+    /// Tokens are returned in SOURCE ORDER (the lex order); the server sorts and
+    /// delta-encodes. Returns an empty vec when the unit is not cached or its
+    /// source content is unreadable.
+    pub fn semantic_tokens(&self, unit_key: Identifier) -> Vec<crate::query::SemanticToken> {
+        use logos::Logos;
+
+        let Some(meta) = self.meta_of(unit_key) else {
+            return Vec::new();
+        };
+        // The unit's own source file (the header name's file). Its byte spans are
+        // exactly the offsets the lexer produces below, so a token span maps
+        // consistently back to this content in the server.
+        let file = meta.ast.name.location.file;
+        let Ok(content) = self.arena.content(file) else {
+            return Vec::new();
+        };
+
+        // Pre-collect the own-unit declaration NAME spans and their finer kind, so
+        // a name token at its declaring site is classified structurally (with the
+        // `declaration` modifier) rather than through the usage path. This also
+        // carries the finer class/interface/enum distinction the interface index
+        // does not (the AST type_expression does). Namespace (unit-name) spans are
+        // kept separately: a dotted unit name (`Winapi.Windows`) is ONE span over
+        // several identifier tokens, so those are matched by CONTAINMENT.
+        let SemanticSites {
+            declaration_sites,
+            namespace_spans,
+        } = self.own_declaration_sites(&meta);
+
+        let mut tokens: Vec<crate::query::SemanticToken> = Vec::new();
+        let mut lexer = Token::lexer(content);
+        while let Some(result) = lexer.next() {
+            let token = result.unwrap_or(Token::Error);
+            // Skip ONLY whitespace/newlines. Comments are trivia to the PARSER
+            // but ARE emitted as semantic tokens (their lexical kind is Comment) —
+            // so they are handled by `lexical_kind` below, not skipped here.
+            if matches!(token, Token::Whitespace | Token::Newline) {
+                continue;
+            }
+            let span = crate::meta::Span::new(lexer.span().start, lexer.span().end);
+            let location = CodeLocation { file, span };
+
+            if let Some(kind) = lexical_kind(token) {
+                tokens.push(crate::query::SemanticToken {
+                    location,
+                    token_type: kind,
+                    modifiers: crate::query::SemanticModifiers::NONE,
+                });
+                continue;
+            }
+
+            // An identifier (or a context-sensitive keyword usable as one). First
+            // ask the own-unit declaration table for an exact-span match (a
+            // declaration/member/parameter NAME at its declaring site).
+            if token.can_be_identifier() {
+                if let Some((kind, modifiers)) = declaration_sites.get(&span).copied() {
+                    tokens.push(crate::query::SemanticToken {
+                        location,
+                        token_type: kind,
+                        modifiers,
+                    });
+                    continue;
+                }
+                // A unit-name part (inside a header/uses qualified-name span) →
+                // Namespace. Matched by containment (dotted names span several
+                // identifier tokens under one qualified-name span).
+                if namespace_spans
+                    .iter()
+                    .any(|whole| whole.start <= span.start && span.end <= whole.end)
+                {
+                    tokens.push(crate::query::SemanticToken {
+                        location,
+                        token_type: crate::query::SemanticKind::Namespace,
+                        modifiers: crate::query::SemanticModifiers::NONE,
+                    });
+                    continue;
+                }
+                // Otherwise a usage: resolve it, emit ONLY on an unambiguous known
+                // kind, else OMIT (no token — never a wrong color).
+                if let Some(kind) = self.usage_semantic_kind(unit_key, &meta, span.start) {
+                    tokens.push(crate::query::SemanticToken {
+                        location,
+                        token_type: kind,
+                        modifiers: crate::query::SemanticModifiers::NONE,
+                    });
+                }
+            }
+            // A non-identifier token that produced no lexical kind (e.g.
+            // `Token::Error`) is left un-highlighted — never a fabricated class.
+        }
+        tokens
+    }
+
+    /// The own-unit declaration/member/parameter NAME spans, each mapped to its
+    /// certain [`SemanticKind`] + the `declaration` modifier, plus the whole
+    /// qualified-name spans of unit names (header + uses entries) for Namespace
+    /// classification by containment. Built from the AST so the finer
+    /// class/interface/enum/enum-member distinction (which the interface index
+    /// does not carry) is available at a declaring site.
+    fn own_declaration_sites(&self, meta: &UnitMeta) -> SemanticSites {
+        use crate::query::SemanticModifiers;
+        let declaration = SemanticModifiers::DECLARATION;
+        let mut declaration_sites = HashMap::new();
+
+        for interface_declaration in &meta.ast.interface_declarations {
+            let name_span = interface_declaration.name.location.span;
+            let kind = declaration_semantic_kind(interface_declaration);
+            declaration_sites.insert(name_span, (kind, declaration));
+
+            // Enum member names are declarations too (`type E = (meA, meB)`).
+            if let Some(TypeExpression::Enumeration(members)) =
+                interface_declaration.type_expression.as_ref()
+            {
+                for member in members {
+                    declaration_sites.insert(
+                        member.name.location.span,
+                        (crate::query::SemanticKind::EnumMember, declaration),
+                    );
+                }
+            }
+
+            // Structured-type member names (field/method/property) at their
+            // declaring sites, plus method parameter names.
+            if let Some(type_expression) = interface_declaration.type_expression.as_ref() {
+                collect_member_declaration_sites(type_expression, &mut declaration_sites);
+            }
+        }
+
+        // Unit-name spans (header + uses entries), matched by containment because a
+        // dotted name (`Winapi.Windows`) is one span over several ident tokens.
+        let mut namespace_spans = vec![meta.ast.name.location.span];
+        for clause in [
+            meta.ast.interface_uses.as_ref(),
+            meta.ast.implementation_uses.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for used in &clause.uses {
+                namespace_spans.push(used.name.location.span);
+            }
+        }
+
+        SemanticSites {
+            declaration_sites,
+            namespace_spans,
+        }
+    }
+
+    /// Resolve an identifier USAGE at byte `position` to a certain semantic kind,
+    /// or `None` (→ OMIT). Uses the SAME machinery as `hover_info`: the occurrence
+    /// resolves to an interface declaration (own then imports) whose kind is
+    /// known, else nothing. Unknown/ambiguous → `None`, never a guess.
+    fn usage_semantic_kind(
+        &self,
+        unit_key: Identifier,
+        meta: &UnitMeta,
+        position: u32,
+    ) -> Option<crate::query::SemanticKind> {
+        let target = self.symbol_at(unit_key, position)?;
+        // A declaration/member site handled by `own_declaration_sites` would not
+        // reach here; a member usage (`Owner.Member`) resolves through the owner.
+        match target.kind {
+            // A declaration/member whose exact span did not match the pre-collected
+            // table, or an ordinary usage: classify via the resolved facts. (A
+            // declaration/member at its exact declaring span is handled earlier by
+            // `own_declaration_sites`, WITH the declaration modifier; reaching here
+            // means classify by resolution WITHOUT it.)
+            TargetKind::Declaration | TargetKind::Member | TargetKind::Usage => {
+                self.resolved_usage_kind(meta, target)
+            }
+        }
+    }
+
+    /// Classify a resolved [`QueryTarget`] by its DECLARATION's kind, cross-unit
+    /// through the same loader as `hover_info`. `None` when the target resolves to
+    /// no interface declaration (unknown identifier, implementation-only local, a
+    /// member on an unresolved owner) — the OMIT case.
+    fn resolved_usage_kind(
+        &self,
+        meta: &UnitMeta,
+        target: QueryTarget,
+    ) -> Option<crate::query::SemanticKind> {
+        use crate::query::SemanticKind;
+        use crate::unit_cache::MemberKind;
+
+        // A member occurrence: resolve the owner, then the member's kind.
+        if let Some(owner_key) = target.owner_type {
+            let member_kind = self.member_kind_of(meta, owner_key, target.key)?;
+            return Some(match member_kind {
+                MemberKind::Field => SemanticKind::Field,
+                MemberKind::Method => SemanticKind::Method,
+                MemberKind::Property => SemanticKind::Property,
+                MemberKind::NestedType => SemanticKind::Type,
+                MemberKind::NestedConst => SemanticKind::Constant,
+            });
+        }
+
+        // A top-level symbol: own interface first, then imports (reverse uses
+        // order) — the exact resolution order of `definition`/`hover_info`.
+        if let Some(symbol) = meta.interface().find(target.key) {
+            return Some(symbol_semantic_kind(symbol, meta));
+        }
+        let loader = self.make_loader();
+        for import in imports_reversed(meta) {
+            if let crate::parse_state::LoadOutcome::Loaded(imported) = loader.interface_of(import) {
+                if let Some(symbol) = imported.interface().find(target.key) {
+                    // Cross-unit: the finer type shape is not certainly available
+                    // here (the interface index carries no type_expression), so a
+                    // type resolves to the coarse-but-correct `Type`.
+                    return Some(symbol_semantic_kind_coarse(symbol.kind));
+                }
+            }
+        }
+        // Also allow a usage whose key names a UNIT this unit imports → Namespace.
+        if imports_reversed(meta).iter().any(|import| *import == target.key) {
+            return Some(SemanticKind::Namespace);
+        }
+        None
+    }
+
+    /// The [`MemberKind`] of `member_key` on type `owner_key`, resolving the owner
+    /// (own then imports). `None` if owner/member unresolved.
+    fn member_kind_of(
+        &self,
+        meta: &UnitMeta,
+        owner_key: Identifier,
+        member_key: Identifier,
+    ) -> Option<crate::unit_cache::MemberKind> {
+        if let Some(owner) = meta.interface().find(owner_key) {
+            return owner.find_member(member_key).map(|member| member.kind);
+        }
+        let loader = self.make_loader();
+        for import in imports_reversed(meta) {
+            if let crate::parse_state::LoadOutcome::Loaded(imported) = loader.interface_of(import) {
+                if let Some(owner) = imported.interface().find(owner_key) {
+                    return owner.find_member(member_key).map(|member| member.kind);
+                }
+            }
+        }
+        None
+    }
+
     /// If `position` follows a `Receiver.` member access, return the folded
     /// TYPE key of `Receiver` (so its members can be completed). Looks at the
     /// recorded usages: the occurrence ending nearest before `position` whose
@@ -1246,6 +1510,206 @@ impl ProjectSession {
 /// zero-length span covers nothing.
 fn span_covers(location: CodeLocation, position: u32) -> bool {
     location.span.start <= position && position < location.span.end
+}
+
+// ─── Semantic-token classification helpers (task 13) ─────────────────────────
+
+/// The own-unit semantic-token declaration tables built from the AST: exact-span
+/// declaration/member/parameter NAME sites, and whole qualified-name spans of
+/// unit names (matched by containment).
+struct SemanticSites {
+    declaration_sites:
+        HashMap<crate::meta::Span, (crate::query::SemanticKind, crate::query::SemanticModifiers)>,
+    namespace_spans: Vec<crate::meta::Span>,
+}
+
+/// The LEXICALLY-certain [`crate::query::SemanticKind`] of a token, or `None` for
+/// an identifier / context-sensitive keyword (classified structurally instead) or
+/// a token that carries no highlight (`Token::Error`). Trivia is filtered by the
+/// caller before this is consulted.
+fn lexical_kind(token: Token) -> Option<crate::query::SemanticKind> {
+    use crate::query::SemanticKind;
+    // A directive (`{$…}`) is a macro; a comment is a comment.
+    if token.is_directive() {
+        return Some(SemanticKind::Macro);
+    }
+    match token {
+        Token::BlockComment | Token::BlockCommentParen | Token::LineComment => {
+            Some(SemanticKind::Comment)
+        }
+        Token::StringLiteral | Token::CharLiteral => Some(SemanticKind::String),
+        Token::IntLiteral | Token::FloatLiteral => Some(SemanticKind::Number),
+        // Operators & punctuation.
+        Token::Plus | Token::Minus | Token::Star | Token::Slash | Token::Eq | Token::NEq
+        | Token::Lt | Token::Gt | Token::LtEq | Token::GtEq | Token::Assign | Token::Colon
+        | Token::Semicolon | Token::Comma | Token::DotDot | Token::Dot | Token::Caret
+        | Token::At_ | Token::LParen | Token::RParen | Token::LBracket | Token::RBracket => {
+            Some(SemanticKind::Operator)
+        }
+        // An identifier or a context-sensitive keyword usable as an identifier is
+        // NOT lexically classifiable — the structural/usage path decides. Every
+        // other token that reaches here is a genuine reserved word → Keyword.
+        Token::Error => None,
+        other if other.can_be_identifier() => None,
+        _ => Some(SemanticKind::Keyword),
+    }
+}
+
+/// The certain [`crate::query::SemanticKind`] of a top-level interface
+/// declaration, using the AST type_expression for the finer type shape
+/// (class/interface/enum) where present.
+fn declaration_semantic_kind(
+    declaration: &crate::ast::InterfaceDeclaration,
+) -> crate::query::SemanticKind {
+    use crate::ast::DeclarationKind;
+    use crate::query::SemanticKind;
+    match declaration.kind {
+        DeclarationKind::Type => declaration
+            .type_expression
+            .as_ref()
+            .map(type_expression_semantic_kind)
+            .unwrap_or(SemanticKind::Type),
+        DeclarationKind::Const | DeclarationKind::ResourceString => SemanticKind::Constant,
+        DeclarationKind::Var | DeclarationKind::ThreadVar => SemanticKind::Variable,
+        DeclarationKind::Procedure | DeclarationKind::Function => SemanticKind::Function,
+    }
+}
+
+/// The finer semantic kind of a type's right-hand side: class/interface/enum are
+/// distinguished; every other shape (record, alias, pointer, subrange, routine
+/// type, …) is the coarse-but-correct `Type`.
+fn type_expression_semantic_kind(
+    type_expression: &TypeExpression,
+) -> crate::query::SemanticKind {
+    use crate::query::SemanticKind;
+    match type_expression {
+        TypeExpression::Class(_) | TypeExpression::ForwardClass => SemanticKind::Class,
+        TypeExpression::Interface(_)
+        | TypeExpression::ForwardInterface
+        | TypeExpression::ForwardDispInterface => SemanticKind::Interface,
+        TypeExpression::Enumeration(_) => SemanticKind::Enum,
+        _ => SemanticKind::Type,
+    }
+}
+
+/// The coarse semantic kind of a symbol from its [`SymbolKind`] alone (no
+/// type-shape refinement) — used for CROSS-UNIT usages where the interface index
+/// carries no type_expression. Correct-but-coarse: a type resolves to `Type`.
+fn symbol_semantic_kind_coarse(kind: SymbolKind) -> crate::query::SemanticKind {
+    use crate::query::SemanticKind;
+    match kind {
+        SymbolKind::Type => SemanticKind::Type,
+        SymbolKind::Const | SymbolKind::ResourceString => SemanticKind::Constant,
+        SymbolKind::Var | SymbolKind::ThreadVar => SemanticKind::Variable,
+        SymbolKind::Procedure | SymbolKind::Function => SemanticKind::Function,
+    }
+}
+
+/// The semantic kind of an OWN-unit interface symbol, refining a `Type` to its
+/// class/interface/enum shape via the AST declaration when available.
+fn symbol_semantic_kind(
+    symbol: &crate::unit_cache::InterfaceSymbol,
+    meta: &UnitMeta,
+) -> crate::query::SemanticKind {
+    if symbol.kind == SymbolKind::Type {
+        if let Some(type_expression) = find_type_declaration_in(meta, symbol.key) {
+            return type_expression_semantic_kind(type_expression);
+        }
+    }
+    symbol_semantic_kind_coarse(symbol.kind)
+}
+
+/// The own-unit type declaration's type_expression for `key`, if it is a `Type`
+/// declaration with a right-hand side. (`find_type_declaration` exists elsewhere
+/// but returns the whole declaration for a different shape; this returns the
+/// type_expression directly for the semantic-kind refinement.)
+fn find_type_declaration_in(meta: &UnitMeta, key: Identifier) -> Option<&TypeExpression> {
+    meta.ast
+        .interface_declarations
+        .iter()
+        .find(|declaration| {
+            declaration.name.key == key
+                && matches!(declaration.kind, crate::ast::DeclarationKind::Type)
+        })
+        .and_then(|declaration| declaration.type_expression.as_ref())
+}
+
+/// Collect the DECLARING NAME spans of a structured type's members (field/
+/// method/property/nested) and a method's parameter names, each mapped to its
+/// certain [`crate::query::SemanticKind`] + the `declaration` modifier.
+fn collect_member_declaration_sites(
+    type_expression: &TypeExpression,
+    sites: &mut HashMap<
+        crate::meta::Span,
+        (crate::query::SemanticKind, crate::query::SemanticModifiers),
+    >,
+) {
+    match type_expression {
+        TypeExpression::Class(class_type) => {
+            for section in &class_type.sections {
+                collect_members_into(&section.members, sites);
+            }
+        }
+        TypeExpression::Record(structured) => {
+            for section in &structured.sections {
+                collect_members_into(&section.members, sites);
+            }
+        }
+        TypeExpression::Interface(interface_type) => {
+            collect_members_into(&interface_type.members, sites);
+        }
+        _ => {}
+    }
+}
+
+/// Insert member NAME sites (and method parameter names) for a flat member slice.
+fn collect_members_into(
+    members: &[crate::ast::Member],
+    sites: &mut HashMap<
+        crate::meta::Span,
+        (crate::query::SemanticKind, crate::query::SemanticModifiers),
+    >,
+) {
+    use crate::ast::Member;
+    use crate::query::{SemanticKind, SemanticModifiers};
+    let declaration = SemanticModifiers::DECLARATION;
+
+    for member in members {
+        match member {
+            Member::Field { names, .. } => {
+                for name in names {
+                    sites.insert(name.location.span, (SemanticKind::Field, declaration));
+                }
+            }
+            Member::Method(method) => {
+                sites.insert(
+                    method.name.location.span,
+                    (SemanticKind::Method, declaration),
+                );
+                for parameter in &method.routine.parameters {
+                    for name in &parameter.names {
+                        sites.insert(
+                            name.location.span,
+                            (SemanticKind::Parameter, declaration),
+                        );
+                    }
+                }
+            }
+            Member::Property(property) => {
+                sites.insert(
+                    property.name.location.span,
+                    (SemanticKind::Property, declaration),
+                );
+            }
+            Member::NestedType(declaration_box) => {
+                let kind = declaration_semantic_kind(declaration_box);
+                sites.insert(declaration_box.name.location.span, (kind, declaration));
+            }
+            Member::NestedConst { name, .. } => {
+                sites.insert(name.location.span, (SemanticKind::Constant, declaration));
+            }
+        }
+    }
 }
 
 /// One `uses`-clause entry: its folded lookup key, its display spelling, and the
@@ -3093,4 +3557,188 @@ mod tests {
         assert!(session.index.units_for(&goes).is_empty());
         assert_eq!(session.index.units_for(&stays).len(), 1);
     }
+
+    // ─── Deliverable A: semantic_tokens (task 13) ───────────────────────────
+    //
+    // The never-a-wrong-answer discipline at the highlight boundary: a token is
+    // emitted only when the classification is CERTAIN. These tests prove: lexical
+    // precision (keyword/comment/string/number/directive/operator); declaration/
+    // member/parameter NAMES get their kind + declaration modifier; a KNOWN usage
+    // is classified; an UNKNOWN identifier usage is OMITTED (never a wrong color).
+
+    use crate::query::{SemanticKind, SemanticModifiers};
+
+    /// The classified span's source text (via the arena), for readable asserts.
+    fn token_text<'a>(session: &'a ProjectSession, token: &crate::query::SemanticToken) -> &'a str {
+        session.arena().location_text(token.location)
+    }
+
+    /// Find the (first) token whose source text equals `text`.
+    fn find_token<'a>(
+        session: &ProjectSession,
+        tokens: &'a [crate::query::SemanticToken],
+        text: &str,
+    ) -> Option<&'a crate::query::SemanticToken> {
+        tokens.iter().find(|token| token_text(session, token) == text)
+    }
+
+    #[test]
+    fn semantic_tokens_lexical_are_precise() {
+        let directory = temp_directory("sem_lexical");
+        std::fs::write(
+            directory.join("Lexy.pas"),
+            "unit Lexy;\ninterface\n{$DEFINE FOO}\n\
+             { a comment }\n\
+             const Answer = 42;\n\
+             const Greeting = 'hello';\n\
+             implementation\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("Lexy.pas")).unwrap();
+        let key = session.context.intern_key("LEXY");
+        let tokens = session.semantic_tokens(key);
+        assert!(!tokens.is_empty());
+
+        // A reserved word → Keyword.
+        assert_eq!(find_token(&session, &tokens, "unit").unwrap().token_type, SemanticKind::Keyword);
+        assert_eq!(find_token(&session, &tokens, "const").unwrap().token_type, SemanticKind::Keyword);
+        // A block comment → Comment.
+        assert_eq!(
+            find_token(&session, &tokens, "{ a comment }").unwrap().token_type,
+            SemanticKind::Comment
+        );
+        // A `{$…}` directive → Macro.
+        assert_eq!(
+            find_token(&session, &tokens, "{$DEFINE FOO}").unwrap().token_type,
+            SemanticKind::Macro
+        );
+        // An int literal → Number; a string literal → String.
+        assert_eq!(find_token(&session, &tokens, "42").unwrap().token_type, SemanticKind::Number);
+        assert_eq!(
+            find_token(&session, &tokens, "'hello'").unwrap().token_type,
+            SemanticKind::String
+        );
+        // An operator → Operator (the `=` in a const decl).
+        assert_eq!(find_token(&session, &tokens, "=").unwrap().token_type, SemanticKind::Operator);
+        // No token ever spans trivia (whitespace/newline produce nothing).
+        assert!(tokens.iter().all(|token| !token_text(&session, token).trim().is_empty()));
+    }
+
+    #[test]
+    fn semantic_tokens_declarations_get_kind_and_declaration_modifier() {
+        let directory = temp_directory("sem_decls");
+        std::fs::write(
+            directory.join("Decl.pas"),
+            "unit Decl;\ninterface\n\
+             type TThing = class\n  FValue: Integer;\n  procedure Go(const Amount: Integer);\n\
+             property Value: Integer read FValue;\nend;\n\
+             type IFace = interface\n  procedure Ping;\nend;\n\
+             type TColor = (clRed, clBlue);\n\
+             const MaxThings = 3;\n\
+             var Total: Integer;\n\
+             implementation\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("Decl.pas")).unwrap();
+        let key = session.context.intern_key("DECL");
+        let tokens = session.semantic_tokens(key);
+
+        let declaration = SemanticModifiers::DECLARATION;
+        // A class type NAME → Class + declaration.
+        let thing = find_token(&session, &tokens, "TThing").unwrap();
+        assert_eq!(thing.token_type, SemanticKind::Class);
+        assert!(thing.modifiers.contains(declaration));
+        // An interface type NAME → Interface + declaration.
+        let iface = find_token(&session, &tokens, "IFace").unwrap();
+        assert_eq!(iface.token_type, SemanticKind::Interface);
+        assert!(iface.modifiers.contains(declaration));
+        // An enum type NAME → Enum; its members → EnumMember.
+        assert_eq!(find_token(&session, &tokens, "TColor").unwrap().token_type, SemanticKind::Enum);
+        assert_eq!(
+            find_token(&session, &tokens, "clRed").unwrap().token_type,
+            SemanticKind::EnumMember
+        );
+        // A field NAME → Field; a method NAME → Method; a parameter → Parameter.
+        assert_eq!(find_token(&session, &tokens, "FValue").unwrap().token_type, SemanticKind::Field);
+        let go = find_token(&session, &tokens, "Go").unwrap();
+        assert_eq!(go.token_type, SemanticKind::Method);
+        assert!(go.modifiers.contains(declaration));
+        let amount = find_token(&session, &tokens, "Amount").unwrap();
+        assert_eq!(amount.token_type, SemanticKind::Parameter);
+        assert!(amount.modifiers.contains(declaration));
+        // A property NAME → Property.
+        assert_eq!(find_token(&session, &tokens, "Value").unwrap().token_type, SemanticKind::Property);
+        // A const → Constant; a var → Variable.
+        assert_eq!(
+            find_token(&session, &tokens, "MaxThings").unwrap().token_type,
+            SemanticKind::Constant
+        );
+        assert_eq!(find_token(&session, &tokens, "Total").unwrap().token_type, SemanticKind::Variable);
+        // The unit's own header name → Namespace.
+        assert_eq!(find_token(&session, &tokens, "Decl").unwrap().token_type, SemanticKind::Namespace);
+    }
+
+    #[test]
+    fn semantic_tokens_known_usage_classified_unknown_omitted() {
+        let directory = temp_directory("sem_usage");
+        std::fs::write(
+            directory.join("Models.pas"),
+            "unit Models;\ninterface\n\
+             type TUser = class\n  Name: string;\nend;\n\
+             implementation\nend.",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("Client.pas"),
+            "unit Client;\ninterface\nuses Models;\n\
+             type TManager = class\n  Boss: TUser;\n  Ghost: TUnknownType;\nend;\n\
+             implementation\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("Client.pas")).unwrap();
+        let key = session.context.intern_key("CLIENT");
+        let tokens = session.semantic_tokens(key);
+
+        // A KNOWN cross-unit type USAGE (`Boss: TUser`) → classified as Type (the
+        // coarse-but-correct kind for a cross-unit type). The `TUser` here is the
+        // field-type usage, NOT its declaration (declared in Models).
+        let user_usage = find_token(&session, &tokens, "TUser").unwrap();
+        assert_eq!(user_usage.token_type, SemanticKind::Type);
+        assert!(
+            !user_usage.modifiers.contains(SemanticModifiers::DECLARATION),
+            "a cross-unit usage is not a declaration site"
+        );
+        // The imported unit name in the `uses` clause → Namespace.
+        assert_eq!(
+            find_token(&session, &tokens, "Models").unwrap().token_type,
+            SemanticKind::Namespace
+        );
+        // An UNKNOWN identifier USAGE (`TUnknownType`, resolves to nothing) is
+        // OMITTED entirely — never given a (wrong) class. The editor's TextMate
+        // color shows instead.
+        assert!(
+            find_token(&session, &tokens, "TUnknownType").is_none(),
+            "an unresolved identifier usage must be omitted, not colored: {:?}",
+            tokens
+                .iter()
+                .map(|token| (token_text(&session, token), token.token_type))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn semantic_tokens_empty_for_uncached_unit() {
+        let directory = temp_directory("sem_empty");
+        let session = query_session(&directory);
+        // Nothing parsed → the unit is not cached → no tokens (never a panic).
+        let key = session.context.intern_key("NOPE");
+        assert!(session.semantic_tokens(key).is_empty());
+    }
 }
+

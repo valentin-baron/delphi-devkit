@@ -209,3 +209,103 @@ pub struct UnusedUnit {
     /// The uses-clause entry's source span (the range the hint highlights).
     pub location: CodeLocation,
 }
+
+// ─── Semantic tokens (task 13, syntax highlighting) ──────────────────────────
+
+/// The semantic classification of a source span, for `textDocument/semanticTokens`.
+///
+/// GOVERNING RULE (the never-a-wrong-answer discipline, applied at the highlight
+/// boundary): LSP semantic tokens are ADDITIVE over the editor's TextMate
+/// grammar. A wrong-confident token repaints a span with a WRONG color; an
+/// OMITTED token leaves the editor's own TextMate color in place. So the query
+/// emits a `SemanticKind` only when the classification is CERTAIN — a lexically
+/// certain token (keyword/comment/string/number/directive), a structurally
+/// certain declaration/member/parameter NAME, or an identifier USAGE that
+/// resolves UNAMBIGUOUSLY to a known kind. An unresolved/ambiguous identifier is
+/// never given a kind (no token is produced for it at all).
+///
+/// The variants are the parser's own vocabulary; the server maps each to a
+/// standard LSP `SemanticTokenType` in ONE place (its legend). Where the parser
+/// cannot certainly distinguish a finer class (e.g. a cross-unit type usage it
+/// knows is a `Type` but not whether it is a class/interface/enum), it emits the
+/// coarser-but-correct kind (`Type`) rather than guessing the finer one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticKind {
+    /// A reserved word (`begin`, `class`, `function`, …). Lexically certain.
+    Keyword,
+    /// A comment (`{ … }`, `(* … *)`, `// …`). Lexically certain.
+    Comment,
+    /// A string or char-code literal (`'text'`, `#13`). Lexically certain.
+    String,
+    /// An integer/float literal. Lexically certain.
+    Number,
+    /// An operator/punctuation token (`+`, `:=`, `.`). Lexically certain.
+    Operator,
+    /// A `{$…}` / `(*$…*)` compiler directive. Lexically certain.
+    Macro,
+    /// A type whose finer shape is not certainly known here (a cross-unit type
+    /// usage, a distinct/alias). Structurally certain that it IS a type.
+    Type,
+    /// A `type T = class` declaration/usage. Certain (own-unit type shape).
+    Class,
+    /// A `type I = interface` declaration/usage. Certain (own-unit type shape).
+    Interface,
+    /// A `type E = (…)` enumeration declaration/usage. Certain.
+    Enum,
+    /// A member of an enumeration (`meA` in `(meA, meB)`). Certain.
+    EnumMember,
+    /// A top-level `function`/`procedure`, or a method member.
+    Function,
+    /// A method member of a type (kept distinct from a free function).
+    Method,
+    /// A `property` member.
+    Property,
+    /// A field member.
+    Field,
+    /// A routine parameter name.
+    Parameter,
+    /// A `var`/`threadvar` symbol.
+    Variable,
+    /// A `const`/`resourcestring` symbol.
+    Constant,
+    /// A unit name (a `uses` entry or the unit header name).
+    Namespace,
+}
+
+/// Bit-flag modifiers on a [`SemanticToken`]. A `u32` so the server can OR the
+/// set straight into the LSP delta encoding's modifier bitset. Only structurally
+/// CERTAIN modifiers are set — a declaration site sets [`Self::DECLARATION`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SemanticModifiers(pub u32);
+
+impl SemanticModifiers {
+    /// No modifiers.
+    pub const NONE: SemanticModifiers = SemanticModifiers(0);
+    /// This occurrence is the DECLARATION site of the symbol (a `type`/member/
+    /// parameter/const/var NAME at its declaring position). LSP `declaration`.
+    pub const DECLARATION: SemanticModifiers = SemanticModifiers(1 << 0);
+
+    /// Whether `other`'s bits are all set here.
+    pub fn contains(self, other: SemanticModifiers) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// The union of two modifier sets.
+    pub fn with(self, other: SemanticModifiers) -> SemanticModifiers {
+        SemanticModifiers(self.0 | other.0)
+    }
+}
+
+/// One classified source span, for `textDocument/semanticTokens`. Byte-spanned
+/// (the span is into the token's OWN source file); the server maps it to LSP's
+/// UTF-16 delta encoding. Emitted ONLY when the classification is certain (see
+/// [`SemanticKind`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SemanticToken {
+    /// The classified source span (byte offsets into the unit's own source).
+    pub location: CodeLocation,
+    /// The certain classification of this span.
+    pub token_type: SemanticKind,
+    /// Structurally-certain modifiers (`declaration` at a declaring site).
+    pub modifiers: SemanticModifiers,
+}
