@@ -23,7 +23,7 @@ use crate::meta::CodeLocation;
 use crate::parser::ParseError;
 use crate::unit_meta::UnitMeta;
 
-const CACHE_FORMAT_VERSION: u32 = 12;
+const CACHE_FORMAT_VERSION: u32 = 13;
 /// Default RAM cap for the in-memory AST cache. Lowered from 512MiB to 256MiB
 /// for an EDITOR workload (Task 16 D): the disk-backed cache means an evicted
 /// unit reloads cheaply from its per-unit file instead of re-parsing, so a
@@ -466,7 +466,9 @@ impl UnitCache {
         let mut segments: Vec<Vec<u8>> = Vec::with_capacity(metas.len());
         let mut skipped: Vec<SkippedUnit> = Vec::new();
         for meta in &metas {
-            match bincode::serialize(meta.as_ref()) {
+            // Same compressed `[magic | version]` segment format as the per-unit
+            // files (via `serialize_meta`), so bulk and per-unit stay identical.
+            match serialize_meta(meta.as_ref()) {
                 Ok(segment) => segments.push(segment),
                 Err(error) => {
                     // Dropping the meta is the correct recovery (re-parses on
@@ -537,9 +539,9 @@ impl UnitCache {
             // A unit's `FileId`s deserialize by re-registering their paths; an
             // unregisterable path (deleted / virtual buffer) is a clean serde
             // error → count unreadable, never panic (M2, #21, #25).
-            let meta: UnitMeta = match bincode::deserialize(&segment) {
-                Ok(meta) => meta,
-                Err(_) => {
+            let meta: UnitMeta = match decode_segment(&segment) {
+                Some(meta) => meta,
+                None => {
                     report.unreadable += 1;
                     continue;
                 }
@@ -592,12 +594,58 @@ pub fn is_persistable(meta: &UnitMeta) -> bool {
     matches!(hash_file(&meta.source_path), Ok(hash) if hash == meta.source_hash)
 }
 
-/// Transparent-serde serialize of a single meta into its own byte segment.
-/// `Identifier`s and `FileId`s inside serialize as strings/paths through the
-/// process globals; a foreign `FileId`/`Spur` yields a serde error (never a
-/// panic — M2), returned to the caller to record as a skip.
+/// Magic prefix stamped on every meta segment so a foreign/older byte layout is
+/// rejected DETERMINISTICALLY (per-unit `.unit` files have no outer version
+/// guard, unlike the bulk snapshot's `SavedCacheDisk.version`). The 4-byte magic
+/// plus the `CACHE_FORMAT_VERSION` word means a stale segment decodes to `None`
+/// (→ delete + re-parse) rather than being fed to an incompatible bincode.
+const SEGMENT_MAGIC: [u8; 4] = *b"DUC1";
+/// Header length: 4-byte magic + 4-byte little-endian format version.
+const SEGMENT_HEADER_LEN: usize = 8;
+
+/// Transparent-serde serialize of a single meta into its own byte segment,
+/// DEFLATE-compressed behind a `[magic | version]` header. `Identifier`s and
+/// `FileId`s inside serialize as strings/paths through the process globals; a
+/// foreign `FileId`/`Spur` yields a serde error (never a panic — M2), returned
+/// to the caller to record as a skip.
+///
+/// Compression matters: a meta is the full INTERFACE AST, and a large RTL/VCL
+/// unit's AST is highly repetitive (thousands of similar decls) — DEFLATE cuts
+/// the on-disk `.unit`/snapshot size several-fold. Writes are infrequent
+/// (per unit on parse), so the default compression level is the right trade.
 pub fn serialize_meta(meta: &UnitMeta) -> Result<Vec<u8>, String> {
-    bincode::serialize(meta).map_err(|error| error.to_string())
+    use std::io::Write;
+    let raw = bincode::serialize(meta).map_err(|error| error.to_string())?;
+    let mut encoder =
+        flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&raw).map_err(|error| error.to_string())?;
+    let compressed = encoder.finish().map_err(|error| error.to_string())?;
+    let mut segment = Vec::with_capacity(SEGMENT_HEADER_LEN + compressed.len());
+    segment.extend_from_slice(&SEGMENT_MAGIC);
+    segment.extend_from_slice(&CACHE_FORMAT_VERSION.to_le_bytes());
+    segment.extend_from_slice(&compressed);
+    Ok(segment)
+}
+
+/// Decode one meta segment written by [`serialize_meta`]: check the
+/// `[magic | version]` header, DEFLATE-decompress, then transparent-serde
+/// deserialize (re-registering FileIds / re-interning Spurs). Panic-free: a
+/// missing/foreign magic, a version mismatch, a truncated stream, or a corrupt
+/// payload all degrade to `None` (never a crash — M2). Does NOT hash-validate;
+/// callers that require freshness use [`load_valid_meta`].
+fn decode_segment(segment: &[u8]) -> Option<UnitMeta> {
+    use std::io::Read;
+    if segment.len() < SEGMENT_HEADER_LEN || segment[0..4] != SEGMENT_MAGIC {
+        return None;
+    }
+    let version = u32::from_le_bytes(segment[4..SEGMENT_HEADER_LEN].try_into().ok()?);
+    if version != CACHE_FORMAT_VERSION {
+        return None;
+    }
+    let mut decoder = flate2::read::DeflateDecoder::new(&segment[SEGMENT_HEADER_LEN..]);
+    let mut raw = Vec::new();
+    decoder.read_to_end(&mut raw).ok()?;
+    bincode::deserialize(&raw).ok()
 }
 
 /// Deserialize one meta segment (transparent serde re-registers FileIds /
@@ -606,7 +654,7 @@ pub fn serialize_meta(meta: &UnitMeta) -> Result<Vec<u8>, String> {
 /// crash — M2). Returns `Some(meta)` ONLY when the meta decodes AND is
 /// hash-fresh (own source + dfm + includes + dependencies + their includes).
 pub fn load_valid_meta(segment: &[u8]) -> Option<UnitMeta> {
-    let meta: UnitMeta = bincode::deserialize(segment).ok()?;
+    let meta: UnitMeta = decode_segment(segment)?;
     match validate_meta(&meta) {
         Validity::Fresh => Some(meta),
         Validity::Stale | Validity::Unreadable => None,
@@ -793,6 +841,54 @@ mod tests {
     }
 
     #[test]
+    fn segment_is_compressed_versioned_and_roundtrips() {
+        // A meta segment is DEFLATE-compressed behind a `[magic | version]`
+        // header: it must shrink a repetitive payload, round-trip through the
+        // validating loader, and reject the OLD headerless (raw-bincode) format.
+        let directory = std::env::temp_dir().join("delphi_parser_unit_cache_compress");
+        let unit_path = write_temp(&directory, "UnitC.pas", "unit UnitC;");
+        let dependency_path = write_temp(&directory, "UnitD.pas", "unit UnitD;");
+        let mut meta = build_meta(&unit_path, &dependency_path);
+        // Many repeated usages → a highly compressible payload, mirroring the
+        // repetition of a real interface AST.
+        let file = meta.usages[0].location.file;
+        meta.usages = (0..2000)
+            .map(|_| Usage {
+                symbol: crate::globals::intern_key("TFoo"),
+                location: CodeLocation { file, span: Span::new(0, 4) },
+            })
+            .collect();
+
+        let raw = bincode::serialize(&meta).unwrap();
+        let segment = serialize_meta(&meta).expect("serializes");
+
+        // Header: magic + current version.
+        assert_eq!(&segment[0..4], &SEGMENT_MAGIC);
+        assert_eq!(
+            u32::from_le_bytes(segment[4..8].try_into().unwrap()),
+            CACHE_FORMAT_VERSION
+        );
+        // Compression actually shrinks a repetitive payload (header included).
+        assert!(
+            segment.len() < raw.len(),
+            "compressed {} must be smaller than raw {}",
+            segment.len(),
+            raw.len()
+        );
+
+        // Round-trips through the validating loader (source unchanged → Fresh).
+        let loaded = load_valid_meta(&segment).expect("decodes + fresh");
+        assert_eq!(loaded.usages.len(), 2000);
+
+        // A raw (headerless, uncompressed) segment — the OLD format — is
+        // rejected cleanly (→ None → delete + re-parse), never mis-decoded.
+        assert!(
+            decode_segment(&raw).is_none(),
+            "an old headerless segment must not decode"
+        );
+    }
+
+    #[test]
     fn changed_source_is_stale_on_load() {
         let directory = std::env::temp_dir().join("delphi_parser_unit_cache_stale");
         let unit_path = write_temp(&directory, "UnitA.pas", "unit UnitA;");
@@ -936,8 +1032,8 @@ mod tests {
 
     #[test]
     fn old_version_snapshot_is_cleanly_rejected() {
-        // A snapshot written by a PRIOR format version (here v11, one behind the
-        // current v12) must be refused with a clean version-mismatch error — not
+        // A snapshot written by a PRIOR format version (here v12, one behind the
+        // current v13) must be refused with a clean version-mismatch error — not
         // a panic, not a partial/garbage load. Bincode is not self-describing,
         // so an old snapshot's unit bytes may not even match the current
         // `UnitMeta` layout; the version guard must reject BEFORE any unit
@@ -950,9 +1046,9 @@ mod tests {
         // segment of bytes that would NOT decode under the current `UnitMeta`
         // layout. The version guard must reject before any segment is touched,
         // so these bytes are never even reached.
-        assert_eq!(CACHE_FORMAT_VERSION, 12, "update this test on a format bump");
+        assert_eq!(CACHE_FORMAT_VERSION, 13, "update this test on a format bump");
         let stale = SavedCacheDisk {
-            version: 11,
+            version: 12,
             units: vec![vec![0xDE, 0xAD, 0xBE, 0xEF]],
         };
         std::fs::write(&snapshot, bincode::serialize(&stale).unwrap()).unwrap();
@@ -962,8 +1058,8 @@ mod tests {
         let error = result.expect_err("an old-version snapshot must be rejected");
         // the message names both the found and expected versions
         assert!(
-            error.message.contains("11") && error.message.contains("12"),
-            "version-mismatch message must name found (11) and expected (12): {}",
+            error.message.contains("12") && error.message.contains("13"),
+            "version-mismatch message must name found (12) and expected (13): {}",
             error.message
         );
     }
