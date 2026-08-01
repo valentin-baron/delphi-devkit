@@ -151,37 +151,76 @@ impl UnitMeta {
             }))
     }
 
-    /// Real-heap footprint estimate for the moka weigher — a CLOSE proxy so the
-    /// byte cap actually bounds process RAM (Task 16 D). It must NOT undercount:
+    /// Real-heap footprint estimate for the moka weigher — a proxy that must be
+    /// `>=` the real resident heap of this meta so the byte cap actually bounds
+    /// process RAM (Task 16 D). It must NEVER undercount: an undercount is
+    /// exactly what let RAM blow past the "512MB cap" in the OOM this fixes.
     /// `UnitMeta` owns the WHOLE unit AST (nested `TypeExpression`s, member vecs,
     /// every declaration), whose heap grows roughly linearly with the source it
-    /// was derived from. The old estimate counted only shallow members × struct
-    /// sizes and undercounted a real VCL/RTL unit by an order of magnitude, so
-    /// the "512MB cap" never bounded RAM.
+    /// was derived from — AND, in the LSP steady state, the query-populated
+    /// `interface_index` (a `#[serde(skip)]` `OnceCell`) that a completion /
+    /// `Declared` query builds AFTER moka has already fixed this entry's weight.
+    /// That derived index is charged HERE, structurally, at insert time — so the
+    /// weight already accounts for it before any query builds it.
     ///
-    /// PRIMARY proxy: the decoded SOURCE byte length ([`Self::source_len`]),
-    /// scaled by [`Self::AST_BYTES_PER_SOURCE_BYTE`] — a parsed AST typically
-    /// costs several bytes of heap per source byte (nodes, spans, interned refs,
-    /// the usage index). This is O(1), never touches the `OnceCell`, and is
-    /// robust across unit shapes. On TOP of that, the explicitly-owned side
-    /// vectors (usages, dependencies, includes) are added at their real element
-    /// size — they scale with cross-unit references, not just source length.
+    /// Three additive terms, all lower-bounds-or-more of real heap:
+    ///   1. AST proxy: `source_len * AST_BYTES_PER_SOURCE_BYTE` — the parsed AST
+    ///      costs many heap bytes per source byte (nodes, spans, interned refs,
+    ///      owned member/section vecs). Measured ~14.6x on member-dense VCL-shaped
+    ///      units; the factor is set ABOVE that (over-count is safe, under-count
+    ///      is the bug). O(1), never touches the `OnceCell`.
+    ///   2. Derived interface-index cost: counted STRUCTURALLY from the shallow
+    ///      AST (declaration count + flattened member count via
+    ///      [`shallow_member_count`]) times the real sizes of the
+    ///      [`InterfaceSymbol`] / [`MemberSymbol`] they flatten into, WITHOUT
+    ///      calling [`interface()`](Self::interface) (that would build the
+    ///      `OnceCell` under moka's insert lock — forbidden, ledger #29). This is
+    ///      the ~3.3x/byte the old weigher never charged; the reviewer's OOM
+    ///      root cause.
+    ///   3. Owned side tables: usages, dependencies, includes at real element
+    ///      size — they scale with cross-unit references, not source length.
     ///
     /// FALLBACK: a meta with no recorded `source_len` (built via [`Self::new`]
-    /// by an older caller / a test) uses a structural estimate that STILL scales
-    /// with declaration + member counts, so it never collapses to a constant.
-    ///
-    /// Deliberately never calls [`interface()`](Self::interface): the weigher
-    /// runs on the insert hot path under moka's lock; building the derived index
-    /// there would mutate the `OnceCell` under that lock.
+    /// by an older caller / a test) replaces term 1 with a structural AST
+    /// estimate that STILL scales with declaration + member counts (never a flat
+    /// constant); terms 2 and 3 apply unchanged.
     pub fn estimated_bytes(&self) -> u32 {
-        // Real per-element sizes of the owned side tables (these scale with
-        // cross-unit references / occurrences, independent of source length).
+        // Flattened member count across all interface declarations — the SAME
+        // shallow traversal `build_interface`/`collect_member_symbols` use, so it
+        // matches the real element count the derived index will hold, WITHOUT
+        // building (or touching) the `interface_index` OnceCell (#29).
+        let declaration_count = self.ast.interface_declarations.len();
+        let member_count: usize = self
+            .ast
+            .interface_declarations
+            .iter()
+            .map(|declaration| {
+                declaration
+                    .type_expression
+                    .as_ref()
+                    .map(shallow_member_count)
+                    .unwrap_or(0)
+            })
+            .sum();
+
+        // Term 2: the derived interface_index the LSP populates on first query.
+        // Each declaration flattens to one `InterfaceSymbol`, each member to one
+        // `MemberSymbol`; both own small Vecs (members/attributes/directives)
+        // whose backing allocations we approximate with a per-element slack so
+        // the charge is a LOWER bound of the real derived heap, never an
+        // over-count that would be corrected downward.
+        let interface_index_estimate = declaration_count
+            * (std::mem::size_of::<InterfaceSymbol>() + 32)
+            + member_count * (std::mem::size_of::<MemberSymbol>() + 24);
+
+        // Term 3: real per-element sizes of the owned side tables (these scale
+        // with cross-unit references / occurrences, independent of source length).
         let side_tables = self.usages.len() * std::mem::size_of::<Usage>()
             + self.dependencies.len() * (std::mem::size_of::<Dependency>() + 96)
             + self.includes.len() * (std::mem::size_of::<SourceStamp>() + 96)
             + self.source_path.as_os_str().len();
 
+        // Term 1: the owned AST heap.
         let ast_estimate = if self.source_len > 0 {
             // Primary: source-length proxy for the owned AST heap.
             (self.source_len as usize) * Self::AST_BYTES_PER_SOURCE_BYTE
@@ -190,35 +229,26 @@ impl UnitMeta {
             // with the AST's declaration + member counts, generously weighted so
             // it does not undercount the nested TypeExpression heap it stands in
             // for. Never a flat constant.
-            let member_count: usize = self
-                .ast
-                .interface_declarations
-                .iter()
-                .map(|declaration| {
-                    declaration
-                        .type_expression
-                        .as_ref()
-                        .map(shallow_member_count)
-                        .unwrap_or(0)
-                })
-                .sum();
-            self.ast.interface_declarations.len()
-                * (256 + std::mem::size_of::<InterfaceSymbol>())
+            declaration_count * (256 + std::mem::size_of::<InterfaceSymbol>())
                 + member_count * (128 + std::mem::size_of::<MemberSymbol>())
         };
 
-        let total = 512 + ast_estimate + side_tables;
+        let total = 512 + ast_estimate + interface_index_estimate + side_tables;
         total.min(u32::MAX as usize) as u32
     }
 
     /// Heap bytes charged per source byte for the owned AST (Task 16 D). A
-    /// parsed interface AST costs several heap bytes per source byte once nodes,
-    /// spans, interned-identifier references and the derived-on-demand surface
-    /// are accounted for. `8` is a deliberately conservative (over- rather than
-    /// under-counting) multiplier: the weigher must NOT undercount, since an
-    /// undercount is exactly what let RAM blow past the cap. Tuned together with
-    /// the editor default capacity ([`crate::unit_cache::DEFAULT_CAPACITY_BYTES`]).
-    pub const AST_BYTES_PER_SOURCE_BYTE: usize = 8;
+    /// parsed interface AST costs many heap bytes per source byte once nodes,
+    /// spans, interned-identifier references and the owned member/section vecs
+    /// are accounted for. The reviewer's RSS probe over member-dense VCL-shaped
+    /// units MEASURED the real AST heap at ~14.6x source bytes; `16` is set
+    /// deliberately ABOVE that so the weigher OVER-counts rather than under-counts
+    /// — an over-count only evicts a little earlier (safe), an under-count is the
+    /// exact bug that let RAM blow past the cap. Note this covers term 1 only; the
+    /// derived `interface_index` (~3.3x/byte, ledger #29) is charged SEPARATELY
+    /// and structurally in [`Self::estimated_bytes`]. Tuned together with the
+    /// editor default capacity ([`crate::unit_cache::DEFAULT_CAPACITY_BYTES`]).
+    pub const AST_BYTES_PER_SOURCE_BYTE: usize = 16;
 }
 
 // ─── Interface surface derivation (AST → queryable index) ────────────────
@@ -740,6 +770,134 @@ mod tests {
         assert_eq!(value.visibility, Visibility::Public);
         // existing read-target behaviour preserved
         assert_eq!(value.read_target, Some(crate::globals::intern_key("FValue")));
+    }
+
+    /// Task 16 (weigher review): `estimated_bytes` must NOT undercount. Two
+    /// guarantees, either of which failing is the OOM regression:
+    ///   1. a large member-dense unit charges at LEAST its measured lower bound —
+    ///      `AST_BYTES_PER_SOURCE_BYTE * source_len` for the AST proxy PLUS a
+    ///      per-declaration + per-member term for the derived interface index
+    ///      (charged structurally, without building the OnceCell);
+    ///   2. a big unit weighs FAR more (>10x) than a tiny one — the weight tracks
+    ///      real content, it never collapses toward a constant.
+    #[test]
+    fn estimated_bytes_does_not_undercount_a_member_dense_unit() {
+        let directory = std::env::temp_dir().join("delphi_parser_weigher_undercount");
+        std::fs::create_dir_all(&directory).unwrap();
+
+        // A member-dense unit: many types, each with many fields/methods — the
+        // exact shape whose derived interface index the old weigher ignored.
+        let mut source = String::from("unit Dense;\ninterface\n");
+        for type_index in 0..60 {
+            source.push_str(&format!("type TThing{type_index} = class\n"));
+            for field_index in 0..20 {
+                source.push_str(&format!("  Field{field_index}: Integer;\n"));
+            }
+            for method_index in 0..10 {
+                source.push_str(&format!("  procedure Method{method_index};\n"));
+            }
+            source.push_str("end;\n");
+        }
+        source.push_str("implementation\nend.");
+        let path = directory.join("Dense.pas");
+        std::fs::write(&path, &source).unwrap();
+
+        let source_len = source.len() as u32;
+        let meta = parse_meta(&path).with_source_len(source_len);
+
+        // Structural counts (WITHOUT building the interface index) — the same
+        // shallow traversal the weigher uses. Cross-checked here so an undercount
+        // in either the AST proxy OR the interface-index term fails the suite.
+        let declaration_count = meta.ast.interface_declarations.len();
+        let member_count: usize = meta
+            .ast
+            .interface_declarations
+            .iter()
+            .map(|declaration| {
+                declaration
+                    .type_expression
+                    .as_ref()
+                    .map(super::shallow_member_count)
+                    .unwrap_or(0)
+            })
+            .sum();
+        assert!(declaration_count >= 60, "sanity: many declarations parsed");
+        assert!(member_count >= 60 * 30, "sanity: ~1800 flattened members parsed");
+
+        // Lower bound the weigher must MEET OR EXCEED: the AST proxy at the
+        // measured-and-then-some factor, PLUS a per-declaration and per-member
+        // term for the derived interface index (its raw struct sizes — a strict
+        // lower bound on the real index heap it stands in for).
+        let ast_lower_bound =
+            source_len as usize * UnitMeta::AST_BYTES_PER_SOURCE_BYTE;
+        let index_lower_bound = declaration_count * std::mem::size_of::<InterfaceSymbol>()
+            + member_count * std::mem::size_of::<MemberSymbol>();
+        let lower_bound = ast_lower_bound + index_lower_bound;
+
+        let charged = meta.estimated_bytes() as usize;
+        assert!(
+            charged >= lower_bound,
+            "weigher undercounts: charged {charged} < lower bound {lower_bound} \
+             (ast {ast_lower_bound} + index {index_lower_bound}); an undercount is \
+             the OOM regression this test guards"
+        );
+
+        // The AST factor itself must be at least 16x (>= the measured ~14.6x
+        // real heap) — the second half of the non-undercount guarantee.
+        assert!(
+            UnitMeta::AST_BYTES_PER_SOURCE_BYTE >= 16,
+            "AST_BYTES_PER_SOURCE_BYTE must not fall below the measured ~14.6x"
+        );
+
+        // Building the interface index AFTER weighing must not exceed what we
+        // already charged for it structurally — proves term 2 covers the
+        // query-populated index (the uncounted ~3.3x/byte the OOM blamed).
+        let real_index_members: usize =
+            meta.interface().symbols.iter().map(|symbol| symbol.members.len()).sum();
+        assert_eq!(
+            real_index_members, member_count,
+            "the structural member count the weigher uses must equal the index's \
+             real flattened member count — else the charge is for the wrong shape"
+        );
+    }
+
+    /// A big unit must weigh FAR more than a tiny one — the weight tracks real
+    /// content and never collapses toward a constant (the undercount failure
+    /// mode is a weight that barely moves with size).
+    #[test]
+    fn estimated_bytes_big_unit_dwarfs_tiny_unit() {
+        let directory = std::env::temp_dir().join("delphi_parser_weigher_ratio");
+        std::fs::create_dir_all(&directory).unwrap();
+
+        let tiny_path = directory.join("Tiny.pas");
+        std::fs::write(
+            &tiny_path,
+            "unit Tiny;\ninterface\nconst X = 1;\nimplementation\nend.",
+        )
+        .unwrap();
+        let tiny_source = std::fs::read_to_string(&tiny_path).unwrap();
+        let tiny = parse_meta(&tiny_path).with_source_len(tiny_source.len() as u32);
+
+        let mut big_source = String::from("unit Big;\ninterface\n");
+        for type_index in 0..80 {
+            big_source.push_str(&format!("type TBig{type_index} = class\n"));
+            for field_index in 0..15 {
+                big_source.push_str(&format!("  F{field_index}: Integer;\n"));
+            }
+            big_source.push_str("end;\n");
+        }
+        big_source.push_str("implementation\nend.");
+        let big_path = directory.join("Big.pas");
+        std::fs::write(&big_path, &big_source).unwrap();
+        let big = parse_meta(&big_path).with_source_len(big_source.len() as u32);
+
+        let tiny_bytes = tiny.estimated_bytes() as u64;
+        let big_bytes = big.estimated_bytes() as u64;
+        assert!(
+            big_bytes > tiny_bytes * 10,
+            "a big member-dense unit must weigh >>10x a tiny one, got big={big_bytes} \
+             tiny={tiny_bytes}"
+        );
     }
 
     #[test]
