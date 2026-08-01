@@ -9,7 +9,10 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
 };
 
 use crate::meta::{CodeLocation, FileId, Span};
@@ -24,26 +27,38 @@ pub struct FileReadError {
 
 struct SourceEntry {
     path: PathBuf,
-    /// Lazily materialized: [`SourceArena::register`] creates path-only
-    /// entries (e.g. when loading a persisted cache whose locations reference
-    /// files nobody has read yet); the text is read on first access.
+    /// Lazily materialized AND CLEARABLE storage for a DISK file's decoded text.
+    /// `None` for a merely-`register`ed (never-read) file, a cleared entry, or a
+    /// virtual buffer (which keeps its text in [`Self::virtual_content`]).
     ///
-    /// DISK entries write this ONCE (first `content` access) and never mutate
-    /// it. VIRTUAL entries do NOT use this field — their content lives in
-    /// [`Self::virtual_content`] so it can be REPLACED (and the prior String
-    /// freed) on re-parse without unbounded arena growth. `is_virtual`
+    /// DISK entries fill this on first [`SourceArena::content`] access (reading
+    /// the file) and a [`SourceArena::trim_disk_content`] can DROP the `Box<str>`
+    /// again — a later `content` access RE-READS from disk (the entry keeps its
+    /// real path). This is the Task-19 bound: a disk file's text is resident only
+    /// while it is in the working set, re-read on demand otherwise. The `Mutex`
+    /// makes fill/clear a short critical section and keeps the entry `Sync`; the
+    /// handed-out `&str` stays valid until the next between-checkpoints clear (see
+    /// [`disk_content_ref`]'s SAFETY note — the same discipline as virtual).
+    ///
+    /// VIRTUAL entries do NOT use this field — their content lives in
+    /// [`Self::virtual_content`], REPLACED (prior box freed) on re-parse and NEVER
+    /// trimmed (a virtual path can't be re-read → data loss). `is_virtual`
     /// distinguishes the two.
-    content: OnceLock<String>,
+    content: Mutex<Option<Box<str>>>,
     /// The RAW on-disk bytes this file was read from (before any BOM/UTF-16/ANSI
     /// decoding), retained so hash stamps can be taken without a second disk
     /// read (no TOCTOU window — L15). Populated together with `content` when a
-    /// disk file is read. `None` for a virtual buffer (no disk bytes) — the
-    /// stamp then falls back to hashing the decoded content, which by design
-    /// never matches a disk read and drops the entry as stale on load (#21/#25).
-    raw: OnceLock<Vec<u8>>,
+    /// disk file is read, and CLEARED together with it by a trim (re-read on the
+    /// next `raw_bytes`/`content`, giving the same bytes unless the file changed
+    /// — hash-validation already handles change). `None` for a virtual buffer (no
+    /// disk bytes) — the stamp then falls back to hashing the decoded content,
+    /// which by design never matches a disk read and drops the entry as stale on
+    /// load (#21/#25).
+    raw: Mutex<Option<Box<[u8]>>>,
     /// `true` for a virtual (in-memory editor) buffer, `false` for a disk file.
     /// A virtual entry reads/writes [`Self::virtual_content`]; a disk entry uses
-    /// [`Self::content`]. This flag is fixed at creation and never changes.
+    /// [`Self::content`]/[`Self::raw`]. This flag is fixed at creation and never
+    /// changes. Only DISK entries are ever trimmed.
     is_virtual: bool,
     /// REPLACEABLE storage for a virtual buffer's decoded content. `None` for a
     /// disk entry. The `Box<str>` is owned here so [`SourceArena::set_virtual`]
@@ -53,6 +68,13 @@ struct SourceEntry {
     /// stays valid until the next swap under the caller's serialization (see
     /// [`SourceArena::set_virtual`]'s soundness note).
     virtual_content: Mutex<Option<Box<str>>>,
+    /// Monotonic last-access tick for a DISK entry's LRU trim: bumped from the
+    /// arena's global counter each time [`SourceArena::content`] returns this
+    /// entry's disk text (fresh read OR cached hit). `trim_disk_content` evicts
+    /// the entries with the SMALLEST ticks first (least recently accessed).
+    /// Never consulted for virtual entries (they are not trimmable). `0` until
+    /// the first access.
+    last_access: AtomicU64,
 }
 
 /// Append-only store of source buffers, shared across a parse run.
@@ -73,6 +95,12 @@ pub struct SourceArena {
     /// unchanged (#21/#25: a virtual id never enters `ids_by_path`, never
     /// canonicalizes, still fails `register` on load → never persisted).
     virtual_ids_by_path: Mutex<HashMap<PathBuf, FileId>>,
+    /// Monotonic access clock for the disk-content LRU (Task-19). Every
+    /// [`Self::content`] hit on a DISK entry stamps that entry's `last_access`
+    /// with the next value here; `trim_disk_content` evicts the smallest ticks
+    /// first. A plain `AtomicU64` — no wraparound concern in any realistic
+    /// process lifetime (2^64 accesses).
+    access_clock: AtomicU64,
 }
 
 impl SourceArena {
@@ -192,6 +220,113 @@ impl SourceArena {
         self.virtual_ids_by_path.lock().unwrap().len()
     }
 
+    /// Bytes of DISK-file text + raw bytes currently RESIDENT in the arena — the
+    /// sum, over every disk entry, of its materialized `content` length (UTF-8
+    /// bytes) plus its retained `raw` length. Virtual entries are excluded (they
+    /// are the Task-15 bound, not this one). This is the quantity
+    /// [`Self::trim_disk_content`] shrinks; exposed for the bound test/metrics.
+    pub fn resident_disk_bytes(&self) -> usize {
+        let mut total = 0;
+        for index in 0..self.files.len() {
+            let entry = self.files.get(index).unwrap();
+            if entry.is_virtual {
+                continue;
+            }
+            total += entry_resident_bytes(entry);
+        }
+        total
+    }
+
+    /// The number of DISK entries whose content is currently resident (read and
+    /// not yet trimmed). For the bound test to assert entries were cleared.
+    pub fn resident_disk_entry_count(&self) -> usize {
+        let mut count = 0;
+        for index in 0..self.files.len() {
+            let entry = self.files.get(index).unwrap();
+            if entry.is_virtual {
+                continue;
+            }
+            if entry.content.lock().unwrap().is_some() {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// LRU-evict DISK-file content (decoded text + raw bytes) until the total
+    /// resident disk bytes is at most `cap_bytes`, dropping the LEAST-recently-
+    /// accessed entries first. Returns the number of bytes freed. Virtual entries
+    /// are NEVER touched (their path is display-only and cannot be re-read — a
+    /// clear would be irreversible data loss; only re-readable disk entries are
+    /// trimmable). A cleared disk entry re-reads from disk on the next
+    /// [`Self::content`]/[`Self::raw_bytes`] access.
+    ///
+    /// SOUNDNESS (Task-19 — the adversarial-review target; mirrors the Task-15
+    /// SAFETY note on `set_virtual`/`virtual_content_ref`):
+    ///
+    /// Clearing an entry drops its `Box<str>`/`Box<[u8]>`; any outstanding
+    /// lifetime-extended `&str`/`&[u8]` into it (handed out by `content`/`text`/
+    /// `try_text`/`raw_bytes`, all via `disk_content_ref`/`disk_raw_ref`, whose
+    /// pointers outlive the mutex guard) would DANGLE. This is sound ONLY because
+    /// this method is called EXCLUSIVELY at a SAFE CHECKPOINT where NO borrow into
+    /// the arena is live:
+    /// - Every `content`/`text`/`try_text`/`raw_bytes` caller consumes the
+    ///   returned reference (copies to owned, or uses it) WITHIN a single
+    ///   synchronous parse or query, and drops it before that parse/query returns.
+    /// - The LSP session serializes ALL parses/queries under one `blocking_lock()`
+    ///   (see `server::session`). `trim_disk_content` is invoked via
+    ///   `ProjectSession::trim_arena` at the END of a blocking parse/query section
+    ///   — after the owned LSP results are built, still under the SAME session
+    ///   lock, before it releases. So a trim runs strictly BETWEEN parses/queries,
+    ///   when every arena borrow from the just-finished one is already dropped and
+    ///   the next one cannot have started (it needs the lock this trim holds).
+    /// - It must therefore NEVER be called reactively inside `content` (a borrow
+    ///   from an earlier file in the SAME parse chain may still be live — trimming
+    ///   it would UAF). The only call site is the post-section checkpoint.
+    /// - No other thread reads or clears disk content in a racing way: the moka
+    ///   eviction persister serializes bincoded metas (paths, never arena text)
+    ///   and the import loader reads content only during a parse (under the lock).
+    ///   The per-entry `Mutex` on `content`/`raw` further makes an individual
+    ///   fill/clear atomic; a concurrent `content` on a DIFFERENT entry is fine.
+    pub fn trim_disk_content(&self, cap_bytes: usize) -> usize {
+        // Snapshot (index, last_access, resident_bytes) for every resident disk
+        // entry, then evict coldest-first until at or below the cap.
+        let mut resident: Vec<(usize, u64, usize)> = Vec::new();
+        let mut total: usize = 0;
+        for index in 0..self.files.len() {
+            let entry = self.files.get(index).unwrap();
+            if entry.is_virtual {
+                continue;
+            }
+            let bytes = entry_resident_bytes(entry);
+            if bytes == 0 {
+                continue; // already cleared / never read
+            }
+            total += bytes;
+            resident.push((index, entry.last_access.load(Ordering::Relaxed), bytes));
+        }
+        if total <= cap_bytes {
+            return 0;
+        }
+        // Coldest (smallest last_access) first.
+        resident.sort_by_key(|&(_, tick, _)| tick);
+
+        let mut freed = 0;
+        for (index, _, bytes) in resident {
+            if total <= cap_bytes {
+                break;
+            }
+            let entry = self.files.get(index).unwrap();
+            // Drop the boxes → free the heap allocations. Safe: no live borrow
+            // into them (checkpoint discipline, above).
+            *entry.content.lock().unwrap() = None;
+            *entry.raw.lock().unwrap() = None;
+            total -= bytes;
+            freed += bytes;
+        }
+        freed
+    }
+
     pub fn path(&self, file: FileId) -> &Path {
         &self.entry(file).path
     }
@@ -216,51 +351,111 @@ impl SourceArena {
         // allocation stays valid until the next `set_virtual` for this FileId,
         // which only happens BETWEEN parses under the session's serialization
         // (see `set_virtual`'s soundness note). Reading a virtual entry whose
-        // content was freed (`did_close`) is an error, never a panic.
+        // content was freed (`did_close`) is an error, never a panic. Virtual
+        // entries are NEVER trimmed, so no LRU tick is taken for them.
         if entry.is_virtual {
             return virtual_content_ref(entry).ok_or_else(|| FileReadError {
                 path: entry.path.clone(),
                 message: "virtual buffer content was released (closed document)".into(),
             });
         }
-        if let Some(content) = entry.content.get() {
+
+        // DISK entry. Stamp the LRU clock: this access makes the entry the
+        // most-recently-used, so a concurrent/subsequent trim evicts colder
+        // entries first. Done for a cache HIT and a fresh READ alike.
+        entry
+            .last_access
+            .store(self.access_clock.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+
+        // Fast path: content already resident. Return a lifetime-extended `&str`
+        // into the entry's `Box<str>` (stable heap address). Sound because the
+        // box is only dropped by `trim_disk_content`, which runs at a checkpoint
+        // with no live arena borrow (see `disk_content_ref`'s SAFETY note).
+        if let Some(content) = disk_content_ref(entry) {
             return Ok(content);
         }
+
+        // Cleared or never-read: re-read from disk on demand (the entry keeps
+        // its real, re-readable path). A read failure surfaces as `FileReadError`
+        // (never a panic) — the existing FileReadError path, unchanged.
         let (raw, decoded) = read_source_file(&entry.path)?;
-        // benign race: first writer wins, the duplicate read is discarded. Set
-        // `raw` first so any reader that observes `content` also sees `raw`.
-        let _ = entry.raw.set(raw);
-        let _ = entry.content.set(decoded);
-        Ok(entry.content.get().unwrap())
+        // Store raw FIRST so any reader that observes `content` also sees `raw`
+        // (matches the prior write-once ordering). Under the session lock these
+        // fills do not race a trim of the SAME entry.
+        *entry.raw.lock().unwrap() = Some(raw.into_boxed_slice());
+        *entry.content.lock().unwrap() = Some(decoded.into_boxed_str());
+        // Return the just-stored content as a lifetime-extended `&str`.
+        Ok(disk_content_ref(entry).expect("content just stored is present"))
     }
 
     /// The RAW on-disk bytes a disk file was read from, before decoding. `None`
-    /// for a virtual buffer (no disk bytes) or a merely-registered file whose
-    /// content has never been materialized. Used by the pipeline to hash a
-    /// file's on-disk bytes for its validity stamp WITHOUT re-reading it from
-    /// disk (one read, no TOCTOU window — L15). The bytes are byte-identical to
-    /// what `std::fs::read` would return, so the resulting hash matches
+    /// for a virtual buffer (no disk bytes). Used by the pipeline to hash a
+    /// file's on-disk bytes for its validity stamp; the bytes are byte-identical
+    /// to what `std::fs::read` would return, so the resulting hash matches
     /// [`crate::unit_cache::hash_file`] and existing snapshots still validate.
+    ///
+    /// For a DISK file whose bytes are RESIDENT (materialized and not trimmed)
+    /// this returns them with no disk touch (the L15 no-re-read property on the
+    /// hot path). If the bytes were TRIMMED (or never read), it re-reads them
+    /// from disk on demand and re-populates the entry — so a stamp taken after a
+    /// trim still hashes the exact on-disk bytes rather than silently falling
+    /// through to decoded content. A disk-read failure surfaces as `None` (the
+    /// caller then hashes decoded content as a defensive fallback — see
+    /// `stamp_file`), never a panic. Also stamps the LRU clock, since a re-read
+    /// materializes bytes into the working set exactly like `content`.
     pub fn raw_bytes(&self, file: FileId) -> Option<&[u8]> {
-        self.entry(file).raw.get().map(Vec::as_slice)
+        let entry = self.entry(file);
+        // Virtual buffer: no disk bytes, ever.
+        if entry.is_virtual {
+            return None;
+        }
+        // Resident: hand back a lifetime-extended slice into the entry's
+        // `Box<[u8]>` (stable heap address), same discipline as `content`.
+        if let Some(bytes) = disk_raw_ref(entry) {
+            entry
+                .last_access
+                .store(self.access_clock.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+            return Some(bytes);
+        }
+        // Trimmed or never read: re-read from disk. A read failure → None (the
+        // stamp's decoded-content fallback handles it), never a panic.
+        let (raw, decoded) = read_source_file(&entry.path).ok()?;
+        entry
+            .last_access
+            .store(self.access_clock.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+        *entry.raw.lock().unwrap() = Some(raw.into_boxed_slice());
+        *entry.content.lock().unwrap() = Some(decoded.into_boxed_str());
+        Some(disk_raw_ref(entry).expect("raw just stored is present"))
     }
 
-    /// Content that is guaranteed to be materialized already (a span for this
-    /// file exists, so someone lexed it). Panics on merely-registered files.
+    /// Content of a file whose text a caller already knows exists (a span for
+    /// this file was produced, so it was lexed at least once). This is the parse
+    /// hot-path accessor.
+    ///
+    /// For a DISK file this now transparently RE-READS if the text was trimmed
+    /// since it was last lexed (Task-19): a `(FileId, Span)` outlives the resident
+    /// text, and `text`/`loaded_content` must still resolve it. The re-read gives
+    /// byte-identical content unless the file changed on disk (in which case a
+    /// span may fall out of bounds — the panic-free [`Self::try_text`] is the
+    /// accessor for locations that may be stale; `text` stays the guaranteed-
+    /// materialized hot path). Panics ONLY when the disk file genuinely cannot be
+    /// read (deleted mid-session) or a virtual buffer's content was released —
+    /// the same "should never happen on the hot path" contract as before, now
+    /// covering the trim case by re-reading rather than panicking on it.
     pub fn loaded_content(&self, file: FileId) -> &str {
         let entry = self.entry(file);
         if entry.is_virtual {
             return virtual_content_ref(entry)
                 .expect("virtual buffer content requested after it was released");
         }
-        entry
-            .content
-            .get()
-            .expect("file content requested before it was loaded")
+        // Disk file: `content` re-reads a trimmed/never-read entry on demand.
+        self.content(file)
+            .expect("disk file content requested but the file could not be read")
     }
 
     /// Text under a span of a file. The file must be materialized (spans only
-    /// exist for lexed content).
+    /// exist for lexed content); a disk file trimmed since lexing is re-read by
+    /// [`Self::loaded_content`].
     pub fn text(&self, file: FileId, span: Span) -> &str {
         &self.loaded_content(file)[span.start as usize..span.end as usize]
     }
@@ -304,15 +499,17 @@ impl SourceArena {
         // stays empty, so `raw_bytes` returns None and the stamp falls back to
         // hashing decoded content (the intended virtual-buffer behaviour).
         let is_virtual = content.is_some();
-        // Disk entries keep their content in `content` (write-once); virtual
-        // entries keep it in `virtual_content` (replaceable, freed on re-parse).
+        // Disk entries keep their content in `content` (clearable/re-readable);
+        // virtual entries keep it in `virtual_content` (replaceable, freed on
+        // re-parse). A disk entry starts empty (filled on first `content`).
         let virtual_content = Mutex::new(content.map(String::into_boxed_str));
         let index = self.files.push_get_index(Box::new(SourceEntry {
             path,
-            content: OnceLock::new(),
-            raw: OnceLock::new(),
+            content: Mutex::new(None),
+            raw: Mutex::new(None),
             is_virtual,
             virtual_content,
+            last_access: AtomicU64::new(0),
         }));
         FileId(index as u32)
     }
@@ -346,6 +543,59 @@ fn virtual_content_ref(entry: &SourceEntry) -> Option<&str> {
     let extended: &str = unsafe { std::mem::transmute::<&str, &str>(text) };
     drop(guard);
     Some(extended)
+}
+
+/// The resident decoded text of a DISK entry as a `&str` borrowing the entry
+/// (whose heap address is stable — a `Box` inside the append-only `FrozenVec`).
+/// `None` if the content was trimmed or never read.
+///
+/// SAFETY: identical discipline to [`virtual_content_ref`] — the returned `&str`
+/// outlives the `MutexGuard` taken here. The bytes live in the `Box<str>`'s heap
+/// allocation, stable until [`SourceArena::trim_disk_content`] clears it, which
+/// runs ONLY at a checkpoint with no live arena borrow (see
+/// `trim_disk_content`'s SOUNDNESS note). The guard is released immediately (it
+/// protects the fill/clear swap, not the read lifetime); we must not hold it for
+/// the borrow's whole life because the parse hot path borrows content across the
+/// entire parse while OTHER files are read/filled concurrently.
+fn disk_content_ref(entry: &SourceEntry) -> Option<&str> {
+    let guard = entry.content.lock().unwrap();
+    let text: &str = guard.as_deref()?;
+    let extended: &str = unsafe { std::mem::transmute::<&str, &str>(text) };
+    drop(guard);
+    Some(extended)
+}
+
+/// The resident raw on-disk bytes of a DISK entry as a `&[u8]` borrowing the
+/// entry. `None` if trimmed or never read. Same SAFETY discipline as
+/// [`disk_content_ref`] — the slice outlives the guard; the `Box<[u8]>` heap
+/// allocation is stable until `trim_disk_content` clears it at a checkpoint.
+fn disk_raw_ref(entry: &SourceEntry) -> Option<&[u8]> {
+    let guard = entry.raw.lock().unwrap();
+    let bytes: &[u8] = guard.as_deref()?;
+    let extended: &[u8] = unsafe { std::mem::transmute::<&[u8], &[u8]>(bytes) };
+    drop(guard);
+    Some(extended)
+}
+
+/// The bytes a DISK entry currently keeps resident: decoded content length +
+/// retained raw length. Zero when both are cleared. Only meaningful for disk
+/// entries (a virtual entry's storage is the Task-15 bound, excluded here).
+fn entry_resident_bytes(entry: &SourceEntry) -> usize {
+    let content = entry
+        .content
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|text| text.len())
+        .unwrap_or(0);
+    let raw = entry
+        .raw
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|bytes| bytes.len())
+        .unwrap_or(0);
+    content + raw
 }
 
 impl std::fmt::Debug for SourceArena {
@@ -463,9 +713,13 @@ mod tests {
 
         let arena = SourceArena::new();
         let file = arena.register(&path).unwrap();
-        // merely registered → not read yet → no raw bytes
-        assert!(arena.raw_bytes(file).is_none());
-        // materialize → raw bytes now retained, equal to the on-disk bytes
+        // merely registered → nothing resident yet
+        assert_eq!(entry_resident_bytes(arena.entry(file)), 0);
+        // Task-19: `raw_bytes` on an un-materialized disk file re-reads on demand
+        // (rather than returning None), so a stamp taken after a trim still hashes
+        // the exact on-disk bytes. The bytes equal the on-disk bytes.
+        assert_eq!(arena.raw_bytes(file).unwrap(), bytes.as_slice());
+        // materialize the decoded content → raw bytes remain byte-identical.
         arena.content(file).unwrap();
         assert_eq!(arena.raw_bytes(file).unwrap(), bytes.as_slice());
     }
@@ -525,6 +779,147 @@ mod tests {
         let reopened = arena.set_virtual(path, "unit Closable; // reopened".to_string());
         assert_eq!(reopened, file, "reopen reuses the stable FileId");
         assert_eq!(arena.content(file).unwrap(), "unit Closable; // reopened");
+    }
+
+    /// Task-19 bound: parse many distinct large DISK units, then
+    /// `trim_disk_content(small_cap)` drops resident disk bytes to at most the
+    /// cap by LRU-evicting the coldest entries, and a cleared entry's
+    /// `content`/`text(span)` RE-READS from disk with byte-identical text and
+    /// resolvable spans. Virtual entries are never cleared by trim.
+    #[test]
+    fn trim_disk_content_bounds_and_reread_is_correct() {
+        let directory = std::env::temp_dir().join("delphi_parser_trim_bound");
+        std::fs::create_dir_all(&directory).unwrap();
+        let arena = SourceArena::new();
+
+        // 20 distinct disk units, each ~2 KiB of ASCII (raw==decoded length).
+        let unit_bytes = 2048;
+        let count = 20;
+        let mut files = Vec::new();
+        let mut expected = Vec::new();
+        for index in 0..count {
+            let text = format!(
+                "unit Big{index}; // {}",
+                "x".repeat(unit_bytes - 20)
+            );
+            let path = directory.join(format!("Big{index}.pas"));
+            std::fs::write(&path, &text).unwrap();
+            let file = arena.load(&path).unwrap(); // reads → resident
+            files.push(file);
+            expected.push(text);
+        }
+
+        // All resident: content + raw both retained → ~2x unit_bytes each.
+        let before = arena.resident_disk_bytes();
+        assert!(before >= count * unit_bytes, "all units resident: {before}");
+        assert_eq!(arena.resident_disk_entry_count(), count);
+
+        // Trim to a small cap: at most 3 units' worth of (content+raw) may stay.
+        let cap = 3 * unit_bytes * 2;
+        let freed = arena.trim_disk_content(cap);
+        assert!(freed > 0, "trim freed bytes");
+        assert!(
+            arena.resident_disk_bytes() <= cap,
+            "resident ({}) must be <= cap ({cap})",
+            arena.resident_disk_bytes()
+        );
+        assert!(
+            arena.resident_disk_entry_count() < count,
+            "some disk entries were cleared"
+        );
+
+        // Every file — including cleared ones — re-reads correctly: content and
+        // a span both match the original (spans resolve after a re-read).
+        for (index, &file) in files.iter().enumerate() {
+            assert_eq!(arena.content(file).unwrap(), expected[index]);
+            // span [5, 8) of "unit BigN;" is "Big"
+            assert_eq!(arena.text(file, Span::new(5, 8)), "Big");
+        }
+    }
+
+    /// A cleared disk file that CHANGED on disk re-reads the NEW bytes without a
+    /// crash (hash-validation of a stale cached AST is task-16's job; here we
+    /// only confirm the arena re-reads live bytes and never panics).
+    #[test]
+    fn trim_then_disk_change_rereads_new_bytes_without_crash() {
+        let directory = std::env::temp_dir().join("delphi_parser_trim_change");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("Mutable.pas");
+        std::fs::write(&path, "unit Mutable; // original padding padding").unwrap();
+
+        let arena = SourceArena::new();
+        let file = arena.load(&path).unwrap();
+        assert_eq!(arena.content(file).unwrap(), "unit Mutable; // original padding padding");
+
+        // Trim to zero: force the entry cleared.
+        arena.trim_disk_content(0);
+        assert_eq!(entry_resident_bytes(arena.entry(file)), 0);
+
+        // Change the file on disk, then re-read: NEW bytes, no crash.
+        std::fs::write(&path, "unit Mutable; // CHANGED").unwrap();
+        assert_eq!(arena.content(file).unwrap(), "unit Mutable; // CHANGED");
+        // raw bytes also reflect the new content.
+        assert_eq!(
+            arena.raw_bytes(file).unwrap(),
+            b"unit Mutable; // CHANGED".as_slice()
+        );
+    }
+
+    /// Virtual entries are NEVER cleared by a trim (their display-only path
+    /// cannot be re-read — a clear would lose data). Even a `trim_disk_content(0)`
+    /// leaves a virtual buffer's content intact and readable.
+    #[test]
+    fn trim_never_clears_virtual_entries() {
+        let arena = SourceArena::new();
+        let file = arena.set_virtual("C:/editor/Live.pas", "unit Live; // unsaved".to_string());
+        assert_eq!(arena.content(file).unwrap(), "unit Live; // unsaved");
+
+        // Trim to zero must not touch virtual content.
+        arena.trim_disk_content(0);
+        assert_eq!(
+            arena.content(file).unwrap(),
+            "unit Live; // unsaved",
+            "a virtual buffer's content survives an aggressive trim"
+        );
+        // A virtual entry contributes nothing to the disk-resident total.
+        assert_eq!(arena.resident_disk_bytes(), 0);
+    }
+
+    /// LRU order: the MOST-recently-accessed disk entry survives a trim that can
+    /// keep only one, and the colder ones are evicted.
+    #[test]
+    fn trim_evicts_least_recently_accessed_first() {
+        let directory = std::env::temp_dir().join("delphi_parser_trim_lru");
+        std::fs::create_dir_all(&directory).unwrap();
+        let arena = SourceArena::new();
+
+        let unit = 2048;
+        let mut files = Vec::new();
+        for index in 0..4 {
+            let path = directory.join(format!("Lru{index}.pas"));
+            std::fs::write(&path, format!("unit Lru{index}; // {}", "y".repeat(unit)))
+                .unwrap();
+            files.push(arena.load(&path).unwrap());
+        }
+        // Touch file 2 LAST so it is the most-recently-accessed (hottest).
+        let _ = arena.content(files[0]).unwrap();
+        let _ = arena.content(files[1]).unwrap();
+        let _ = arena.content(files[3]).unwrap();
+        let _ = arena.content(files[2]).unwrap();
+
+        // Keep at most one entry's (content+raw) resident.
+        let cap = (unit + 20) * 2;
+        arena.trim_disk_content(cap);
+        assert!(arena.resident_disk_bytes() <= cap);
+        // The hottest (file 2) is still resident; a colder one (file 0) is not.
+        assert!(
+            arena.entry(files[2]).content.lock().unwrap().is_some(),
+            "most-recently-accessed entry survives"
+        );
+        assert!(
+            arena.entry(files[0]).content.lock().unwrap().is_none(),
+            "a least-recently-accessed entry was evicted"
+        );
     }
 
     #[test]
