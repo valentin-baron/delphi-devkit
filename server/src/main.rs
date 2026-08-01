@@ -1,5 +1,6 @@
 mod diagnostics;
 mod documents;
+mod locations;
 mod positions;
 mod session;
 
