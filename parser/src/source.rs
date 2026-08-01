@@ -27,6 +27,12 @@ struct SourceEntry {
     /// Lazily materialized: [`SourceArena::register`] creates path-only
     /// entries (e.g. when loading a persisted cache whose locations reference
     /// files nobody has read yet); the text is read on first access.
+    ///
+    /// DISK entries write this ONCE (first `content` access) and never mutate
+    /// it. VIRTUAL entries do NOT use this field — their content lives in
+    /// [`Self::virtual_content`] so it can be REPLACED (and the prior String
+    /// freed) on re-parse without unbounded arena growth. `is_virtual`
+    /// distinguishes the two.
     content: OnceLock<String>,
     /// The RAW on-disk bytes this file was read from (before any BOM/UTF-16/ANSI
     /// decoding), retained so hash stamps can be taken without a second disk
@@ -35,6 +41,18 @@ struct SourceEntry {
     /// stamp then falls back to hashing the decoded content, which by design
     /// never matches a disk read and drops the entry as stale on load (#21/#25).
     raw: OnceLock<Vec<u8>>,
+    /// `true` for a virtual (in-memory editor) buffer, `false` for a disk file.
+    /// A virtual entry reads/writes [`Self::virtual_content`]; a disk entry uses
+    /// [`Self::content`]. This flag is fixed at creation and never changes.
+    is_virtual: bool,
+    /// REPLACEABLE storage for a virtual buffer's decoded content. `None` for a
+    /// disk entry. The `Box<str>` is owned here so [`SourceArena::set_virtual`]
+    /// can swap in the new text and DROP the prior box — bounding memory to one
+    /// live copy per open document (Task-15 part 2). The mutex makes the swap a
+    /// short critical section and keeps the entry `Sync`; the handed-out `&str`
+    /// stays valid until the next swap under the caller's serialization (see
+    /// [`SourceArena::set_virtual`]'s soundness note).
+    virtual_content: Mutex<Option<Box<str>>>,
 }
 
 /// Append-only store of source buffers, shared across a parse run.
@@ -46,6 +64,15 @@ pub struct SourceArena {
     /// Canonicalized path → id. Windows canonicalization resolves case and
     /// 8.3 names, so `FOO.PAS` and `foo.pas` dedup to one entry.
     ids_by_path: Mutex<HashMap<PathBuf, FileId>>,
+    /// Display path (as-given, NOT canonicalized) → virtual FileId. A virtual
+    /// buffer's path is a display-only name that may not exist on disk, so it
+    /// cannot canonicalize; this map dedups virtual buffers by that exact path
+    /// so an editor's repeated re-parses of one open document REUSE a single
+    /// arena entry (its content replaced in place) instead of appending forever.
+    /// Kept SEPARATE from `ids_by_path` so disk-file dedup-by-canonical-path is
+    /// unchanged (#21/#25: a virtual id never enters `ids_by_path`, never
+    /// canonicalizes, still fails `register` on load → never persisted).
+    virtual_ids_by_path: Mutex<HashMap<PathBuf, FileId>>,
 }
 
 impl SourceArena {
@@ -83,8 +110,86 @@ impl SourceArena {
 
     /// Register an in-memory buffer (tests, unsaved editor content). The
     /// `path` is a display name only — no deduplication, no disk access.
+    ///
+    /// NOTE: this appends a FRESH entry every call and never frees it — fine for
+    /// tests, but the LSP editor path must use [`Self::set_virtual`] so repeated
+    /// re-parses of one open document do not grow the process-global arena
+    /// without bound (Task-15).
     pub fn insert_virtual(&self, path: impl Into<PathBuf>, content: impl Into<String>) -> FileId {
         self.push_entry(path.into(), Some(content.into()))
+    }
+
+    /// Register OR RE-REGISTER an in-memory (unsaved editor) buffer for `path`,
+    /// bounding the arena to ONE virtual entry per open-document path. The first
+    /// call for a path appends a virtual entry and returns its stable `FileId`;
+    /// every later call for the SAME display path REUSES that `FileId` and
+    /// REPLACES its content, DROPPING the prior `Box<str>` — so an editor that
+    /// re-parses on every keystroke keeps exactly one live copy per document
+    /// rather than appending a full-file copy forever (the OOM the old
+    /// `insert_virtual`-per-parse caused).
+    ///
+    /// Dedup is by the EXACT display path (not canonicalized): a virtual path is
+    /// a display-only name that may not exist on disk, so it cannot canonicalize.
+    /// The virtual id therefore never enters `ids_by_path` and still fails
+    /// `register` on load → never persisted (#21/#25 preserved).
+    ///
+    /// SOUNDNESS (stable-`&str` during a parse + span-provenance):
+    /// - A `&str` from [`Self::content`]/[`Self::text`] for a virtual FileId
+    ///   borrows the heap allocation the entry's current `Box<str>` owns. That
+    ///   allocation is freed ONLY here, when the content is replaced.
+    /// - The ONLY reader of a virtual FileId's content is the owning session —
+    ///   its synchronous parse and its query methods, all serialized by the LSP
+    ///   session lock. A parse borrows the content, runs to completion, and
+    ///   drops every borrow before returning; the next `parse_buffer` (which is
+    ///   what calls `set_virtual`) cannot start until then. So a replace happens
+    ///   strictly BETWEEN parses, when no `&str` into the prior content is live.
+    /// - `UnitMeta` stores `(FileId, Span)`, never a borrowed `&str` (tokens are
+    ///   payload-free), so a cached meta never holds a dangling reference across
+    ///   a replace. Worker threads (moka eviction, import loads) read OTHER files
+    ///   (disk units), never this virtual buffer.
+    /// - Span-provenance: `set_virtual` runs at the START of `parse_buffer`, and
+    ///   the meta that parse produces indexes THIS newly-stored content. So after
+    ///   the re-parse, `content(file)` returns exactly the text the new meta's
+    ///   spans index — replacement and re-parse are atomic per document version.
+    pub fn set_virtual(&self, path: impl Into<PathBuf>, content: impl Into<String>) -> FileId {
+        let path = path.into();
+        let content = content.into().into_boxed_str();
+        let mut virtual_ids = self.virtual_ids_by_path.lock().unwrap();
+        if let Some(&file) = virtual_ids.get(&path) {
+            // Reuse the entry: swap in the new content and DROP the prior box.
+            let entry = self.entry(file);
+            let mut slot = entry.virtual_content.lock().unwrap();
+            *slot = Some(content); // the previous Box<str> is dropped here → freed
+            return file;
+        }
+        // First time this document is parsed: append one virtual entry.
+        let file = self.push_entry(path.clone(), Some(String::new()));
+        // push_entry stored an empty placeholder; write the real content.
+        *self.entry(file).virtual_content.lock().unwrap() = Some(content);
+        virtual_ids.insert(path, file);
+        file
+    }
+
+    /// Release the content of the virtual buffer registered for `path`, freeing
+    /// its `Box<str>` (Task-15 `did_close` cleanup). The `FileId` and its map
+    /// entry are RETAINED so a reopen re-registers the SAME id (stable ids), but
+    /// the memory the content held is returned immediately. A subsequent
+    /// `content`/`loaded_content` on the freed id errors/panics respectively
+    /// until the document is re-parsed via `set_virtual`. No-op for a path that
+    /// was never a virtual buffer.
+    pub fn free_virtual(&self, path: impl AsRef<Path>) {
+        let virtual_ids = self.virtual_ids_by_path.lock().unwrap();
+        if let Some(&file) = virtual_ids.get(path.as_ref()) {
+            *self.entry(file).virtual_content.lock().unwrap() = None;
+        }
+    }
+
+    /// The number of virtual (in-memory editor) buffers the arena currently
+    /// tracks — one per open-document path that has been `set_virtual`-parsed.
+    /// Bounded regardless of how many times each document is re-parsed (that is
+    /// the Task-15 memory-bound property this exposes for tests).
+    pub fn virtual_buffer_count(&self) -> usize {
+        self.virtual_ids_by_path.lock().unwrap().len()
     }
 
     pub fn path(&self, file: FileId) -> &Path {
@@ -106,6 +211,18 @@ impl SourceArena {
     /// hash stamp needs no second read.
     pub fn content(&self, file: FileId) -> Result<&str, FileReadError> {
         let entry = self.entry(file);
+        // Virtual buffer: return the CURRENT replaceable content. The `&str`
+        // borrows the heap allocation the entry's `Box<str>` owns; that
+        // allocation stays valid until the next `set_virtual` for this FileId,
+        // which only happens BETWEEN parses under the session's serialization
+        // (see `set_virtual`'s soundness note). Reading a virtual entry whose
+        // content was freed (`did_close`) is an error, never a panic.
+        if entry.is_virtual {
+            return virtual_content_ref(entry).ok_or_else(|| FileReadError {
+                path: entry.path.clone(),
+                message: "virtual buffer content was released (closed document)".into(),
+            });
+        }
         if let Some(content) = entry.content.get() {
             return Ok(content);
         }
@@ -131,7 +248,12 @@ impl SourceArena {
     /// Content that is guaranteed to be materialized already (a span for this
     /// file exists, so someone lexed it). Panics on merely-registered files.
     pub fn loaded_content(&self, file: FileId) -> &str {
-        self.entry(file)
+        let entry = self.entry(file);
+        if entry.is_virtual {
+            return virtual_content_ref(entry)
+                .expect("virtual buffer content requested after it was released");
+        }
+        entry
             .content
             .get()
             .expect("file content requested before it was loaded")
@@ -178,17 +300,19 @@ impl SourceArena {
     }
 
     fn push_entry(&self, path: PathBuf, content: Option<String>) -> FileId {
-        let cell = OnceLock::new();
-        if let Some(content) = content {
-            let _ = cell.set(content);
-        }
         // A pushed-with-content entry is a virtual buffer (no disk bytes): `raw`
         // stays empty, so `raw_bytes` returns None and the stamp falls back to
         // hashing decoded content (the intended virtual-buffer behaviour).
+        let is_virtual = content.is_some();
+        // Disk entries keep their content in `content` (write-once); virtual
+        // entries keep it in `virtual_content` (replaceable, freed on re-parse).
+        let virtual_content = Mutex::new(content.map(String::into_boxed_str));
         let index = self.files.push_get_index(Box::new(SourceEntry {
             path,
-            content: cell,
+            content: OnceLock::new(),
             raw: OnceLock::new(),
+            is_virtual,
+            virtual_content,
         }));
         FileId(index as u32)
     }
@@ -198,6 +322,30 @@ impl SourceArena {
             .get(file.0 as usize)
             .expect("FileId not issued by this arena")
     }
+}
+
+/// The current text of a virtual entry as a `&str` borrowing the entry (whose
+/// heap address is stable — it lives in a `Box` inside the append-only
+/// `FrozenVec`). Returns `None` if the content was released (`free_virtual`).
+///
+/// SAFETY: the returned `&str` outlives the `MutexGuard` taken here. That is
+/// sound under the arena's single-writer-between-parses discipline
+/// ([`SourceArena::set_virtual`]): the `Box<str>` this points into is replaced
+/// or freed ONLY between parses, when no borrow into it is live. The guard is
+/// released immediately (it only protects the swap, not the read lifetime), and
+/// the pointer stays valid until the next `set_virtual`/`free_virtual` for this
+/// entry — exactly the contract `content` documents. We must not hold the guard
+/// for the borrow's lifetime because the parse hot path borrows content for the
+/// whole parse while other files (never this one) may be inserted concurrently.
+fn virtual_content_ref(entry: &SourceEntry) -> Option<&str> {
+    let guard = entry.virtual_content.lock().unwrap();
+    let text: &str = guard.as_deref()?;
+    // Extend the borrow from the guard to the entry. The bytes live in the
+    // `Box<str>`'s heap allocation, not in the guard/Option, and are stable
+    // until the next between-parses replace. See the function's SAFETY note.
+    let extended: &str = unsafe { std::mem::transmute::<&str, &str>(text) };
+    drop(guard);
+    Some(extended)
 }
 
 impl std::fmt::Debug for SourceArena {
@@ -320,6 +468,63 @@ mod tests {
         // materialize → raw bytes now retained, equal to the on-disk bytes
         arena.content(file).unwrap();
         assert_eq!(arena.raw_bytes(file).unwrap(), bytes.as_slice());
+    }
+
+    #[test]
+    fn set_virtual_bounds_the_arena_to_one_entry_per_path() {
+        // Task-15 memory bound: re-parsing ONE document N times must keep the
+        // arena at a single virtual entry (its content REPLACED, prior freed),
+        // not N appended copies. Proven by a stable FileId, a bounded virtual
+        // count, and `content` always returning the LATEST text with resolvable
+        // spans — the exact property the old `insert_virtual`-per-parse violated.
+        let arena = SourceArena::new();
+        let path = "C:/editor/Editing.pas";
+
+        let first = arena.set_virtual(path, "unit Editing; // v0".to_string());
+        assert_eq!(arena.virtual_buffer_count(), 1);
+        assert_eq!(arena.len(), 1);
+
+        for version in 1..=1000 {
+            let content = format!("unit Editing; // v{version} {}", "x".repeat(version));
+            let file = arena.set_virtual(path, content.clone());
+            // SAME FileId every time — the entry is reused, not appended.
+            assert_eq!(file, first, "re-parse must reuse the virtual FileId");
+            // The arena never grows: one virtual entry, one total file.
+            assert_eq!(arena.virtual_buffer_count(), 1);
+            assert_eq!(arena.len(), 1);
+            // `content` returns the LATEST text (span-provenance), and a span
+            // into it resolves to the expected substring.
+            assert_eq!(arena.content(file).unwrap(), content);
+            assert_eq!(arena.text(file, Span::new(0, 4)), "unit");
+        }
+
+        // A DIFFERENT path gets its own single entry (dedup is per-path).
+        let other = arena.set_virtual("C:/editor/Other.pas", "unit Other;".to_string());
+        assert_ne!(other, first);
+        assert_eq!(arena.virtual_buffer_count(), 2);
+        assert_eq!(arena.len(), 2);
+    }
+
+    #[test]
+    fn free_virtual_releases_content_but_keeps_id_stable() {
+        // did_close cleanup: freeing a virtual buffer releases its content
+        // (subsequent `content` errors, never panics) while keeping the id so a
+        // reopen re-registers the SAME FileId.
+        let arena = SourceArena::new();
+        let path = "C:/editor/Closable.pas";
+        let file = arena.set_virtual(path, "unit Closable;".to_string());
+        assert_eq!(arena.content(file).unwrap(), "unit Closable;");
+
+        arena.free_virtual(path);
+        // content is released: an error, not a panic (never-panic contract).
+        assert!(arena.content(file).is_err());
+        // the id and its map entry survive (count unchanged).
+        assert_eq!(arena.virtual_buffer_count(), 1);
+
+        // reopen re-registers the SAME id and restores content.
+        let reopened = arena.set_virtual(path, "unit Closable; // reopened".to_string());
+        assert_eq!(reopened, file, "reopen reuses the stable FileId");
+        assert_eq!(arena.content(file).unwrap(), "unit Closable; // reopened");
     }
 
     #[test]

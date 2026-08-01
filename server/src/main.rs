@@ -1130,10 +1130,17 @@ impl LanguageServer for DelphiLsp {
             published.remove(&uri);
         }
         // Drop the Url→unit_key mapping so a reopened document re-analyzes from
-        // scratch rather than reusing a stale key (Task-15 part 1 cleanup).
+        // scratch rather than reusing a stale key (Task-15 part 1 cleanup), and
+        // free the closed document's virtual buffer in the arena (part 2): its
+        // content String is released so a closed document holds no arena memory.
         {
             let mut analyzed = self.analyzed_units.lock().await;
             analyzed.remove(&uri);
+        }
+        if let Some(path) = session::uri_to_path(&uri) {
+            self.session
+                .free_virtual_buffer(session::document_path(&path))
+                .await;
         }
         // Clear diagnostics for the closed document: the editor keeps showing
         // the last published set until we send an empty one.
@@ -1399,6 +1406,70 @@ mod lifecycle_tests {
         let published = vec![diagnostic];
         assert_eq!(published.len(), 1, "exactly one replacing ERROR diagnostic");
         assert!(published.iter().all(|d| d.severity == Some(DiagnosticSeverity::ERROR)));
+    }
+
+    /// Task-15 bound at the server-analysis level: a sequence of didChange
+    /// re-parses interleaved with the query calls the read handlers now make
+    /// (definition/hover/references/completion via the CACHED meta, NO
+    /// parse_buffer) must NOT grow the arena beyond one virtual entry for the
+    /// open document. Under the OLD code every read re-parsed and every change
+    /// re-parsed, each appending a full-file copy → unbounded growth → OOM. This
+    /// drives the exact operations and asserts the virtual-entry count stays
+    /// bounded across many edit+read rounds.
+    #[test]
+    fn didchange_and_reads_do_not_grow_the_arena() {
+        let mut session = build_fallback();
+        let path = std::env::temp_dir()
+            .join("ddk-server-bound")
+            .join("Editing_unsaved.pas");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        // The arena is process-global; its absolute virtual count is not
+        // deterministic under the parallel runner. The concurrency-safe proof is
+        // that THIS document's buffer FileId is reused across every re-parse — no
+        // new arena entry per didChange or read. (The exhaustive absolute-count
+        // proof is `delphi_parser::source`'s local-arena test.)
+        let mut last_file = None;
+        for round in 0..200 {
+            // didChange → analyze re-parses the buffer (the ONLY parse per round).
+            let text = format!(
+                "unit Editing;\ninterface\ntype TThing{round} = class\n  \
+                 procedure Do{round};\nend;\nimplementation\nend."
+            );
+            let index = LineIndex::new(text.clone());
+            let (_, meta) = session.parse_buffer(&path, index.text()).unwrap();
+            let meta = meta.expect("unit meta");
+            let buffer_file = meta.ast.name.location.file;
+            let unit_key = meta.name();
+
+            // Read handlers now REUSE that meta (no parse). Drive the exact query
+            // surface: diagnostics + symbol/hover/references/completion.
+            let _ = session.diagnostics(unit_key);
+            let type_symbol_start = session
+                .meta_for(unit_key)
+                .unwrap()
+                .interface()
+                .find(session.context().intern_key(&format!("TThing{round}")))
+                .unwrap()
+                .location
+                .span
+                .start;
+            let _ = session.symbol_at(unit_key, type_symbol_start);
+            let _ = session.hover_info(unit_key, type_symbol_start);
+            let _ = session.completions(unit_key, type_symbol_start);
+            let _ = session.definition(unit_key, session.context().intern_key(&format!("TThing{round}")), None);
+
+            // The open document's buffer FileId is REUSED every round — no new
+            // arena entry per didChange or read. Reads add NOTHING (they never
+            // parse now). This is the bound: one entry per open document.
+            if let Some(previous) = last_file {
+                assert_eq!(
+                    buffer_file, previous,
+                    "the open document's virtual FileId is reused across edits + reads (round {round})"
+                );
+            }
+            last_file = Some(buffer_file);
+        }
     }
 
     /// A clean buffer produces an empty diagnostic set (didChange to valid code

@@ -245,6 +245,23 @@ impl SessionManager {
         }
     }
 
+    /// A document was CLOSED: free its virtual (unsaved) buffer's content in the
+    /// process-global arena, returning the memory it held (Task-15 `did_close`
+    /// cleanup). No-op when no session is open or the path was never a virtual
+    /// buffer. Runs on a blocking task under the session lock (a short critical
+    /// section, never held across `.await`) so it serializes with parses — a
+    /// close can only free content between parses, never during one.
+    pub async fn free_virtual_buffer(&self, path: PathBuf) {
+        let session_handle = self.session.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let guard = session_handle.blocking_lock();
+            if let Some(project_session) = guard.as_ref() {
+                project_session.arena().free_virtual(&path);
+            }
+        })
+        .await;
+    }
+
     /// A file was SAVED to disk: parse it from DISK (via
     /// [`ProjectSession::parse_source_file`], so the file AND its imports enter
     /// the cache as PERSISTABLE on-disk units — not the virtual editor buffer),

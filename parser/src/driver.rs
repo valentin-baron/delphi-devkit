@@ -285,19 +285,32 @@ impl ProjectSession {
     /// the LSP maps its `Url` onto for subsequent query calls
     /// (`diagnostics`/`symbol_at`/…).
     ///
-    /// A fresh virtual `FileId` is issued on every call (the arena does not
-    /// deduplicate virtual buffers), so re-parsing an edited buffer never reads
-    /// a stale prior version. The cache entry for the unit key is replaced by
-    /// the pipeline's `insert`, so a query after `parse_buffer` sees the newest
-    /// buffer.
+    /// The arena dedups virtual buffers by path ([`SourceArena::set_virtual`]):
+    /// the FIRST parse of a document issues a stable virtual `FileId`; every
+    /// later parse REUSES that id and REPLACES its content (dropping the prior
+    /// String + raw bytes), so the process-global arena holds at most one
+    /// virtual entry per open document rather than growing per keystroke
+    /// (Task-15 memory bound). Re-parsing an edited buffer never reads a stale
+    /// version: the content is replaced atomically before the parse, and the
+    /// meta this parse produces indexes exactly the new content. The cache entry
+    /// for the unit key is replaced by the pipeline's `insert`, so a query after
+    /// `parse_buffer` sees the newest buffer.
     pub fn parse_buffer(
         &mut self,
         path: impl AsRef<Path>,
         content: &str,
     ) -> Result<(ParseOutcome, Option<Arc<UnitMeta>>), SessionError> {
+        // Bound the arena: reuse ONE virtual entry per open-document path,
+        // replacing (freeing) its prior content on re-parse. Using
+        // `insert_virtual` here would append a fresh full-file copy to the
+        // process-global arena on every keystroke → unbounded growth → OOM
+        // (Task-15). `set_virtual` dedups by the display path and drops the
+        // prior String. Sound because a parse is synchronous and completes
+        // (dropping all `&str` borrows) before the next `set_virtual`; the meta
+        // this parse produces indexes exactly this stored content.
         let file = self
             .arena
-            .insert_virtual(path.as_ref().to_path_buf(), content.to_string());
+            .set_virtual(path.as_ref().to_path_buf(), content.to_string());
         let inserts_before = self.context.unit_cache.insert_count();
 
         let loader = UnitLoader::new(self.arena, self.context.clone(), Some(self.index.clone()));
@@ -3506,6 +3519,95 @@ mod tests {
         assert!(
             report.unreadable >= 1,
             "the virtual unit is dropped as unreadable on load: {report:?}"
+        );
+    }
+
+    #[test]
+    fn parse_buffer_reparse_bounds_arena_and_keeps_span_provenance() {
+        // Task-15 memory bound at the SESSION level: parsing the SAME document
+        // buffer N=1000 times (an editor re-parsing on every keystroke) must
+        // keep the arena at ONE virtual entry — the content REPLACED, the prior
+        // freed — not N appended full-file copies (the old OOM). After each
+        // re-parse, `content(file)` must return the CURRENT text and the meta's
+        // spans must resolve against it (span-provenance), and virtual buffers
+        // must never persist.
+        let directory = temp_directory("parse_buffer_bound");
+        let mut session = query_session(&directory);
+        let path = directory.join("Editing_unsaved.pas");
+
+        // NOTE the arena is process-global, so its absolute virtual count is not
+        // deterministic under the parallel test runner (other tests add virtual
+        // buffers concurrently). The concurrency-SAFE proof of the bound is that
+        // THIS document's FileId is REUSED across all re-parses — a stable id
+        // means no new entry is appended per keystroke. The exhaustive absolute
+        // count-stays-1 proof lives in `source::tests::
+        // set_virtual_bounds_the_arena_to_one_entry_per_path`, which uses a
+        // private local arena and so is deterministic.
+        let mut last_file = None;
+        for version in 0..1000 {
+            // Each version declares a distinctly-named type so we can prove the
+            // LATEST content is what the arena and the meta index.
+            let source = format!(
+                "unit Editing;\ninterface\ntype TThing{version} = class end;\n\
+                 implementation\nend."
+            );
+            let (_, meta) = session.parse_buffer(&path, &source).unwrap();
+            let meta = meta.expect("buffer meta");
+            let file = meta.ast.name.location.file;
+
+            // The virtual FileId is REUSED, not appended — the bound property
+            // (no new arena entry per re-parse of this open document).
+            if let Some(previous) = last_file {
+                assert_eq!(file, previous, "the virtual FileId is reused, not appended");
+            }
+            last_file = Some(file);
+
+            // span-provenance: content(file) is exactly this version's text, and
+            // the meta's own type symbol resolves against it.
+            assert_eq!(session.arena().content(file).unwrap(), source);
+            let type_key = session.context.intern_key(&format!("TThing{version}"));
+            let symbol = meta
+                .interface()
+                .find(type_key)
+                .expect("the current version's type is in the meta");
+            let target = session
+                .symbol_at(meta.name(), symbol.location.span.start)
+                .expect("symbol_at resolves against the current content");
+            assert_eq!(target.key, type_key);
+            // and the declaration span (via the arena) reads out of the CURRENT
+            // content — proving the span indexes the just-parsed text.
+            assert!(
+                session
+                    .arena()
+                    .text(file, symbol.location.span)
+                    .contains(&format!("TThing{version}")),
+                "the current declaration span reads the current type name"
+            );
+        }
+
+        // virtual-never-persist still holds after all the re-parses: the reused
+        // virtual FileId's path does not exist on disk, so a save/load
+        // round-trip drops it as unreadable.
+        let key = session
+            .parse_buffer(
+                &path,
+                "unit Editing;\ninterface\ntype TFinal = class end;\nimplementation\nend.",
+            )
+            .unwrap()
+            .1
+            .unwrap()
+            .name();
+        let snapshot = directory.join("bound_roundtrip.bin");
+        session.context.unit_cache.save(&snapshot).unwrap();
+        let fresh = UnitCache::default();
+        let report = fresh.load(&snapshot).unwrap();
+        assert!(
+            fresh.get(key).is_none(),
+            "the virtual unit must not survive a save/load round-trip: {report:?}"
+        );
+        assert!(
+            report.unreadable >= 1,
+            "the reused virtual unit is dropped unreadable on load: {report:?}"
         );
     }
 
