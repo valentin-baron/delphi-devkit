@@ -16,7 +16,7 @@ is deferred".
 | `positions.rs` | `LineIndex`: exact **UTF-16 code-unit ↔ byte-offset** mapping for one document, both directions. Handles LF/CRLF, multibyte UTF-8, astral/surrogate-pair characters, EOL/EOF. Clamps out-of-range positions (never panics). The #1 LSP defect surface — tested exhaustively. |
 | `documents.rs` | `DocumentStore`: `Url → { version, LineIndex }` for open editor buffers (the authoritative unsaved text). Applies incremental **and** full `didChange` edits through the position mapper; ignores stale (older-version) changes. |
 | `session.rs` | Bridges ddk-core project/compiler config → parser `CompilerProfile`; owns the parser `ProjectSession` behind an async lock; opens per active project with a graceful **no-dproj fallback** context. |
-| `diagnostics.rs` | Maps the parser's `UnifiedDiagnostic`s to LSP `Diagnostic`s. Only a location **in the analyzed buffer** gets an exact byte-mapped range; a DFM-only offset (or a location in another file) is anchored at the top of the document — **never a fabricated pas range**. |
+| `diagnostics.rs` | Maps the parser's `UnifiedDiagnostic`s to LSP `Diagnostic`s. Only a location **in the analyzed buffer** gets an exact byte-mapped range; a DFM-only offset (or a location in another file) is anchored at the top of the document — **never a fabricated pas range**. Severity is **per-finding**, mapped 1:1 from the parser's `Severity` (Error/Warning/Information/Hint) — not a blanket WARNING. |
 | `locations.rs` | `code_location_to_lsp`: maps a parser `CodeLocation` (a byte span into *some* parsed file) to an LSP `Location`, computing the `Range` from the **TARGET file's own text** — the open-document `LineIndex` when that file is a buffer, else a `LineIndex` built from `arena.content(file)`. Returns `None` (never a fabricated `Location`) for a virtual/non-file target or unreadable content. Shared navigation primitive for definition/hover/**references**. Also `resolve_references`: the folded key under the cursor → every recorded occurrence across cached units, each mapped through its OWN file's text, honoring `include_declaration` — an **over-approximating candidate set** (see below). |
 | `hover.rs` | Formats the parser's `HoverInfo` into a fenced `delphi` hover signature. Renders only facts the parser captured — a field/property's known type, a method's directives, the owning type — and shows **kind only** when the declared type is anonymous (`type_key` None): **never a fabricated type/return type**. |
 | `completion.rs` | Maps the parser's context-sensitive `completions` to LSP `CompletionItem`s (kind → `CompletionItemKind`, a short type/kind `detail`). Pure translation — the parser guarantees **member-only after `.`** (or an empty list on an unresolved receiver) and the top-level set otherwise, so **no top-level symbol can leak into a member list**. |
@@ -183,7 +183,46 @@ from the LSP notifications, not a second OS watcher.
   currently surfaced on the pas unit (top-of-document anchor with the offset
   noted). Mapping it into the `.dfm` document's own range (and go-to across the
   pas↔dfm boundary) is deferred (parser ledger #34).
-- **Sharper severities.** All parser findings currently map to WARNING; a
-  per-finding severity table is a later refinement.
 - **`didSave`-driven persistence / autosave cadence.** `tick` is not yet driven
   from the LSP; snapshot autosave of on-disk units is a follow-up.
+
+## Diagnostic severities (per-finding)
+
+Each parser finding sets an accurate `Severity` at its creation site; the server
+maps it 1:1 to LSP `DiagnosticSeverity`. It is **never** a blanket WARNING:
+
+| Finding | Severity |
+|---|---|
+| Lexer error in an active region / unrecoverable parse | Error |
+| Error-tolerant recovery dropped a declaration | Warning |
+| Unknown `{$IF}` (assumed one way) | Warning |
+| DFM dangling component / missing handler / type mismatch | Warning |
+| Pseudo-include `%DATE%`/unset-var placeholder | Information |
+| DFM "possibly inherited" / "form class not found" note | Hint |
+| Dropped attribute at a section boundary | Hint |
+| **Unused-uses** candidate | Hint |
+
+### Unused-uses (a conservative Hint, never a removal instruction)
+
+`ProjectSession::unused_units` flags a `uses` entry (interface **and**
+implementation) only when it can **prove** the imported unit contributes no
+referenced symbol, and even then surfaces it as a **Hint** from the
+`delphi-analysis` source with a side-effect caveat — never an error or a
+"delete this" claim. A false "unused" would invite deleting a needed unit and
+breaking the build, so the analysis is deliberately conservative. It **never**
+flags a unit that:
+
+- is **referenced** — any of its exported folded keys (its own unit key
+  included) appears in the over-approximating usage set (a name-match spares it);
+- **cannot be loaded** — missing source / DCU-only / parse-failed → can't prove
+  unused;
+- is **consulted as a dependency** — e.g. `{$IF Declared(Foo.X)}`/`SizeOf`
+  reached into its interface (that IS a use);
+- is reached while the importing unit is **cycle-tainted** (untrustworthy import
+  graph → flag nothing).
+
+Because the usage index is scope-unresolved and over-approximating, the analysis
+errs toward "used": a unit is flagged only when **zero** of its exports is
+referenced. Initialization side effects, re-exported types, ancestors and
+operator overloads are exactly why the message says the unit "may still be
+needed".

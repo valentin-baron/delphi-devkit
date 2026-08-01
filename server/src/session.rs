@@ -279,6 +279,15 @@ pub fn build_fallback_session_for_test() -> ProjectSession {
     build_fallback_session("Debug", "Win32", Vec::new()).expect("fallback session builds")
 }
 
+/// Test-only: a fallback session whose search paths include `directory`, so a
+/// buffer's `uses` clause resolves against on-disk sibling units there. Used by
+/// the unused-uses diagnostic test (cross-unit import resolution required).
+#[cfg(test)]
+pub fn build_fallback_session_with_search_path(directory: PathBuf) -> ProjectSession {
+    build_fallback_session("Debug", "Win32", vec![directory])
+        .expect("fallback session builds")
+}
+
 /// Bridge a ddk-core [`CompilerConfiguration`] + target platform into a parser
 /// [`CompilerProfile`]. The `VERxxx` condition plus the standard compiler +
 /// platform auto-defines dcc emits for the target.

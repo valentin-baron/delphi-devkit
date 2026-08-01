@@ -1018,6 +1018,7 @@ mod lifecycle_tests {
     use crate::diagnostics::to_lsp_diagnostics;
     use crate::positions::LineIndex;
     use crate::session::build_fallback_session_for_test as build_fallback;
+    use crate::session::build_fallback_session_with_search_path;
     use tower_lsp::lsp_types::DiagnosticSeverity;
 
     /// didOpen/didChange → parse → correctly-ranged diagnostics. An unknown
@@ -1056,6 +1057,52 @@ mod lifecycle_tests {
                 || directive.range.end.line > directive.range.start.line,
             "the range spans the directive, not a zero-length point: {directive:?}"
         );
+    }
+
+    /// Part B end-to-end through the server mapping: a buffer that imports a
+    /// referenced unit (Used) and an unreferenced unit (Unused) publishes a HINT
+    /// for Unused and NONE for Used — the conservative unused-uses hint reaches
+    /// the editor as a HINT-severity diagnostic, never a wrong "delete Used".
+    #[test]
+    fn unused_import_surfaces_as_hint_used_one_does_not() {
+        let directory = std::env::temp_dir().join("ddk-server-unused-uses");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("Used.pas"),
+            "unit Used;\ninterface\ntype TUsed = class end;\nimplementation\nend.",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("Unused.pas"),
+            "unit Unused;\ninterface\ntype TUnused = class end;\nimplementation\nend.",
+        )
+        .unwrap();
+
+        let mut session = build_fallback_session_with_search_path(directory.clone());
+        let text = "unit Consumer;\ninterface\nuses Used, Unused;\n\
+             implementation\n\
+             procedure P;\nvar X: TUsed;\nbegin X := TUsed.Create; end;\n\
+             end.";
+        let index = LineIndex::new(text.to_string());
+        let path = directory.join("Consumer.pas");
+
+        let (_, meta) = session.parse_buffer(&path, index.text()).unwrap();
+        let meta = meta.expect("unit meta");
+        let buffer_file = meta.ast.name.location.file;
+        let unified = session.diagnostics(meta.name());
+        let lsp = to_lsp_diagnostics(&unified, buffer_file, &index);
+
+        // exactly one HINT, naming Unused, from the analysis source, and NOT Used.
+        let hints: Vec<_> = lsp
+            .iter()
+            .filter(|d| d.severity == Some(DiagnosticSeverity::HINT))
+            .collect();
+        assert_eq!(hints.len(), 1, "one unused-uses hint: {lsp:?}");
+        assert!(hints[0].message.contains("Unused"));
+        assert!(!hints[0].message.contains("'Used'"), "the referenced Used is never flagged");
+        assert_eq!(hints[0].source.as_deref(), Some("delphi-analysis"));
+        // the hint sits on the uses-clause line (line index 2).
+        assert_eq!(hints[0].range.start.line, 2);
     }
 
     /// A clean buffer produces an empty diagnostic set (didChange to valid code
