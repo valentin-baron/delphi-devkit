@@ -782,6 +782,11 @@
     },
     "grammars": [
       {
+        "language": "objectpascal",
+        "scopeName": "source.objectpascal",
+        "path": "./config/languages/grammar/objectpascal.tmLanguage.json"
+      },
+      {
         "language": "ddk.compiler",
         "scopeName": "text.output.delphi-compiler",
         "path": "./config/languages/grammar/compiler-output.json"

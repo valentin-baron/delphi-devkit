@@ -1,0 +1,180 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Object Pascal",
+  "scopeName": "source.objectpascal",
+  "comment": "Original Object Pascal / Delphi TextMate grammar for DDK. Compiler directives {$...} and (*$...*) are scoped distinctly from plain comments. Contextual keywords (name/index/read/write/...) are deliberately NOT colored in identifier position; the LSP semantic-token layer refines identifiers.",
+  "patterns": [
+    { "include": "#directives" },
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#keywords" },
+    { "include": "#types" },
+    { "include": "#operators" }
+  ],
+  "repository": {
+    "directives": {
+      "comment": "Compiler directives — must be matched BEFORE comments so a { $... } / (* $... *) is never swallowed as a plain comment.",
+      "patterns": [
+        {
+          "name": "meta.preprocessor.objectpascal",
+          "comment": "Brace-form directive {$DEFINE FOO}, {$IFDEF X}, {$R *.res}, {$I unit.inc} ...",
+          "begin": "\\{\\$",
+          "end": "\\}",
+          "beginCaptures": {
+            "0": { "name": "keyword.control.directive.objectpascal" }
+          },
+          "endCaptures": {
+            "0": { "name": "keyword.control.directive.objectpascal" }
+          },
+          "patterns": [
+            {
+              "match": "(?i)\\b(DEFINE|UNDEF|IFDEF|IFNDEF|IFOPT|IF|ELSEIF|ELSE|ENDIF|IFEND|INCLUDE|I|RESOURCE|R|LINK|LIBPREFIX|LIBSUFFIX|LIBVERSION|WARN|WARNINGS|HINTS|MESSAGE|REGION|ENDREGION|SCOPEDENUMS|MINENUMSIZE|ALIGN|APPTYPE|H|HPPEMIT|M|MODE|ASSERTIONS|BOOLEVAL|DEBUGINFO|EXTENDEDSYNTAX|IMPORTEDDATA|IOCHECKS|LOCALSYMBOLS|LONGSTRINGS|OPENSTRINGS|OPTIMIZATION|OVERFLOWCHECKS|RANGECHECKS|REFERENCEINFO|SAFEDIVIDE|STACKFRAMES|TYPEDADDRESS|TYPEINFO|VARSTRINGCHECKS|WRITEABLECONST|X|Z|ZEROBASEDSTRINGS|POINTERMATH|EXCESSPRECISION)\\b",
+              "name": "keyword.control.directive.name.objectpascal"
+            }
+          ]
+        },
+        {
+          "name": "meta.preprocessor.objectpascal",
+          "comment": "Legacy parenthesis-star directive (*$DIRECTIVE ...*).",
+          "begin": "\\(\\*\\$",
+          "end": "\\*\\)",
+          "beginCaptures": {
+            "0": { "name": "keyword.control.directive.objectpascal" }
+          },
+          "endCaptures": {
+            "0": { "name": "keyword.control.directive.objectpascal" }
+          }
+        }
+      ]
+    },
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.block.objectpascal",
+          "comment": "Brace comment { ... } — a leading $ would be a directive, already consumed above.",
+          "begin": "\\{",
+          "end": "\\}"
+        },
+        {
+          "name": "comment.block.star.objectpascal",
+          "comment": "Parenthesis-star comment (* ... *) — a leading $ would be a directive, already consumed above.",
+          "begin": "\\(\\*",
+          "end": "\\*\\)"
+        },
+        {
+          "name": "comment.line.double-slash.objectpascal",
+          "begin": "//",
+          "end": "$"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.single.objectpascal",
+          "comment": "Single-quoted string; a doubled '' is an escaped quote and stays inside the string.",
+          "begin": "'",
+          "end": "'",
+          "patterns": [
+            {
+              "name": "constant.character.escape.objectpascal",
+              "match": "''"
+            }
+          ]
+        },
+        {
+          "name": "constant.character.objectpascal",
+          "comment": "Control/character codes: #13, #$1B, #255 — including adjacency like 'a'#13'b'.",
+          "match": "#(\\$[0-9A-Fa-f]+|[0-9]+)"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.hex.objectpascal",
+          "match": "\\$[0-9A-Fa-f]+"
+        },
+        {
+          "name": "constant.numeric.binary.objectpascal",
+          "match": "%[01]+"
+        },
+        {
+          "name": "constant.numeric.float.objectpascal",
+          "comment": "Decimal with a fractional part and/or an exponent.",
+          "match": "\\b[0-9]+(\\.[0-9]+)?([eE][+-]?[0-9]+)\\b|\\b[0-9]+\\.[0-9]+\\b"
+        },
+        {
+          "name": "constant.numeric.integer.objectpascal",
+          "match": "\\b[0-9]+\\b"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.objectpascal",
+          "comment": "Control-flow reserved words (case-insensitive).",
+          "match": "(?i)\\b(if|then|else|case|of|while|do|for|to|downto|repeat|until|begin|end|try|except|finally|raise|on|with|goto|exit|break|continue|asm|inline)\\b"
+        },
+        {
+          "name": "keyword.other.declaration.objectpascal",
+          "comment": "Declaration / structural reserved words (case-insensitive).",
+          "match": "(?i)\\b(unit|program|library|package|interface|implementation|initialization|finalization|uses|type|const|var|threadvar|resourcestring|procedure|function|constructor|destructor|operator|class|object|record|interface|dispinterface|packed|array|set|file|string|of|out|property|label|exports|contains|requires|nil|true|false)\\b"
+        },
+        {
+          "name": "keyword.operator.word.objectpascal",
+          "comment": "Word-form operators (case-insensitive).",
+          "match": "(?i)\\b(and|or|not|xor|div|mod|in|is|as|shl|shr)\\b"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "support.type.objectpascal",
+          "comment": "Common built-in type names (case-insensitive). Optional coloring; the semantic layer refines user types.",
+          "match": "(?i)\\b(Integer|Cardinal|SmallInt|ShortInt|Byte|Word|LongInt|LongWord|Int64|UInt64|NativeInt|NativeUInt|Single|Double|Extended|Real|Real48|Comp|Currency|Boolean|ByteBool|WordBool|LongBool|Char|AnsiChar|WideChar|String|AnsiString|WideString|UnicodeString|ShortString|RawByteString|Pointer|Variant|OleVariant|TObject|TClass|Pchar|PAnsiChar|PWideChar)\\b"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.assignment.objectpascal",
+          "match": ":="
+        },
+        {
+          "name": "keyword.operator.comparison.objectpascal",
+          "match": "<>|<=|>=|=|<|>"
+        },
+        {
+          "name": "keyword.operator.range.objectpascal",
+          "match": "\\.\\."
+        },
+        {
+          "name": "keyword.operator.arithmetic.objectpascal",
+          "match": "[+\\-*/]"
+        },
+        {
+          "name": "keyword.operator.symbolic.objectpascal",
+          "comment": "@ address-of, ^ pointer/deref.",
+          "match": "[@^]"
+        },
+        {
+          "name": "punctuation.terminator.objectpascal",
+          "match": ";"
+        },
+        {
+          "name": "punctuation.separator.objectpascal",
+          "match": "[,:]"
+        },
+        {
+          "name": "punctuation.accessor.objectpascal",
+          "match": "\\."
+        }
+      ]
+    }
+  }
+}
