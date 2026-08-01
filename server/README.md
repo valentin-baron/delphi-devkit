@@ -1,11 +1,12 @@
 # ddk-server — Delphi Language Server (LSP)
 
 tower-lsp server wiring the [`delphi-parser`](../parser) analysis engine to an
-editor. This document describes the **document-lifecycle foundation** (Task 8):
-the plumbing every language feature builds on. Features themselves
-(definition / references / completion / hover / rename / signatureHelp /
-semanticTokens) are **separate later tasks** and are intentionally NOT advertised
-yet.
+editor. This document describes the **document-lifecycle foundation** (Task 8)
+plus the language features layered on it: **definition + hover** (Task 9) and
+**find-references** (Task 10). The remaining features (completion / rename /
+signatureHelp / semanticTokens) are **separate later tasks**; a capability is
+advertised only once it is actually backed. **rename** in particular is
+*deliberately deferred* (not just unimplemented) — see "Why rename is deferred".
 
 ## Modules
 
@@ -15,9 +16,9 @@ yet.
 | `documents.rs` | `DocumentStore`: `Url → { version, LineIndex }` for open editor buffers (the authoritative unsaved text). Applies incremental **and** full `didChange` edits through the position mapper; ignores stale (older-version) changes. |
 | `session.rs` | Bridges ddk-core project/compiler config → parser `CompilerProfile`; owns the parser `ProjectSession` behind an async lock; opens per active project with a graceful **no-dproj fallback** context. |
 | `diagnostics.rs` | Maps the parser's `UnifiedDiagnostic`s to LSP `Diagnostic`s. Only a location **in the analyzed buffer** gets an exact byte-mapped range; a DFM-only offset (or a location in another file) is anchored at the top of the document — **never a fabricated pas range**. |
-| `locations.rs` | `code_location_to_lsp`: maps a parser `CodeLocation` (a byte span into *some* parsed file) to an LSP `Location`, computing the `Range` from the **TARGET file's own text** — the open-document `LineIndex` when that file is a buffer, else a `LineIndex` built from `arena.content(file)`. Returns `None` (never a fabricated `Location`) for a virtual/non-file target or unreadable content. Shared navigation primitive for definition/hover. |
+| `locations.rs` | `code_location_to_lsp`: maps a parser `CodeLocation` (a byte span into *some* parsed file) to an LSP `Location`, computing the `Range` from the **TARGET file's own text** — the open-document `LineIndex` when that file is a buffer, else a `LineIndex` built from `arena.content(file)`. Returns `None` (never a fabricated `Location`) for a virtual/non-file target or unreadable content. Shared navigation primitive for definition/hover/**references**. Also `resolve_references`: the folded key under the cursor → every recorded occurrence across cached units, each mapped through its OWN file's text, honoring `include_declaration` — an **over-approximating candidate set** (see below). |
 | `hover.rs` | Formats the parser's `HoverInfo` into a fenced `delphi` hover signature. Renders only facts the parser captured — a field/property's known type, a method's directives, the owning type — and shows **kind only** when the declared type is anonymous (`type_key` None): **never a fabricated type/return type**. |
-| `main.rs` | tower-lsp handlers: `initialize` capabilities, `didOpen`/`didChange`/`didClose` → `analyze` → `publishDiagnostics`, plus `textDocument/definition` and `textDocument/hover`. |
+| `main.rs` | tower-lsp handlers: `initialize` capabilities, `didOpen`/`didChange`/`didClose` → `analyze` → `publishDiagnostics`, plus `textDocument/definition`, `textDocument/hover`, and `textDocument/references`. |
 
 ## Capabilities advertised
 
@@ -33,10 +34,48 @@ yet.
   type), resolved **cross-unit** through the same machinery as definition, and
   rendered as a fenced `delphi` signature. No honest facts → **None**, never a
   fabricated type.
+- `referencesProvider` — `textDocument/references`. The identifier under the
+  cursor → every recorded occurrence of its folded key across **cached** units,
+  each mapped to a `Location` from its **own file's text**, honoring
+  `context.includeDeclaration`. No symbol under the cursor → **None**.
+  **This is a READ-ONLY, OVER-APPROXIMATING candidate set** the user visually
+  reviews: the parser's usage index is scope-unresolved, so it never misses a
+  real occurrence in a cached unit but *may* include an unrelated same-named
+  identifier (a local `Result`, a same-named symbol in another unit). This is
+  documented honestly (matching how the parser documents the index) — it does
+  **not** claim precision it lacks. Only units that have been parsed/cached
+  contribute occurrences.
 
-The remaining feature providers — completion / references / rename /
-signatureHelp / semanticTokens — stay **off**; a capability is only advertised
-once it is actually backed.
+The remaining feature providers — completion / **rename** / signatureHelp /
+semanticTokens — stay **off**; a capability is only advertised once it is
+actually backed. See below for why **rename is deliberately deferred**.
+
+### Why rename is deferred (not advertised)
+
+A rename must be **both complete** (rewrite *every* real reference) **and
+correct** (rewrite *nothing else*) — and because it is **destructive**, the
+never-a-wrong-answer rule binds hardest here. The only occurrence set available
+is the *same* over-approximating candidate set `references` serves (the
+scope-unresolved usage index). That leaves no correct option:
+
+- Renaming the **whole** candidate set would rewrite an unrelated same-named
+  identifier (a local `Result`, a different unit's `Name`) → a **destructive
+  wrong edit**.
+- Renaming only the **provably-bound subset** (the declaration + resolved
+  interface references) would leave the implementation-section uses — recorded
+  only as flat, owner-less, scope-unresolved usages — un-renamed → **dangling /
+  broken code**, an incomplete edit.
+
+No provable safety gate bridges this without scope resolution (proving an
+occurrence binds to *this* symbol, not a shadowing local, needs the very scope
+resolution that is missing; the usage index does not even record whether an
+occurrence is a local binding). So `rename_provider` is **not advertised** and
+no `rename`/`prepareRename` handler ships — the editor offers no rename rather
+than a sometimes-wrong one. This is the honest, safe outcome, ledgered as parser
+`SESSION.md` **#42** with the prerequisite plan (a scope-resolved symbol table,
+which also sharpens `references` to an exact set and closes #40/#41). `references`
+is acceptable to ship over the same set precisely because it is non-destructive
+and the user reviews it.
 
 ## Async / lock model (why it can't deadlock or block the executor)
 
@@ -95,11 +134,16 @@ from the LSP notifications, not a second OS watcher.
 
 ## Deferred to later feature tasks
 
-- **definition and hover are now wired** (Task 9). The remaining language-feature
-  providers (references / completion / rename / signatureHelp / semanticTokens)
-  are still deferred — the parser query API
+- **definition, hover, and references are now wired** (Tasks 9–10). The
+  remaining language-feature providers (completion / signatureHelp /
+  semanticTokens) are still deferred — the parser query API
   (`ProjectSession::{symbol_at, definition, hover_info, references, completions}`)
   already exists; only the LSP request handlers + capabilities remain.
+- **rename is deferred, not merely unimplemented** (Task 10 Deliverable B): a
+  correct+complete rename requires scope-resolved bindings the parser does not
+  yet have (over-approximation over-renames; declaration-only under-renames).
+  Ledgered as parser SESSION.md **#42**; `rename_provider` is intentionally not
+  advertised. See "Why rename is deferred" above.
 - **Interface ↔ implementation method jump** (Task 9 Deliverable D) is deferred:
   the parser does not yet structurally capture implementation-section method
   headers (`procedure TFoo.Bar; begin … end;`), so the jump has no data and was
