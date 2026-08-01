@@ -127,11 +127,17 @@ export class DDK_Client {
             debug: { command: serverPath, transport: TransportKind.stdio }
         };
         const clientOptions: LanguageClientOptions = {
+            // Route Object Pascal source documents to ddk-server for the LSP
+            // language features (diagnostics, definition, hover, references,
+            // completion, signature help, semantic tokens). The `.dfm`/compiler
+            // languages are handled through their own providers, not the LSP.
+            documentSelector: [
+                { scheme: 'file', language: 'objectpascal' }
+            ],
             initializationOptions: {
                 encoding: workspace.getConfiguration(PROJECTS.SETTINGS.SECTION).get<string>(PROJECTS.SETTINGS.COMPILER_ENCODING, 'oem')
             }
         };
-        // we can't set the documentSelector until we implement the actual LSP
         clientOptions.outputChannelName = 'DDK Server';
         this.client = new LanguageClient(
             'ddk_server',

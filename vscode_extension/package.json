@@ -639,6 +639,21 @@
     },
     "languages": [
       {
+        "id": "objectpascal",
+        "extensions": [
+          ".pas",
+          ".dpr",
+          ".dpk",
+          ".inc"
+        ],
+        "aliases": [
+          "Object Pascal",
+          "Delphi",
+          "Pascal"
+        ],
+        "configuration": "./config/languages/objectpascal-language-configuration.json"
+      },
+      {
         "id": "ddk.dfm",
         "extensions": [
           ".dfm"
