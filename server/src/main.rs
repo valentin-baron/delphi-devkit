@@ -3,6 +3,7 @@ mod documents;
 mod positions;
 mod session;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -34,6 +35,30 @@ struct DelphiLsp {
     /// on `spawn_blocking`; the lock is never held across `.await`. See
     /// [`session`] for the async/lock model.
     session: Arc<SessionManager>,
+    /// Per-URL monotonic "last published diagnostics version". tower-lsp runs
+    /// notification handlers with bounded concurrency (`buffer_unordered`), so
+    /// two `analyze` calls for the same document can finish OUT OF ORDER: a slow
+    /// parse for v2 may complete AFTER v3 has already parsed and published. This
+    /// guard makes the publish itself monotonic — a publish whose version is
+    /// `<=` the last one already published for that URL is dropped, so newer
+    /// diagnostics are never overwritten by staler ones (the never-a-wrong-answer
+    /// rule: never show squiggles for an older buffer version).
+    published_versions: Arc<Mutex<HashMap<Url, i32>>>,
+}
+
+/// The monotonic publish-slot decision, extracted so the out-of-order race is
+/// unit-testable without a live LSP `Client`. Returns `true` (and records
+/// `version` as the new last-published) iff `version` is strictly newer than the
+/// last version published for `uri`; returns `false` (leaving the map unchanged)
+/// for a stale-or-duplicate version, which the caller drops.
+fn claim_publish_slot(published: &mut HashMap<Url, i32>, uri: &Url, version: i32) -> bool {
+    match published.get(uri) {
+        Some(&last) if version <= last => false,
+        _ => {
+            published.insert(uri.clone(), version);
+            true
+        }
+    }
 }
 
 impl DelphiLsp {
@@ -42,7 +67,32 @@ impl DelphiLsp {
             client,
             documents: Arc::new(Mutex::new(DocumentStore::new())),
             session: Arc::new(SessionManager::new()),
+            published_versions: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Publish `diagnostics` for `(uri, version)` unless a NEWER (or equal) set
+    /// has already been published for that URL. Returns whether the publish went
+    /// out. This closes the out-of-order publish race: when a slow parse for an
+    /// older version finishes after a newer one has already been published, its
+    /// stale set is dropped here instead of overwriting the newer squiggles.
+    ///
+    /// The `published_versions` lock is a short critical section held only to
+    /// read-and-update the last-published version; it is dropped before the
+    /// `publish_diagnostics` await so it is never held across `.await`.
+    async fn publish_if_newer(&self, uri: Url, diagnostics: Vec<Diagnostic>, version: i32) -> bool {
+        {
+            let mut published = self.published_versions.lock().await;
+            if !claim_publish_slot(&mut published, &uri, version) {
+                // A publish for this-or-a-newer version already went out → drop
+                // this staler/duplicate one.
+                return false;
+            }
+        }
+        self.client
+            .publish_diagnostics(uri, diagnostics, Some(version))
+            .await;
+        true
     }
 
     /// Analyze an open document and publish its diagnostics: parse the buffer
@@ -92,38 +142,60 @@ impl DelphiLsp {
             let Some(project_session) = guard.as_mut() else {
                 // No session (unresolvable + fallback failed) → clear
                 // diagnostics rather than leaving a stale set.
-                return Some(Vec::new());
+                return Ok(Some(Vec::new()));
             };
             match project_session.parse_buffer(&parse_path, index.text()) {
                 Ok((_, Some(meta))) => {
                     let unit_key = meta.name();
                     let buffer_file = meta.ast.name.location.file;
                     let unified = project_session.diagnostics(unit_key);
-                    Some(diagnostics::to_lsp_diagnostics(&unified, buffer_file, &index))
+                    Ok(Some(diagnostics::to_lsp_diagnostics(&unified, buffer_file, &index)))
                 }
                 // A non-unit source (program/library/package) produces no
                 // importable meta and thus no unit-keyed diagnostics here; clear.
-                Ok((_, None)) => Some(Vec::new()),
+                Ok((_, None)) => Ok(Some(Vec::new())),
                 // A hard parse failure (unrecoverable directive structure): do
                 // not fabricate — publish nothing new (leave the prior set until
-                // the next successful parse). `None` signals "skip publish".
-                Err(_) => None,
+                // the next successful parse). `Some(None)` signals "skip publish",
+                // but the error itself must be visible (see below).
+                Err(error) => Err(error),
             }
         })
         .await;
 
-        match result {
-            Ok(Some(lsp_diagnostics)) => {
-                self.client
-                    .publish_diagnostics(uri, lsp_diagnostics, Some(version))
-                    .await;
+        let lsp_diagnostics = match result {
+            Ok(Ok(Some(lsp_diagnostics))) => lsp_diagnostics,
+            // A recovered "nothing to publish" (unreachable today: the blocking
+            // task returns Some(..) or Err(..)) — keep the previous set.
+            Ok(Ok(None)) => return,
+            // Parse error → keep the previous diagnostics (skip publish), but
+            // surface the SessionError so a failing buffer is not silent.
+            Ok(Err(error)) => {
+                lsp_error!(self.client, "parse of {} failed: {}", uri, error.message);
+                return;
             }
-            // Parse error → keep the previous diagnostics (skip publish).
-            Ok(None) => {}
             Err(join_error) => {
                 lsp_error!(self.client, "analyze task failed: {}", join_error);
+                return;
+            }
+        };
+
+        // Re-check the stored version BEFORE publishing: while this parse ran, a
+        // newer didChange may have replaced the buffer. Publishing this (now
+        // older) set would show squiggles for a version the editor no longer
+        // holds. Skip if the document advanced or was closed.
+        {
+            let store = self.documents.lock().await;
+            match store.get(&uri) {
+                Some(document) if document.version == version => {}
+                _ => return,
             }
         }
+
+        // Publish under the monotonic guard: even if the stored-version recheck
+        // passed, an out-of-order completion could still try to publish an older
+        // version than one already sent, so `publish_if_newer` is the final gate.
+        self.publish_if_newer(uri, lsp_diagnostics, version).await;
     }
 
     async fn projects_compile(
@@ -373,6 +445,14 @@ impl LanguageServer for DelphiLsp {
             let mut store = self.documents.lock().await;
             store.close(&uri);
         }
+        // Forget the last-published version for this URL: a reopen starts a fresh
+        // version sequence (the editor resets to version 1), which must not be
+        // rejected by the monotonic publish guard as "older than" the closed
+        // document's last version.
+        {
+            let mut published = self.published_versions.lock().await;
+            published.remove(&uri);
+        }
         // Clear diagnostics for the closed document: the editor keeps showing
         // the last published set until we send an empty one.
         self.client
@@ -407,6 +487,69 @@ async fn main() -> Result<()> {
     Server::new(stdin(), stdout(), socket).serve(service).await;
 
     return Ok(())
+}
+
+#[cfg(test)]
+mod publish_guard_tests {
+    //! The monotonic publish guard (finding 1): with tower-lsp's bounded
+    //! concurrency, `analyze` calls finish out of order. The publish must be
+    //! monotonic per URL so an older parse that completes late never overwrites a
+    //! newer already-published set.
+
+    use super::claim_publish_slot;
+    use std::collections::HashMap;
+    use tower_lsp::lsp_types::Url;
+
+    fn uri() -> Url {
+        Url::parse("file:///c:/proj/Unit1.pas").unwrap()
+    }
+
+    /// Simulate the exact race: a fast v3 publish lands first, then a SLOW v2
+    /// parse completes and tries to publish. v2 must be dropped (not overwrite
+    /// v3), and the recorded last-published version stays at 3.
+    #[test]
+    fn out_of_order_v2_after_v3_is_dropped() {
+        let mut published: HashMap<Url, i32> = HashMap::new();
+        // v3 finishes first and publishes.
+        assert!(claim_publish_slot(&mut published, &uri(), 3));
+        assert_eq!(published.get(&uri()), Some(&3));
+        // v2's slow parse completes AFTER v3 — its publish is dropped.
+        assert!(
+            !claim_publish_slot(&mut published, &uri(), 2),
+            "a v2 publish after v3 must be rejected"
+        );
+        // v3 is still the last published — v2 did NOT overwrite it.
+        assert_eq!(published.get(&uri()), Some(&3));
+    }
+
+    /// A newer version always wins; an equal version (duplicate notification) is
+    /// dropped so the same set is not republished.
+    #[test]
+    fn newer_wins_equal_and_older_dropped() {
+        let mut published: HashMap<Url, i32> = HashMap::new();
+        assert!(claim_publish_slot(&mut published, &uri(), 1));
+        assert!(claim_publish_slot(&mut published, &uri(), 2)); // newer wins
+        assert!(!claim_publish_slot(&mut published, &uri(), 2)); // equal dropped
+        assert!(!claim_publish_slot(&mut published, &uri(), 1)); // older dropped
+        assert_eq!(published.get(&uri()), Some(&2));
+    }
+
+    /// After close (map entry removed), a reopened document's fresh v1 must
+    /// publish again — the guard must not reject it as "older than" the closed
+    /// document's last version.
+    #[test]
+    fn reopen_after_close_publishes_fresh_version() {
+        let mut published: HashMap<Url, i32> = HashMap::new();
+        assert!(claim_publish_slot(&mut published, &uri(), 5));
+        // didClose removes the entry.
+        published.remove(&uri());
+        // Reopen resets the editor version to 1 — it must publish.
+        assert!(
+            claim_publish_slot(&mut published, &uri(), 1),
+            "a reopened document's v1 must not be blocked by the old v5"
+        );
+        assert_eq!(published.get(&uri()), Some(&1));
+    }
 }
 
 #[cfg(test)]
