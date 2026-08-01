@@ -40,6 +40,7 @@ use tokio::sync::Mutex;
 
 use delphi_parser::context::CompilerProfile;
 use delphi_parser::driver::{ProjectSession, SessionError, SessionOptions};
+use delphi_parser::unit_cache::SaveReport;
 
 use ddk_core::projects::CompilerConfiguration;
 
@@ -79,6 +80,15 @@ impl SessionManager {
     /// Shared handle to the session mutex — cloned into `spawn_blocking` tasks.
     pub fn handle(&self) -> Arc<Mutex<Option<ProjectSession>>> {
         self.session.clone()
+    }
+
+    /// Test-only: inject a prebuilt session (e.g. a fallback with an explicit
+    /// snapshot base), bypassing `ensure_open`, so the persistence paths
+    /// (`save_now` / `parse_disk_and_save`) can be exercised against a session
+    /// whose snapshot lands in a caller-controlled temp directory.
+    #[cfg(test)]
+    pub async fn inject_session_for_test(&self, session: ProjectSession) {
+        *self.session.lock().await = Some(session);
     }
 
     /// Ensure a session is open for `(dproj, config, platform, profile)`. Opens
@@ -203,6 +213,89 @@ impl SessionManager {
         *self.session.lock().await = None;
         *self.identity.lock().await = None;
     }
+
+    /// Persist the session's snapshot NOW (the LocalAppData cache). Runs the
+    /// blocking save on a blocking thread, taking the session lock with
+    /// `blocking_lock()` — the lock is a plain synchronous critical section
+    /// around `ProjectSession::save_now`, never held across `.await` (the async
+    /// caller awaits the JoinHandle, not the lock).
+    ///
+    /// No session open (nothing resolvable) → `Ok(None)`, a legitimate no-op.
+    /// Returns the [`SaveReport`] so the caller can LOG any skipped units — a
+    /// skipped meta is a dropped-and-re-parsed-next-session unit, never silently
+    /// swallowed. The VIRTUAL open buffer is not persistable BY CONSTRUCTION
+    /// (invariant #21/#25 — a virtual `FileId` never validates on load), so
+    /// `save_now` only ever writes on-disk units.
+    pub async fn save_now(&self) -> Result<Option<SaveReport>, SessionError> {
+        let session_handle = self.session.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            let mut guard = session_handle.blocking_lock();
+            match guard.as_mut() {
+                Some(project_session) => project_session.save_now().map(Some),
+                None => Ok(None),
+            }
+        })
+        .await;
+
+        match joined {
+            Ok(result) => result,
+            Err(join_error) => Err(SessionError::message(format!(
+                "save task failed: {join_error}"
+            ))),
+        }
+    }
+
+    /// A file was SAVED to disk: parse it from DISK (via
+    /// [`ProjectSession::parse_source_file`], so the file AND its imports enter
+    /// the cache as PERSISTABLE on-disk units — not the virtual editor buffer),
+    /// then persist the snapshot.
+    ///
+    /// This is the didSave persistence path. The parse + save run on ONE
+    /// blocking task under a single `blocking_lock()` acquisition, so no other
+    /// task can interleave a re-open between the parse and the save; the lock is
+    /// never held across `.await`.
+    ///
+    /// No session open → `Ok(None)` (nothing to persist). A parse failure is
+    /// returned as `Err` (the caller logs it, best-effort); a successful parse
+    /// returns the [`SaveReport`] so the caller can log skipped units.
+    pub async fn parse_disk_and_save(
+        &self,
+        path: PathBuf,
+    ) -> Result<Option<SaveReport>, SessionError> {
+        let session_handle = self.session.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            let mut guard = session_handle.blocking_lock();
+            let Some(project_session) = guard.as_mut() else {
+                return Ok(None);
+            };
+            // Parse from disk so the saved file and its imports become on-disk
+            // (persistable) cache units. A parse failure here does not abort the
+            // save — the imports pulled in before the failure are still worth
+            // persisting — but we surface the parse error to the caller AFTER
+            // the save so it is logged, not swallowed.
+            let parse_result = project_session.parse_source_file(&path);
+            let save_report = project_session.save_now()?;
+            match parse_result {
+                Ok(_) => Ok(Some(save_report)),
+                Err(parse_error) => Err(SessionError {
+                    message: format!(
+                        "saved snapshot but parse of {} failed: {}",
+                        path.display(),
+                        parse_error.message
+                    ),
+                    location: parse_error.location,
+                }),
+            }
+        })
+        .await;
+
+        match joined {
+            Ok(result) => result,
+            Err(join_error) => Err(SessionError::message(format!(
+                "didSave persistence task failed: {join_error}"
+            ))),
+        }
+    }
 }
 
 /// Build a fallback [`ProjectSession`] over a minimal default context: no dproj,
@@ -214,6 +307,22 @@ fn build_fallback_session(
     configuration: &str,
     platform: &str,
     standard_source_paths: Vec<PathBuf>,
+) -> Result<ProjectSession, SessionError> {
+    let scratch_base = std::env::temp_dir().join("ddk-server").join("fallback-cache");
+    build_fallback_session_in(configuration, platform, standard_source_paths, scratch_base)
+}
+
+/// The fallback-session builder with an EXPLICIT snapshot base directory. Both
+/// the placeholder synthetic dproj (needed to give the cache identity a
+/// canonicalizable path) and the snapshot `.bin` land under `snapshot_base`, so
+/// a caller (e.g. a server test) can point persistence at a temp directory and
+/// assert the snapshot was written. The default fallback (above) uses a stable
+/// scratch subdirectory so it never clobbers a real project's cache.
+fn build_fallback_session_in(
+    configuration: &str,
+    platform: &str,
+    standard_source_paths: Vec<PathBuf>,
+    snapshot_base: PathBuf,
 ) -> Result<ProjectSession, SessionError> {
     use delphi_parser::cache_store::{CacheIdentity, CacheStore};
     use delphi_parser::context::{
@@ -243,7 +352,7 @@ fn build_fallback_session(
     // snapshot file. A stable synthetic path keyed on config/platform. The cache
     // identity canonicalizes the project path, so the placeholder file must
     // exist on disk — create it (idempotently) before building the identity.
-    let scratch_base = std::env::temp_dir().join("ddk-server").join("fallback-cache");
+    let scratch_base = snapshot_base;
     std::fs::create_dir_all(&scratch_base)
         .map_err(|error| SessionError::message(format!("cannot create fallback cache dir: {error}")))?;
     let synthetic_dproj = scratch_base.join(format!("{configuration}-{platform}.dproj"));
@@ -284,6 +393,16 @@ pub fn build_fallback_session_for_test() -> ProjectSession {
 #[cfg(test)]
 pub fn build_fallback_session_with_search_path(directory: PathBuf) -> ProjectSession {
     build_fallback_session("Debug", "Win32", vec![directory])
+        .expect("fallback session builds")
+}
+
+/// Test-only: a fallback session whose snapshot base AND search path are both
+/// `directory`, so persistence lands in a caller-controlled temp directory (the
+/// snapshot `.bin` can then be asserted on disk) and a saved file's imports
+/// resolve against the same directory. Used by the persistence tests.
+#[cfg(test)]
+pub fn build_fallback_session_with_snapshot_base(directory: PathBuf) -> ProjectSession {
+    build_fallback_session_in("Debug", "Win32", vec![directory.clone()], directory)
         .expect("fallback session builds")
 }
 
@@ -545,6 +664,195 @@ mod tests {
         assert!(
             meta.interface()
                 .contains_key(delphi_parser::globals::intern_key("TX"))
+        );
+    }
+
+    /// A fresh temp directory unique to this test run — the snapshot base for a
+    /// persistence test, so its `.bin` never collides with another test's.
+    fn fresh_snapshot_base(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir()
+            .join("ddk-server-persist")
+            .join(format!("{tag}-{}-{nonce}", std::process::id()));
+        // Start clean so a pre-existing snapshot from a prior run can't mask a
+        // "was a snapshot written THIS run" assertion.
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    /// Whether ANY snapshot `.bin` exists under `base` — the persisted cache
+    /// file the fallback identity writes (its name is a hash, so match by
+    /// extension rather than by exact name).
+    fn snapshot_written(base: &Path) -> bool {
+        std::fs::read_dir(base)
+            .map(|entries| {
+                entries.flatten().any(|entry| {
+                    entry.path().extension().and_then(|e| e.to_str()) == Some("bin")
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    /// didSave path: `parse_disk_and_save` parses the saved file FROM DISK (so it
+    /// and its import become persistable on-disk units) and writes a snapshot to
+    /// the temp cache base. Proves the didSave handler persists.
+    #[tokio::test]
+    async fn did_save_parses_from_disk_and_writes_snapshot() {
+        let base = fresh_snapshot_base("didsave");
+        // A saved unit that imports a sibling on-disk unit — both are on-disk
+        // (persistable) units the snapshot must capture.
+        std::fs::write(
+            base.join("Imported.pas"),
+            "unit Imported;\ninterface\ntype TImported = class end;\nimplementation\nend.",
+        )
+        .unwrap();
+        let saved = base.join("Saver.pas");
+        // Saver `uses` the on-disk import and references its type — the disk
+        // parse resolves the `uses` clause against the sibling on disk.
+        std::fs::write(
+            &saved,
+            "unit Saver;\ninterface\nuses Imported;\n\
+             type TSaver = class\n  Field: TImported;\nend;\n\
+             implementation\nend.",
+        )
+        .unwrap();
+
+        let manager = SessionManager::new();
+        manager
+            .inject_session_for_test(build_fallback_session_with_snapshot_base(base.clone()))
+            .await;
+
+        // No snapshot before the save.
+        assert!(!snapshot_written(&base), "no snapshot before didSave");
+
+        let report = manager
+            .parse_disk_and_save(saved)
+            .await
+            .expect("parse+save succeeds")
+            .expect("a session is open, so a report is produced");
+        // The saved on-disk file persists (at least itself; imports that the
+        // loader fully materialized as a cached meta are folded in too).
+        assert!(
+            report.written >= 1,
+            "the saved on-disk file persists: {report:?}"
+        );
+        assert!(report.skipped.is_empty(), "no on-disk unit is skipped: {report:?}");
+        assert!(snapshot_written(&base), "didSave wrote a snapshot .bin");
+
+        // Reload the snapshot into a FRESH cache and prove the SAVED on-disk unit
+        // survives the round-trip (it has a real on-disk FileId, so it
+        // re-registers) — the persistence the didSave path exists to provide.
+        use delphi_parser::unit_cache::UnitCache;
+        let store_path = std::fs::read_dir(&base)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|p| p.extension().and_then(|x| x.to_str()) == Some("bin"))
+            .expect("a snapshot .bin exists");
+        let fresh = UnitCache::default();
+        let load_report = fresh.load(&store_path).expect("snapshot loads");
+        fresh.run_pending_tasks();
+        assert!(
+            fresh
+                .get(delphi_parser::globals::intern_key("Saver"))
+                .is_some(),
+            "the saved on-disk unit reloads from the snapshot: {load_report:?}"
+        );
+        // Imports the parser materialized into a full cached meta persist too;
+        // the parser loads a `uses` target's INTERFACE lazily, so whether a given
+        // import becomes a full cached meta (vs. an interface-only load) is a
+        // parser-internal decision. The guarantee this test pins is that the
+        // SAVED on-disk unit round-trips — the point of the didSave persistence
+        // path. (The parser's own suite covers nested-unit caching.)
+    }
+
+    /// shutdown path: after a session did work, `save_now` writes the snapshot
+    /// (best-effort persistence on server shutdown).
+    #[tokio::test]
+    async fn shutdown_save_now_writes_snapshot() {
+        let base = fresh_snapshot_base("shutdown");
+        std::fs::write(
+            base.join("Persisted.pas"),
+            "unit Persisted;\ninterface\ntype TP = class end;\nimplementation\nend.",
+        )
+        .unwrap();
+
+        let mut session = build_fallback_session_with_snapshot_base(base.clone());
+        // Parse an on-disk unit so there is durable state to persist.
+        session
+            .parse_source_file(base.join("Persisted.pas"))
+            .expect("on-disk unit parses");
+        let manager = SessionManager::new();
+        manager.inject_session_for_test(session).await;
+
+        assert!(!snapshot_written(&base), "no snapshot before shutdown save");
+        let report = manager
+            .save_now()
+            .await
+            .expect("save succeeds")
+            .expect("a session is open");
+        assert!(report.written >= 1, "the on-disk unit persists: {report:?}");
+        assert!(snapshot_written(&base), "shutdown save wrote a snapshot .bin");
+    }
+
+    /// The VIRTUAL open buffer must NEVER persist ACROSS SESSIONS (invariant
+    /// #21/#25). A virtual unit's meta IS written into the snapshot segment, but
+    /// its display-only `FileId` path does not exist on disk, so on LOAD it fails
+    /// to `register` (canonicalize) and is dropped as unreadable — it never
+    /// re-enters a fresh cache. This is the load-time gate the invariant
+    /// describes; the proof is a save→load round-trip that does NOT surface the
+    /// virtual unit. (Contrast the on-disk unit tests, which DO reload.)
+    #[tokio::test]
+    async fn virtual_open_buffer_does_not_survive_a_save_load_roundtrip() {
+        let base = fresh_snapshot_base("virtual");
+        let mut session = build_fallback_session_with_snapshot_base(base.clone());
+        // An UNSAVED buffer whose display path does NOT exist on disk — the
+        // essence of an editor buffer with unsaved content.
+        let virtual_path = base.join("VirtualOnly_unsaved.pas");
+        assert!(!virtual_path.exists(), "the buffer path must not exist on disk");
+        session
+            .parse_buffer(
+                &virtual_path,
+                "unit VirtualOnly;\ninterface\ntype TVirtual = class end;\n\
+                 implementation\nend.",
+            )
+            .expect("virtual buffer parses");
+        let manager = SessionManager::new();
+        manager.inject_session_for_test(session).await;
+
+        // save_now succeeds; a snapshot .bin lands on disk.
+        manager
+            .save_now()
+            .await
+            .expect("save succeeds")
+            .expect("session open");
+        assert!(snapshot_written(&base), "a snapshot .bin is written");
+
+        // Reload the snapshot into a FRESH cache: the virtual unit must NOT come
+        // back (its FileId cannot re-register → dropped as unreadable). A future
+        // session therefore never sees the unsaved buffer's state.
+        use delphi_parser::unit_cache::UnitCache;
+        let store_path = std::fs::read_dir(&base)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|p| p.extension().and_then(|x| x.to_str()) == Some("bin"))
+            .expect("a snapshot .bin exists");
+        let fresh = UnitCache::default();
+        let report = fresh.load(&store_path).expect("snapshot loads");
+        fresh.run_pending_tasks();
+        assert!(
+            fresh
+                .get(delphi_parser::globals::intern_key("VirtualOnly"))
+                .is_none(),
+            "the virtual (unsaved) unit must be absent from a freshly loaded cache: {report:?}"
+        );
+        assert!(
+            report.unreadable >= 1,
+            "the virtual unit is dropped as unreadable on load: {report:?}"
         );
     }
 }

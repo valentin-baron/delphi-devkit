@@ -807,8 +807,20 @@ impl LanguageServer for DelphiLsp {
         // rename exists yet.
         return Ok(InitializeResult {
             capabilities: ServerCapabilities {
-                text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::INCREMENTAL,
+                // Incremental buffer sync PLUS save notifications: didSave drives
+                // cache persistence (parse-from-disk + snapshot). `include_text`
+                // is false — the handler re-reads the file from disk itself (the
+                // save already flushed the editor buffer to disk), so the client
+                // need not resend the whole text.
+                text_document_sync: Some(TextDocumentSyncCapability::Options(
+                    TextDocumentSyncOptions {
+                        open_close: Some(true),
+                        change: Some(TextDocumentSyncKind::INCREMENTAL),
+                        save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
+                            include_text: Some(false),
+                        })),
+                        ..TextDocumentSyncOptions::default()
+                    },
                 )),
                 definition_provider: Some(OneOf::Left(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
@@ -872,6 +884,32 @@ impl LanguageServer for DelphiLsp {
 
     async fn shutdown(&self) -> jsonrpc::Result<()> {
         ddk_core::projects::compiler_state::cancel();
+        // Best-effort final persistence: write the session snapshot so edits
+        // made this session survive into the next. NEVER panic or fail shutdown
+        // on a save error — log it. The virtual open buffer is not persistable
+        // by construction (invariant #21/#25), so this only writes on-disk units.
+        match self.session.save_now().await {
+            Ok(Some(report)) => {
+                for skipped in &report.skipped {
+                    lsp_error!(
+                        self.client,
+                        "shutdown save skipped un-serializable unit {}: {}",
+                        skipped.name,
+                        skipped.error
+                    );
+                }
+                lsp_info!(
+                    self.client,
+                    "shutdown persisted {} unit(s) to the snapshot",
+                    report.written
+                );
+            }
+            // No session open — nothing to persist, a legitimate no-op.
+            Ok(None) => {}
+            Err(error) => {
+                lsp_error!(self.client, "shutdown save failed: {}", error.message);
+            }
+        }
         return Ok(())
     }
 
@@ -913,6 +951,65 @@ impl LanguageServer for DelphiLsp {
         // unopened document or a stale-version change yields `None`).
         if updated.is_some() {
             self.analyze(uri, version).await;
+        }
+    }
+
+    // ─── Persist on save ────────────────────────────────────────────────
+    //
+    // On `textDocument/didSave` the file now exists on disk. Parse it FROM DISK
+    // (via `ProjectSession::parse_source_file`) so it — and every unit its
+    // `uses` clause pulls in — enters the cache as a PERSISTABLE on-disk unit
+    // (not the virtual editor buffer, which never persists — invariant
+    // #21/#25), then write the snapshot. This is the primary cache-persistence
+    // trigger; `shutdown` is the fallback. Session work runs on `spawn_blocking`
+    // inside the SessionManager; the lock is never held across `.await`.
+    async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        let uri = params.text_document.uri;
+        // Only persist real file paths (skip untitled:/ and other schemes).
+        let Some(path) = session::uri_to_path(&uri) else {
+            return;
+        };
+
+        // Ensure a session is open for the active project (same resolution as
+        // `analyze`), so the disk parse + save target the right project cache.
+        let inputs = session::resolve_active_project_inputs().await;
+        self.session
+            .ensure_open(
+                inputs.dproj,
+                inputs.configuration,
+                inputs.platform,
+                inputs.profile,
+                inputs.standard_source_paths,
+            )
+            .await;
+
+        let parse_path = session::document_path(&path);
+        match self.session.parse_disk_and_save(parse_path).await {
+            Ok(Some(report)) => {
+                for skipped in &report.skipped {
+                    lsp_error!(
+                        self.client,
+                        "didSave snapshot skipped un-serializable unit {}: {}",
+                        skipped.name,
+                        skipped.error
+                    );
+                }
+                lsp_debug!(
+                    self.client,
+                    "didSave persisted {} unit(s) from {}",
+                    report.written,
+                    uri
+                );
+            }
+            // No session open — the file could not be attached to a project
+            // cache. Not an error the user needs a squiggle for; nothing to
+            // persist.
+            Ok(None) => {}
+            Err(error) => {
+                // Best-effort: a failed disk-parse/save is logged, never fatal
+                // (the buffer's diagnostics still come from `analyze`).
+                lsp_error!(self.client, "didSave persistence failed: {}", error.message);
+            }
         }
     }
 
