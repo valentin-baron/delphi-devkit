@@ -47,6 +47,21 @@ pub fn resolve_signature_help(
         .map(|signature| to_signature_information(signature, active_parameter))
         .collect();
 
+    // Clamp the top-level active parameter too (defensive). Per LSP ≥3.16 the
+    // per-SignatureInformation value wins when present, so this is belt-and-
+    // suspenders for older clients / signatures with no parameters: clamp to the
+    // widest overload's last parameter, or None when no overload has any.
+    let widest = signatures
+        .iter()
+        .map(|signature| signature.parameters.len())
+        .max()
+        .unwrap_or(0);
+    let top_level_active = if widest == 0 {
+        None
+    } else {
+        Some(active_parameter.min(widest as u32 - 1))
+    };
+
     Some(SignatureHelp {
         signatures: signature_informations,
         // The first signature is active. Distinguishing the "best" overload for
@@ -54,7 +69,7 @@ pub fn resolve_signature_help(
         // the query layer does not do — so we present all overloads and default
         // to the first (the editor lets the user cycle). Documented limitation.
         active_signature: Some(0),
-        active_parameter: Some(active_parameter),
+        active_parameter: top_level_active,
     })
 }
 
@@ -269,6 +284,13 @@ mod tests {
             help.signatures[0].active_parameter,
             Some(0),
             "an out-of-range active parameter clamps to the last parameter"
+        );
+        // The TOP-LEVEL active parameter is clamped too (defensive), not left at
+        // the raw out-of-range 5.
+        assert_eq!(
+            help.active_parameter,
+            Some(0),
+            "the top-level active parameter is also clamped"
         );
     }
 }
