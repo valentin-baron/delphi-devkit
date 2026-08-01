@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 
-use crate::ast::{Member, TypeExpression, Unit, VariantPart};
+use crate::ast::{ImplRoutine, Member, TypeExpression, Unit, VariantPart};
 use crate::context::Identifier;
 use crate::unit_cache::{
     Dependency, InterfaceSymbol, MemberKind, MemberSymbol, SourceStamp, SymbolKind, UnitInterface,
@@ -71,10 +71,36 @@ pub struct UnitMeta {
     /// weigher then falls back to a structural estimate.
     #[serde(default)]
     pub source_len: u32,
+    /// Implementation-section routine structure (params + locals per routine
+    /// body), for SAME-UNIT resolution of a local variable / parameter. Empty for
+    /// a unit with no impl routines, for an older meta (pre-format-14, via
+    /// `#[serde(default)]`), or for a meta built through [`Self::new`] without the
+    /// builder. Its entries' `body_span`s let a query find the enclosing routine
+    /// by byte offset; only trusted when `impl_scopes_reliable` is true.
+    #[serde(default)]
+    pub impl_scopes: Vec<ImplRoutine>,
+    /// True only when the WHOLE implementation-section structure pass completed
+    /// cleanly (no recovery). The impl-section grammar is deep and only partially
+    /// modeled here, so any construct the pass cannot confidently track
+    /// (`asm`, an unexpected token, unbalanced `end`, …) flips this false and the
+    /// scope-resolution branch then ignores `impl_scopes` entirely — a WRONG
+    /// `body_span` that mis-attributes a local is unacceptable, so we resolve
+    /// nothing rather than risk it. Defaults true for older metas / `new` callers
+    /// that carry no impl structure (their empty `impl_scopes` simply match
+    /// nothing, which is safe).
+    #[serde(default = "default_true")]
+    pub impl_scopes_reliable: bool,
     /// Derived interface surface (symbols + flattened members), built lazily
     /// from `ast` and cached. Never serialized — rebuilt on demand.
     #[serde(skip)]
     interface_index: OnceCell<UnitInterface>,
+}
+
+/// serde default for [`UnitMeta::impl_scopes_reliable`] — an absent field (an
+/// older snapshot) defaults to reliable, since its (also-absent) `impl_scopes`
+/// is empty and therefore matches nothing.
+fn default_true() -> bool {
+    true
 }
 
 impl UnitMeta {
@@ -98,8 +124,21 @@ impl UnitMeta {
             usages,
             dfm: None,
             source_len: 0,
+            impl_scopes: Vec::new(),
+            impl_scopes_reliable: true,
             interface_index: OnceCell::new(),
         }
+    }
+
+    /// Attach the implementation-section routine structure (builder style, keeps
+    /// [`Self::new`]'s positional signature stable). `reliable` is false when the
+    /// impl-section structure pass had to recover from a construct it does not
+    /// model — the scope-resolution branch then ignores `scopes` entirely (never
+    /// a wrong local attribution). Set by [`crate::pipeline::build_unit_meta`].
+    pub fn with_impl_scopes(mut self, scopes: Vec<ImplRoutine>, reliable: bool) -> Self {
+        self.impl_scopes = scopes;
+        self.impl_scopes_reliable = reliable;
+        self
     }
 
     /// Record the decoded source length (builder style, keeps [`Self::new`]'s
@@ -215,9 +254,23 @@ impl UnitMeta {
 
         // Term 3: real per-element sizes of the owned side tables (these scale
         // with cross-unit references / occurrences, independent of source length).
+        // impl_scopes: one `ImplRoutine` per body plus its owned param/local
+        // vectors (each element a `LocalDeclaration`). Charged at real element
+        // size so a local-dense unit is not undercounted.
+        let impl_scopes_cost: usize = self
+            .impl_scopes
+            .iter()
+            .map(|routine| {
+                std::mem::size_of::<crate::ast::ImplRoutine>()
+                    + (routine.params.len() + routine.locals.len())
+                        * std::mem::size_of::<crate::ast::LocalDeclaration>()
+            })
+            .sum();
+
         let side_tables = self.usages.len() * std::mem::size_of::<Usage>()
             + self.dependencies.len() * (std::mem::size_of::<Dependency>() + 96)
             + self.includes.len() * (std::mem::size_of::<SourceStamp>() + 96)
+            + impl_scopes_cost
             + self.source_path.as_os_str().len();
 
         // Term 1: the owned AST heap.
@@ -627,6 +680,62 @@ mod tests {
         // second call returns the cached index (idempotent)
         let interface_again = meta.interface();
         assert_eq!(interface_again.symbols.len(), interface.symbols.len());
+    }
+
+    /// `impl_scopes` (params + locals per body, plus the reliability flag)
+    /// survives a bincode round-trip under the bumped format — mirrors
+    /// `meta_serde_round_trip_rebuilds_index` for the new field.
+    #[test]
+    fn impl_scopes_survive_serde_round_trip() {
+        let directory = std::env::temp_dir().join("delphi_parser_impl_scopes_serde");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("Scoped.pas");
+        std::fs::write(
+            &path,
+            "unit Scoped;\ninterface\nimplementation\n\
+             procedure TThing.Run;\nvar Local: TThing;\nbegin\n  Local.Free;\nend;\nend.",
+        )
+        .unwrap();
+
+        // Parse through the global arena, capturing the impl_scopes the pass built.
+        let arena = crate::globals::arena();
+        let context = test_context();
+        let file = arena.load(&path).unwrap();
+        let mut outcome = parse_file_full(arena, context, file, None).unwrap();
+        let Some(Source::Unit(unit)) = outcome.source.take() else {
+            panic!("expected unit");
+        };
+        let source_hash = crate::unit_cache::hash_file(&path).unwrap();
+        let meta = UnitMeta::new(
+            unit,
+            outcome.cycle_tainted,
+            path.to_path_buf(),
+            source_hash,
+            Vec::new(),
+            outcome.dependencies,
+            outcome.usages,
+        )
+        .with_impl_scopes(outcome.impl_scopes, outcome.impl_scopes_reliable);
+
+        assert_eq!(meta.impl_scopes.len(), 1, "one routine captured before save");
+        assert!(meta.impl_scopes_reliable);
+
+        let bytes = bincode::serialize(&meta).unwrap();
+        // the local name survives as text (dual-track, no raw Spur).
+        assert!(String::from_utf8_lossy(&bytes).contains("Local"));
+
+        let restored: UnitMeta = bincode::deserialize(&bytes).unwrap();
+        assert!(restored.impl_scopes_reliable, "reliability flag survives");
+        assert_eq!(restored.impl_scopes.len(), 1);
+        let routine = &restored.impl_scopes[0];
+        assert_eq!(routine.owner_type_key, Some(crate::globals::intern_key("TThing")));
+        assert_eq!(routine.name.key, crate::globals::intern_key("Run"));
+        assert_eq!(routine.locals.len(), 1);
+        assert_eq!(routine.locals[0].name.key, crate::globals::intern_key("Local"));
+        assert_eq!(
+            routine.locals[0].type_key,
+            Some(crate::globals::intern_key("TThing"))
+        );
     }
 
     #[test]

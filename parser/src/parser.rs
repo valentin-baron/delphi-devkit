@@ -145,6 +145,12 @@ pub struct ParseOutcome {
     pub dependencies: Vec<crate::unit_cache::Dependency>,
     /// Unresolved identifier occurrences from the implementation section.
     pub usages: Vec<crate::unit_cache::Usage>,
+    /// Implementation-section routine structure (params/locals per body), for
+    /// same-unit local resolution. Only trusted when `impl_scopes_reliable`.
+    pub impl_scopes: Vec<crate::ast::ImplRoutine>,
+    /// True only when the impl-section structure pass completed without recovery
+    /// (see [`crate::unit_meta::UnitMeta::impl_scopes_reliable`]).
+    pub impl_scopes_reliable: bool,
     pub diagnostics: Vec<crate::token_cursor::Diagnostic>,
     /// An interface uses-cycle was hit (invalid Delphi, F2047) — result is
     /// best-effort and must not be persisted as trustworthy.
@@ -196,6 +202,8 @@ pub fn parse_file_full(
         seen_includes: state.seen_includes().to_vec(),
         dependencies: state.take_dependencies(),
         usages: state.take_usages(),
+        impl_scopes: state.take_impl_scopes(),
+        impl_scopes_reliable: state.impl_scopes_reliable(),
         diagnostics,
         cycle_tainted: state.is_cycle_tainted(),
         recovered,
@@ -311,25 +319,709 @@ impl UnitParser<'_> {
         })
     }
 
-    /// Usage-index skeleton: every identifier-like occurrence in the
-    /// implementation section, recorded unresolved (folded key + location).
-    /// Scope-aware resolution refines this later; until then the index
-    /// over-approximates ("candidate usages"), which is the safe direction
-    /// for find-references.
+    /// Emit a usage occurrence for one identifier-like lexeme (the flat
+    /// find-references skeleton — over-approximating, scope-unresolved). Called
+    /// for EVERY identifier token the impl-section pass steps over so the flat
+    /// `usages` index never regresses, regardless of the structure recognized on
+    /// top of it. Returns the folded key so callers can also key structure off it.
+    fn emit_impl_usage(&mut self, lexeme: Lexeme) -> Identifier {
+        let key = {
+            let text = self.identifier_text(lexeme);
+            self.cursor.state().context.intern_key(text)
+        };
+        self.cursor.state_mut().record_usage(crate::unit_cache::Usage {
+            symbol: key,
+            location: lexeme.location,
+        });
+        key
+    }
+
+    /// The implementation-section pass. Two jobs, run over the SAME token walk:
+    ///
+    /// 1. **Flat usage skeleton (never regressed).** Every identifier-like token
+    ///    from here to EOF becomes a `Usage` (folded key + location), exactly as
+    ///    the old flat scan did — this feeds find-references and must stay
+    ///    complete no matter what structure is (or is not) recognized.
+    /// 2. **Routine structure (best-effort, gated).** On top of that walk it
+    ///    recognizes implementation routine definitions
+    ///    (`procedure|function|constructor|destructor|operator [Owner.]Name(params)
+    ///    [: Ret]; <decl-part> begin … end;`), capturing each one's params,
+    ///    locals and whole-body span into `impl_scopes` so a later query can
+    ///    resolve a body-local variable/parameter to its declaration.
+    ///
+    /// SAFETY (never a wrong `body_span`): the impl-section grammar is large and
+    /// only partially modeled. The moment the structure recognizer meets a
+    /// construct it cannot confidently track — an `asm` block, an unexpected
+    /// token where a header/declaration was required, an unbalanced `end`, a
+    /// local `type` opening a `record`/`class`/`case` — it flips
+    /// `impl_scopes_reliable` false via [`crate::parse_state::UnitParseState::mark_impl_scopes_unreliable`]
+    /// and STOPS building structure, falling back to a pure usage scan to EOF.
+    /// The Stage-1 scope branch ignores `impl_scopes` entirely when the flag is
+    /// false, so a partially-built (and possibly mis-attributed) table is never
+    /// consulted. This gating is the key correctness mechanism.
     fn collect_implementation_usages(&mut self) -> Result<(), ParseError> {
+        // Structure-aware phase: keep recognizing routine definitions (and the
+        // section keywords that may sit between them) until we either reach EOF
+        // cleanly or hit a construct we do not model. On the latter we degrade.
+        loop {
+            let Some(peeked) = self.cursor.peek()? else {
+                // Clean EOF: the whole impl section was tracked. `reliable` stays
+                // true (its default).
+                return Ok(());
+            };
+            match peeked.token {
+                Token::Procedure
+                | Token::Function
+                | Token::Constructor
+                | Token::Destructor
+                | Token::Operator => {
+                    if !self.scan_impl_routine()? {
+                        // Recovery inside the routine: degrade to a flat scan.
+                        return self.flush_impl_usages();
+                    }
+                }
+                // A section keyword between routines (`var`/`const`/`type`/
+                // `threadvar`/`resourcestring`/`label`) at impl-section top level,
+                // or the terminating `initialization`/`finalization`/`begin`/
+                // `end.`: we do not model these regions structurally, but they do
+                // not by themselves invalidate the routines already captured —
+                // any body-local resolution keys off `body_span`, and these
+                // regions have no body span. So we simply flat-scan the REST of
+                // the impl section for usages, keeping the already-captured
+                // (fully-tracked) routines and their reliable flag intact.
+                _ => return self.flush_impl_usages(),
+            }
+        }
+    }
+
+    /// Flat usage scan from the current position to EOF (the fallback path):
+    /// emit a `Usage` for every identifier-like token, recognize no structure.
+    /// Used both after a clean run reaches a region we do not model AND after a
+    /// recovery (the caller has already marked scopes unreliable in the latter).
+    fn flush_impl_usages(&mut self) -> Result<(), ParseError> {
         while let Some(lexeme) = self.cursor.advance()? {
             if lexeme.token.can_be_identifier() {
-                let key = {
-                    let text = self.identifier_text(lexeme);
-                    self.cursor.state().context.intern_key(text)
-                };
-                self.cursor.state_mut().record_usage(crate::unit_cache::Usage {
-                    symbol: key,
-                    location: lexeme.location,
-                });
+                self.emit_impl_usage(lexeme);
             }
         }
         Ok(())
+    }
+
+    /// Parse ONE implementation routine definition, recording its structure into
+    /// `impl_scopes`. Returns `Ok(true)` when the routine was tracked cleanly and
+    /// `Ok(false)` when recovery was needed (the state's reliability flag is then
+    /// already cleared) — the caller degrades to a flat scan on `false`.
+    ///
+    /// Every identifier token stepped over still becomes a `Usage`. Nested
+    /// routines (declared in this routine's declaration part) recurse and get
+    /// their own `impl_scopes` entry; their body spans overlap this one's, which
+    /// is fine — a query picks the tightest cover.
+    fn scan_impl_routine(&mut self) -> Result<bool, ParseError> {
+        // Header keyword (`procedure`/…): its start anchors the whole body span.
+        let Some(keyword) = self.cursor.advance()? else {
+            return Ok(true);
+        };
+        let file = keyword.location.file;
+        let header_start = keyword.location.span.start;
+
+        // [Owner.]Name — a possibly-dotted routine name. The LAST part is the
+        // routine name; a leading part (if any) is the owner type. Every part is
+        // emitted as a usage (parity with the old flat scan).
+        let Some(first) = self.impl_take_name_part()? else {
+            // Not a name after the keyword — unmodeled. Degrade.
+            self.cursor.state_mut().mark_impl_scopes_unreliable();
+            return Ok(false);
+        };
+        let mut owner_type_key: Option<Identifier> = None;
+        let mut name = first;
+        while self.peek_token()? == Some(Token::Dot) {
+            self.cursor.advance()?; // '.'
+            owner_type_key = Some(name.key);
+            let Some(next) = self.impl_take_name_part()? else {
+                self.cursor.state_mut().mark_impl_scopes_unreliable();
+                return Ok(false);
+            };
+            name = next;
+        }
+
+        // Optional generic parameters on the method name (`procedure Foo<T>`).
+        // Their `<...>` names are captured as usages by the generic parser; a
+        // failure there degrades.
+        if self.peek_token()? == Some(Token::Lt) {
+            match self.parse_generic_parameters() {
+                Ok(_) => {}
+                Err(_) => {
+                    self.cursor.state_mut().mark_impl_scopes_unreliable();
+                    return Ok(false);
+                }
+            }
+        }
+
+        // Optional parameter list `( ... )`. Parse each param name + simple type
+        // key ourselves (so a param NAME is still emitted as a usage and captured
+        // as a `LocalDeclaration`), degrading on any shape we do not model.
+        let mut params = Vec::new();
+        if self.peek_token()? == Some(Token::LParen) {
+            self.cursor.advance()?; // '('
+            if !self.scan_impl_parameters(&mut params)? {
+                return Ok(false);
+            }
+        }
+
+        // Optional `: ReturnType` — a type reference; emit its identifier usages
+        // but do not otherwise model it. A method-resolution `= Name` or a
+        // trailing directive list follows up to the `;`.
+        // Skip everything up to the header-terminating `;` at paren depth 0,
+        // emitting usages. This absorbs the return type, calling conventions and
+        // other directives without needing to model each.
+        if !self.skip_impl_header_tail()? {
+            return Ok(false);
+        }
+
+        // A forward/external/… routine has NO body: `procedure Foo; forward;`.
+        // After the header `;`, if the next token is another routine keyword, a
+        // section keyword, or EOF, this routine has no local body — record it
+        // with an empty body region (its own header span) and return. We detect
+        // the body by requiring a `var`/`const`/`type`/`label`/`begin`/`asm`.
+        let mut locals = Vec::new();
+        loop {
+            match self.peek_token()? {
+                Some(Token::Var) | Some(Token::Const) | Some(Token::Type)
+                | Some(Token::Label) | Some(Token::ThreadVar) => {
+                    let section = self.cursor.advance()?.expect("peeked").token;
+                    if !self.scan_impl_declaration_section(section, &mut locals)? {
+                        return Ok(false);
+                    }
+                }
+                // A NESTED routine declared before this one's body.
+                Some(Token::Procedure) | Some(Token::Function)
+                | Some(Token::Constructor) | Some(Token::Destructor)
+                | Some(Token::Operator) => {
+                    if !self.scan_impl_routine()? {
+                        return Ok(false);
+                    }
+                }
+                Some(Token::Begin) => break,
+                Some(Token::Asm) => {
+                    // We do not model assembler bodies (their `end` pairing and
+                    // lexis differ). Degrade rather than risk a wrong span.
+                    self.cursor.state_mut().mark_impl_scopes_unreliable();
+                    return Ok(false);
+                }
+                // No body: a forward/external/interface-only routine header. Its
+                // structure carries no locals; record it spanning just the header
+                // so a cursor in the (nonexistent) body never mis-binds.
+                _ => {
+                    let body_span = Span::new(header_start as usize, name.location.span.end as usize);
+                    self.record_impl_routine(name, owner_type_key, body_span, params, locals);
+                    return Ok(true);
+                }
+            }
+        }
+
+        // Body: `begin … end`. Consume `begin`, then balance nested block openers
+        // to the matching `end`, emitting usages throughout.
+        let Some(body_end) = self.scan_impl_body()? else {
+            return Ok(false);
+        };
+        let body_span = Span::new(header_start as usize, body_end as usize);
+        let _ = file; // spans stay within the routine's own file
+        self.record_impl_routine(name, owner_type_key, body_span, params, locals);
+        // Consume the routine-terminating `;` after `end` so the caller's next
+        // peek lands on the following routine / section / `end.`, not this `;`.
+        if self.peek_token()? == Some(Token::Semicolon) {
+            self.cursor.advance()?;
+        }
+        Ok(true)
+    }
+
+    /// Record one fully-tracked routine into the parse state's `impl_scopes`.
+    fn record_impl_routine(
+        &mut self,
+        name: QualifiedName,
+        owner_type_key: Option<Identifier>,
+        body_span: Span,
+        params: Vec<crate::ast::LocalDeclaration>,
+        locals: Vec<crate::ast::LocalDeclaration>,
+    ) {
+        self.cursor
+            .state_mut()
+            .record_impl_routine(crate::ast::ImplRoutine {
+                name,
+                owner_type_key,
+                body_span,
+                params,
+                locals,
+            });
+    }
+
+    /// Take one identifier-like name part at the current position, emitting it as
+    /// a usage and returning it as a `QualifiedName` (single part). `None` when
+    /// the current token is not identifier-like (the caller degrades).
+    fn impl_take_name_part(&mut self) -> Result<Option<QualifiedName>, ParseError> {
+        let Some(lexeme) = self.cursor.peek()? else {
+            return Ok(None);
+        };
+        if !lexeme.token.can_be_identifier() {
+            return Ok(None);
+        }
+        self.cursor.advance()?;
+        let text = self.identifier_text(lexeme).to_string();
+        let name = self.cursor.state().context.intern(&text);
+        let key = self.cursor.state().context.intern_key(&text);
+        // Emit the usage (parity with the flat scan).
+        self.cursor.state_mut().record_usage(crate::unit_cache::Usage {
+            symbol: key,
+            location: lexeme.location,
+        });
+        Ok(Some(QualifiedName {
+            name,
+            key,
+            location: lexeme.location,
+        }))
+    }
+
+    /// Parse an implementation routine's parameter list body (the `(` already
+    /// consumed) up to and including the closing `)`. Captures each parameter
+    /// NAME as both a usage and a `LocalKind::Param` `LocalDeclaration`, plus a
+    /// simple type key when the parameter type is a plain reference. Returns
+    /// `Ok(false)` (after marking unreliable) on any shape it cannot track.
+    fn scan_impl_parameters(
+        &mut self,
+        params: &mut Vec<crate::ast::LocalDeclaration>,
+    ) -> Result<bool, ParseError> {
+        use crate::ast::{LocalDeclaration, LocalKind};
+        if self.peek_token()? == Some(Token::RParen) {
+            self.cursor.advance()?;
+            return Ok(true);
+        }
+        loop {
+            // Optional attributes + modifier (`const`/`var`/`out`) — skip them.
+            while self.peek_token()? == Some(Token::LBracket) {
+                if !self.skip_bracketed()? {
+                    return Ok(self.degrade());
+                }
+            }
+            match self.peek_token()? {
+                Some(Token::Var) | Some(Token::Const) | Some(Token::Out) => {
+                    self.cursor.advance()?;
+                }
+                _ => {}
+            }
+            while self.peek_token()? == Some(Token::LBracket) {
+                if !self.skip_bracketed()? {
+                    return Ok(self.degrade());
+                }
+            }
+            // One or more comma-separated names sharing a type.
+            let mut group: Vec<QualifiedName> = Vec::new();
+            loop {
+                let Some(part) = self.impl_take_name_part()? else {
+                    return Ok(self.degrade());
+                };
+                group.push(part);
+                if self.peek_token()? == Some(Token::Comma) {
+                    self.cursor.advance()?;
+                    continue;
+                }
+                break;
+            }
+            // Optional `: Type`.
+            let mut type_key = None;
+            if self.peek_token()? == Some(Token::Colon) {
+                self.cursor.advance()?;
+                type_key = self.scan_impl_simple_type_then_skip(&[Token::Semicolon, Token::RParen])?;
+            }
+            // Optional `= default` — skip its expression to `;`/`)`.
+            if self.peek_token()? == Some(Token::Eq) {
+                self.cursor.advance()?;
+                if !self.skip_impl_expression(&[Token::Semicolon, Token::RParen])? {
+                    return Ok(self.degrade());
+                }
+            }
+            for member in group {
+                params.push(LocalDeclaration {
+                    name: member,
+                    decl_kind: LocalKind::Param,
+                    type_key,
+                });
+            }
+            match self.peek_token()? {
+                Some(Token::Semicolon) => {
+                    self.cursor.advance()?;
+                }
+                Some(Token::RParen) => {
+                    self.cursor.advance()?;
+                    return Ok(true);
+                }
+                _ => return Ok(self.degrade()),
+            }
+        }
+    }
+
+    /// Parse a `var`/`const`/`type`/`label`/`threadvar` declaration section in a
+    /// routine's declaration part, capturing each declared NAME as a
+    /// `LocalDeclaration` (and a usage). The section keyword is already consumed.
+    /// Ends (without consuming) at the next `begin`/`asm`/routine keyword or a
+    /// construct it cannot model. Returns `Ok(false)` (unreliable) on a local
+    /// `type` opening a structured type, a `label` we cannot read, etc.
+    fn scan_impl_declaration_section(
+        &mut self,
+        section: Token,
+        locals: &mut Vec<crate::ast::LocalDeclaration>,
+    ) -> Result<bool, ParseError> {
+        use crate::ast::{LocalDeclaration, LocalKind};
+        let decl_kind = match section {
+            Token::Var | Token::ThreadVar => LocalKind::Var,
+            Token::Const => LocalKind::Const,
+            Token::Type => LocalKind::Type,
+            Token::Label => LocalKind::Label,
+            _ => return Ok(self.degrade()),
+        };
+        // A `label` section is a comma-separated list of label identifiers ending
+        // at `;`. We do not model gotos; capture the names then finish.
+        if matches!(section, Token::Label) {
+            loop {
+                let Some(part) = self.impl_take_name_part()? else {
+                    return Ok(self.degrade());
+                };
+                locals.push(LocalDeclaration {
+                    name: part,
+                    decl_kind,
+                    type_key: None,
+                });
+                match self.peek_token()? {
+                    Some(Token::Comma) => {
+                        self.cursor.advance()?;
+                    }
+                    Some(Token::Semicolon) => {
+                        self.cursor.advance()?;
+                        return Ok(true);
+                    }
+                    _ => return Ok(self.degrade()),
+                }
+            }
+        }
+
+        // `var`/`const`/`type`: a run of declarations until the next section
+        // keyword / body opener / routine keyword.
+        loop {
+            match self.peek_token()? {
+                Some(Token::Begin) | Some(Token::Asm) | Some(Token::Procedure)
+                | Some(Token::Function) | Some(Token::Constructor)
+                | Some(Token::Destructor) | Some(Token::Operator) | Some(Token::Var)
+                | Some(Token::Const) | Some(Token::Type) | Some(Token::Label)
+                | Some(Token::ThreadVar) => return Ok(true),
+                Some(token) if token.can_be_identifier() => {
+                    if !self.scan_impl_single_declaration(decl_kind, locals)? {
+                        return Ok(false);
+                    }
+                }
+                // Anything else in a declaration position is unmodeled.
+                _ => return Ok(self.degrade()),
+            }
+        }
+    }
+
+    /// One `Name[, Name…] : Type ;` var/type declaration or `Name = value ;`
+    /// const/type declaration. Captures the names, a simple type key for the
+    /// typed form, and — critically — DEGRADES if the right-hand side opens a
+    /// structured type (`record`/`class`/`case`/`object`/`interface`) or an
+    /// unexpected construct, since our body/`end` tracking does not model those.
+    fn scan_impl_single_declaration(
+        &mut self,
+        decl_kind: crate::ast::LocalKind,
+        locals: &mut Vec<crate::ast::LocalDeclaration>,
+    ) -> Result<bool, ParseError> {
+        use crate::ast::{LocalDeclaration, LocalKind};
+        // Names (comma-separated for var; a const/type declares a single name).
+        let mut group: Vec<QualifiedName> = Vec::new();
+        loop {
+            let Some(part) = self.impl_take_name_part()? else {
+                return Ok(self.degrade());
+            };
+            group.push(part);
+            if self.peek_token()? == Some(Token::Comma) {
+                self.cursor.advance()?;
+                continue;
+            }
+            break;
+        }
+
+        let mut type_key = None;
+        match self.peek_token()? {
+            Some(Token::Colon) => {
+                self.cursor.advance()?;
+                // Reject structured local types up front (they contain their own
+                // `end`, which our body balancer would miscount).
+                if self.impl_type_is_structured()? {
+                    return Ok(self.degrade());
+                }
+                type_key = self.scan_impl_simple_type_then_skip(&[Token::Semicolon])?;
+                // A typed var may carry `= value` / `absolute X`; skip to `;`.
+                if self.peek_token()? != Some(Token::Semicolon) {
+                    if !self.skip_impl_expression(&[Token::Semicolon])? {
+                        return Ok(self.degrade());
+                    }
+                }
+            }
+            Some(Token::Eq) => {
+                // `const Name = expr;` or `type Name = Ref;`. Reject a structured
+                // right-hand side; otherwise skip the value to `;`.
+                self.cursor.advance()?;
+                if self.impl_type_is_structured()? {
+                    return Ok(self.degrade());
+                }
+                if matches!(decl_kind, LocalKind::Type) {
+                    type_key = self.scan_impl_simple_type_then_skip(&[Token::Semicolon])?;
+                    if self.peek_token()? != Some(Token::Semicolon) {
+                        if !self.skip_impl_expression(&[Token::Semicolon])? {
+                            return Ok(self.degrade());
+                        }
+                    }
+                } else if !self.skip_impl_expression(&[Token::Semicolon])? {
+                    return Ok(self.degrade());
+                }
+            }
+            _ => return Ok(self.degrade()),
+        }
+        if self.peek_token()? == Some(Token::Semicolon) {
+            self.cursor.advance()?;
+        } else {
+            return Ok(self.degrade());
+        }
+        let _ = LocalKind::Var;
+        for member in group {
+            locals.push(LocalDeclaration {
+                name: member,
+                decl_kind,
+                type_key,
+            });
+        }
+        Ok(true)
+    }
+
+    /// Peek whether the type at the current position opens a STRUCTURED type we
+    /// do not model in the impl pass (`record`/`class`/`object`/`interface`/
+    /// `case`/`packed`/`dispinterface`). Does not consume.
+    fn impl_type_is_structured(&mut self) -> Result<bool, ParseError> {
+        Ok(matches!(
+            self.peek_token()?,
+            Some(Token::Record)
+                | Some(Token::Class)
+                | Some(Token::Object)
+                | Some(Token::Interface)
+                | Some(Token::DispInterface)
+                | Some(Token::Case)
+                | Some(Token::Packed)
+        ))
+    }
+
+    /// Read a SIMPLE type reference (a plain possibly-dotted name) at the current
+    /// position, returning its last-part key, then skip any remaining type tail
+    /// (array bounds, generics, `of T`, …) up to but not consuming one of
+    /// `stops`, emitting usages. Returns `None` type key for a non-simple type
+    /// (but still consumes to the stop). Emits usages for every identifier.
+    fn scan_impl_simple_type_then_skip(
+        &mut self,
+        stops: &[Token],
+    ) -> Result<Option<Identifier>, ParseError> {
+        // A leading plain identifier (possibly dotted) is a simple reference; if
+        // the very next token after the (dotted) name is a stop, it is a pure
+        // simple type and we return its key. Otherwise it has a tail we skip.
+        let mut type_key = None;
+        let mut is_pure = true;
+        if let Some(lexeme) = self.cursor.peek()? {
+            if lexeme.token.can_be_identifier() {
+                let key = self.impl_take_name_part()?.map(|part| part.key);
+                type_key = key;
+                // dotted continuation
+                while self.peek_token()? == Some(Token::Dot) {
+                    self.cursor.advance()?;
+                    match self.impl_take_name_part()? {
+                        Some(part) => type_key = Some(part.key),
+                        None => {
+                            is_pure = false;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                is_pure = false;
+            }
+        }
+        // If the next token is already a stop, it was a pure simple reference.
+        if is_pure {
+            if let Some(peeked) = self.peek_token()? {
+                if stops.contains(&peeked) {
+                    return Ok(type_key);
+                }
+            } else {
+                return Ok(type_key);
+            }
+        }
+        // A tail (generics, array bounds, `= default`, `absolute`…) follows the
+        // name, or the type was not a plain reference: skip to a stop, emitting
+        // usages, and report no simple key.
+        if !self.skip_impl_expression(stops)? {
+            return Ok(None);
+        }
+        Ok(None)
+    }
+
+    /// Skip the routine-header tail after the parameter list: an optional
+    /// `: ReturnType`, a method-resolution `= Name`, and any trailing directive
+    /// list, up to and INCLUDING the header-terminating `;`. Emits usages for
+    /// every identifier. Returns `Ok(false)` (unreliable) if it cannot find the
+    /// terminating `;` at bracket depth 0 before EOF or a body opener.
+    fn skip_impl_header_tail(&mut self) -> Result<bool, ParseError> {
+        let mut bracket_depth = 0usize;
+        loop {
+            let Some(lexeme) = self.cursor.peek()? else {
+                return Ok(self.degrade());
+            };
+            match lexeme.token {
+                Token::Semicolon if bracket_depth == 0 => {
+                    self.cursor.advance()?;
+                    return Ok(true);
+                }
+                Token::LParen | Token::LBracket => {
+                    bracket_depth += 1;
+                    self.cursor.advance()?;
+                }
+                Token::RParen | Token::RBracket => {
+                    bracket_depth = bracket_depth.saturating_sub(1);
+                    self.cursor.advance()?;
+                }
+                // A body opener before a `;` means the header was malformed for
+                // our model — degrade.
+                Token::Begin | Token::Asm if bracket_depth == 0 => {
+                    return Ok(self.degrade());
+                }
+                other => {
+                    self.cursor.advance()?;
+                    if other.can_be_identifier() {
+                        self.emit_impl_usage(lexeme);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Consume `begin`, then balance nested block openers to the MATCHING `end`,
+    /// emitting a usage for every identifier stepped over. Returns the byte
+    /// offset just past the terminating `end` (the body-span end), or `None`
+    /// (after marking unreliable) if the body contains a construct we cannot
+    /// balance (`asm`) or hits EOF before closing.
+    ///
+    /// Block openers that require a matching `end`: `begin`, `case`, `try`,
+    /// `record`/`object`/`class`/`interface`/`dispinterface` (inline anonymous
+    /// types are not modeled → degrade), plus `end`-terminated `class`/`record`
+    /// helper blocks. We degrade on any inline structured-type / `asm` opener
+    /// rather than risk mispairing.
+    fn scan_impl_body(&mut self) -> Result<Option<u32>, ParseError> {
+        // Consume `begin`.
+        self.cursor.advance()?;
+        let mut depth = 1usize;
+        loop {
+            let Some(lexeme) = self.cursor.advance()? else {
+                self.degrade();
+                return Ok(None);
+            };
+            match lexeme.token {
+                Token::Begin | Token::Case | Token::Try => depth += 1,
+                Token::End => {
+                    depth -= 1;
+                    if depth == 0 {
+                        // Body-span end = just past this `end` (its `;` follows).
+                        return Ok(Some(lexeme.location.span.end));
+                    }
+                }
+                // Constructs whose `end` pairing our simple counter cannot model
+                // reliably inside a statement body: an inline `asm … end`, or an
+                // anonymous method / inline record — degrade to be safe.
+                Token::Asm
+                | Token::Record
+                | Token::Class
+                | Token::Object
+                | Token::Interface
+                | Token::DispInterface => {
+                    self.degrade();
+                    return Ok(None);
+                }
+                other => {
+                    if other.can_be_identifier() {
+                        self.emit_impl_usage(lexeme);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Skip an expression / value up to (not consuming) one of `stops` at bracket
+    /// depth 0, emitting usages for identifiers. Returns `Ok(false)` (unreliable)
+    /// on EOF before a stop or on a structured-type / body opener at depth 0.
+    fn skip_impl_expression(&mut self, stops: &[Token]) -> Result<bool, ParseError> {
+        let mut bracket_depth = 0usize;
+        loop {
+            let Some(lexeme) = self.cursor.peek()? else {
+                return Ok(self.degrade());
+            };
+            if bracket_depth == 0 && stops.contains(&lexeme.token) {
+                return Ok(true);
+            }
+            match lexeme.token {
+                Token::LParen | Token::LBracket => {
+                    bracket_depth += 1;
+                    self.cursor.advance()?;
+                }
+                Token::RParen | Token::RBracket => {
+                    bracket_depth = bracket_depth.saturating_sub(1);
+                    self.cursor.advance()?;
+                }
+                Token::Record | Token::Class | Token::Object | Token::Interface
+                | Token::DispInterface | Token::Case | Token::Begin | Token::Asm
+                    if bracket_depth == 0 =>
+                {
+                    return Ok(self.degrade());
+                }
+                other => {
+                    self.cursor.advance()?;
+                    if other.can_be_identifier() {
+                        self.emit_impl_usage(lexeme);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Skip a `[ ... ]` bracket group (already at the `[`), emitting usages.
+    /// Returns false (unreliable) on EOF before the matching `]`.
+    fn skip_bracketed(&mut self) -> Result<bool, ParseError> {
+        self.cursor.advance()?; // '['
+        let mut depth = 1usize;
+        while depth > 0 {
+            let Some(lexeme) = self.cursor.advance()? else {
+                return Ok(self.degrade());
+            };
+            match lexeme.token {
+                Token::LBracket => depth += 1,
+                Token::RBracket => depth -= 1,
+                other => {
+                    if other.can_be_identifier() {
+                        self.emit_impl_usage(lexeme);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Mark the impl-scope structure pass unreliable and return `false` — a
+    /// terse helper for the many degrade sites (`return Ok(self.degrade())`).
+    fn degrade(&mut self) -> bool {
+        self.cursor.state_mut().mark_impl_scopes_unreliable();
+        false
     }
 
     // program Name; [uses ...] <block> end.
@@ -5037,6 +5729,135 @@ mod tests {
         assert!(
             matches!(error, ParseError::Cursor(CursorError::Directive(_))),
             "expected a directive-structure error, got: {error:?}"
+        );
+    }
+
+    // ─── Stage 0: implementation-section routine structure (impl_scopes) ──────
+
+    fn key(text: &str) -> crate::context::Identifier {
+        crate::globals::intern_key(text)
+    }
+
+    /// A qualified method with two typed locals: one `ImplRoutine`, the owner
+    /// type key, both locals with correct keys/spans and simple type keys, and a
+    /// body span covering the body. The flat `usages` must still be emitted, and
+    /// the reliability flag must be true.
+    #[test]
+    fn impl_scope_captures_method_owner_and_locals() {
+        let source = "unit U;\ninterface\nimplementation\n\
+             procedure TThing.Run;\nvar\n  Local: TThing;\n  Count: Integer;\nbegin\n  Local.Count := Count;\nend;\nend.";
+        let outcome = parse_outcome(source);
+
+        assert!(outcome.impl_scopes_reliable, "clean pass stays reliable");
+        assert_eq!(outcome.impl_scopes.len(), 1, "one routine captured");
+        let routine = &outcome.impl_scopes[0];
+        assert_eq!(routine.owner_type_key, Some(key("TThing")));
+        assert_eq!(routine.name.key, key("Run"));
+        assert!(routine.params.is_empty(), "no parameters");
+        assert_eq!(routine.locals.len(), 2);
+
+        let local = &routine.locals[0];
+        assert_eq!(local.name.key, key("Local"));
+        assert_eq!(local.decl_kind, crate::ast::LocalKind::Var);
+        assert_eq!(local.type_key, Some(key("TThing")));
+        // the span is the declaring occurrence of `Local`
+        let local_span = local.name.location.span;
+        assert_eq!(&source[local_span.start as usize..local_span.end as usize], "Local");
+
+        let count = &routine.locals[1];
+        assert_eq!(count.name.key, key("Count"));
+        assert_eq!(count.type_key, Some(key("Integer")));
+
+        // body_span covers the `begin … end` body (the `Local.Count` statement).
+        let body = routine.body_span;
+        let body_text = &source[body.start as usize..body.end as usize];
+        assert!(body_text.starts_with("procedure"), "body span starts at header keyword");
+        assert!(body_text.trim_end().ends_with("end"), "body span ends at terminating end: {body_text:?}");
+        let stmt_offset = source.find("Local.Count := Count").unwrap() as u32;
+        assert!(
+            body.start <= stmt_offset && stmt_offset < body.end,
+            "the statement offset is inside the body span"
+        );
+
+        // flat usages still emitted (no regression): TThing/Local/Count present.
+        let usage_keys: Vec<_> = outcome.usages.iter().map(|u| u.symbol).collect();
+        assert!(usage_keys.contains(&key("TThing")));
+        assert!(usage_keys.contains(&key("Local")));
+        assert!(usage_keys.contains(&key("Count")));
+    }
+
+    /// A routine with parameters: each param becomes a `LocalKind::Param`
+    /// declaration with its simple type key.
+    #[test]
+    fn impl_scope_captures_parameters() {
+        let source = "unit U;\ninterface\nimplementation\n\
+             function Add(const A: Integer; B: Integer): Integer;\nbegin\n  Result := A + B;\nend;\nend.";
+        let outcome = parse_outcome(source);
+        assert!(outcome.impl_scopes_reliable);
+        assert_eq!(outcome.impl_scopes.len(), 1);
+        let routine = &outcome.impl_scopes[0];
+        assert_eq!(routine.name.key, key("Add"));
+        assert_eq!(routine.params.len(), 2);
+        assert_eq!(routine.params[0].name.key, key("A"));
+        assert_eq!(routine.params[0].decl_kind, crate::ast::LocalKind::Param);
+        assert_eq!(routine.params[0].type_key, Some(key("Integer")));
+        assert_eq!(routine.params[1].name.key, key("B"));
+        assert_eq!(routine.params[1].type_key, Some(key("Integer")));
+    }
+
+    /// A nested routine (declared in another routine's declaration part) produces
+    /// a SECOND `ImplRoutine` entry; the spans overlap (outer covers inner).
+    #[test]
+    fn impl_scope_nested_routine_second_entry() {
+        let source = "unit U;\ninterface\nimplementation\n\
+             procedure Outer;\n\
+             var OuterLocal: Integer;\n\
+             procedure Inner;\n  var InnerLocal: Integer;\n  begin\n    InnerLocal := 1;\n  end;\n\
+             begin\n  Outer;\nend;\nend.";
+        let outcome = parse_outcome(source);
+        assert!(outcome.impl_scopes_reliable, "nested routines are modeled");
+        assert_eq!(outcome.impl_scopes.len(), 2, "outer + inner");
+        // Inner is recorded first (it finishes before the outer body).
+        let inner = outcome.impl_scopes.iter().find(|r| r.name.key == key("Inner")).unwrap();
+        let outer = outcome.impl_scopes.iter().find(|r| r.name.key == key("Outer")).unwrap();
+        assert_eq!(inner.locals.len(), 1);
+        assert_eq!(inner.locals[0].name.key, key("InnerLocal"));
+        assert_eq!(outer.locals.len(), 1);
+        assert_eq!(outer.locals[0].name.key, key("OuterLocal"));
+        // Overlap: the outer body span contains the inner body span.
+        assert!(
+            outer.body_span.start <= inner.body_span.start
+                && inner.body_span.end <= outer.body_span.end,
+            "outer body span must contain the nested inner body span"
+        );
+    }
+
+    /// A malformed / unmodeled body (`asm`) sets `impl_scopes_reliable == false`
+    /// so no scope resolution trusts a possibly-wrong body span. The flat usages
+    /// are still emitted.
+    #[test]
+    fn impl_scope_asm_body_degrades_reliability() {
+        let source = "unit U;\ninterface\nimplementation\n\
+             procedure Fast;\nasm\n  NOP\nend;\nend.";
+        let outcome = parse_outcome(source);
+        assert!(
+            !outcome.impl_scopes_reliable,
+            "an asm body we do not model must flip the reliability flag"
+        );
+        // usages still flow (NOP identifier present).
+        assert!(outcome.usages.iter().any(|u| u.symbol == key("NOP")));
+    }
+
+    /// A local `type` opening a structured (`record`) type also degrades — our
+    /// body/`end` balancer does not model the type's own `end`.
+    #[test]
+    fn impl_scope_local_structured_type_degrades() {
+        let source = "unit U;\ninterface\nimplementation\n\
+             procedure P;\ntype TRec = record\n  X: Integer;\nend;\nvar R: TRec;\nbegin\n  R.X := 1;\nend;\nend.";
+        let outcome = parse_outcome(source);
+        assert!(
+            !outcome.impl_scopes_reliable,
+            "a local structured type must degrade reliability"
         );
     }
 }

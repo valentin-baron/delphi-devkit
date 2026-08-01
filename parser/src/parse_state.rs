@@ -146,6 +146,13 @@ pub struct UnitParseState {
     /// Identifier occurrences collected from the implementation section
     /// (usage index skeleton — unresolved, key + location).
     usages: Vec<crate::unit_cache::Usage>,
+    /// Implementation-section routine structure (params/locals per body), for
+    /// same-unit local resolution. Filled by the structure-aware impl pass.
+    impl_scopes: Vec<crate::ast::ImplRoutine>,
+    /// True while the impl-section structure pass is still fully trusted. Flipped
+    /// false on ANY recovery in that pass (an unmodeled construct, an unexpected
+    /// token, unbalanced `end`); consumers then ignore `impl_scopes`.
+    impl_scopes_reliable: bool,
     /// Serves `Declared()`/`SizeOf()` requests for imported units. `None`
     /// = no import resolution available; those queries answer Unknown.
     pub loader: Option<Rc<dyn InterfaceLoader>>,
@@ -171,6 +178,8 @@ impl UnitParseState {
             own_type_expressions: std::collections::HashMap::new(),
             dependencies: Vec::new(),
             usages: Vec::new(),
+            impl_scopes: Vec::new(),
+            impl_scopes_reliable: true,
             loader: None,
             cycle_tainted: false,
             context,
@@ -323,6 +332,28 @@ impl UnitParseState {
 
     pub fn take_usages(&mut self) -> Vec<crate::unit_cache::Usage> {
         std::mem::take(&mut self.usages)
+    }
+
+    /// Record one fully-parsed implementation-section routine (its params,
+    /// locals and body span) for same-unit local resolution.
+    pub fn record_impl_routine(&mut self, routine: crate::ast::ImplRoutine) {
+        self.impl_scopes.push(routine);
+    }
+
+    /// Mark the implementation-section structure pass as having recovered from a
+    /// construct it does not confidently model — consumers must then ignore
+    /// `impl_scopes` (never a wrong local attribution).
+    pub fn mark_impl_scopes_unreliable(&mut self) {
+        self.impl_scopes_reliable = false;
+    }
+
+    /// True while the impl-section structure pass is still fully trusted.
+    pub fn impl_scopes_reliable(&self) -> bool {
+        self.impl_scopes_reliable
+    }
+
+    pub fn take_impl_scopes(&mut self) -> Vec<crate::ast::ImplRoutine> {
+        std::mem::take(&mut self.impl_scopes)
     }
 
     // ─── Conditional compilation ─────────────────────────────────────────

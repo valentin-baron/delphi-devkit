@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{context::Identifier, meta::CodeLocation};
+use crate::{
+    context::Identifier,
+    meta::{CodeLocation, Span},
+};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Source {
@@ -366,4 +369,56 @@ pub struct InClause {
     /// Unquoted path text, display-interned verbatim (paths keep their case).
     pub path: Identifier,
     pub location: CodeLocation,
+}
+
+// ─── Implementation-section routine structure (same-unit local resolution) ──
+//
+// The implementation section is otherwise a flat token scan (its identifiers
+// become bare `Usage` occurrences). These types add just enough STRUCTURE to
+// resolve a local variable / parameter to its own declaration WITHIN the routine
+// body it sits in — no expression parse, no type resolution beyond a trivial
+// simple-reference type key. Every field is a span or a declaration key, in
+// keeping with the "AST carries no strings / expressions are spans" invariant.
+
+/// What a body-local declaration is. Distinguishes the declaration part kinds a
+/// routine body may open (`var`/`const`/`type`/`label`) from a parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LocalKind {
+    Var,
+    Const,
+    Type,
+    Param,
+    Label,
+}
+
+/// One local variable, constant, type, label or parameter declared inside a
+/// routine. `name` gives both the lookup key and the exact source span of the
+/// declaring occurrence (`QualifiedName` carries `key` + `location`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalDeclaration {
+    /// The declared name — its folded lookup key and its own declaration span.
+    pub name: QualifiedName,
+    pub decl_kind: LocalKind,
+    /// The declared type as a SIMPLE reference key (`Local: TThing` → `TThing`),
+    /// else `None` for an anonymous/complex/absent type. Captured only when
+    /// trivial; a later stage refines it.
+    pub type_key: Option<Identifier>,
+}
+
+/// One implementation-section routine, with enough structure to resolve a body
+/// position to an enclosing routine and thence to its params/locals.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImplRoutine {
+    /// The routine header name and its source span (`procedure TThing.Run` →
+    /// the `Run` occurrence).
+    pub name: QualifiedName,
+    /// `Some(TThing)` for a qualified `procedure TThing.Run`; `None` for a free
+    /// routine.
+    pub owner_type_key: Option<Identifier>,
+    /// The WHOLE routine span, from its header keyword through the terminating
+    /// `end` — a body position is enclosed when it falls inside this span. For
+    /// nested routines the tightest-covering span wins (spans may overlap).
+    pub body_span: Span,
+    pub params: Vec<LocalDeclaration>,
+    pub locals: Vec<LocalDeclaration>,
 }

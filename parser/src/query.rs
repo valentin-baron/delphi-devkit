@@ -32,6 +32,12 @@ pub enum TargetKind {
     /// scopes, so this is a candidate identity (its folded key), not a proven
     /// binding.
     Usage,
+    /// A body-local variable or parameter resolved WITHIN its enclosing
+    /// implementation routine (same-unit scope). Its `location` is the local's
+    /// own declaration span, so definition/hover answer directly from the target
+    /// without a further interface lookup — and a body-local of this kind
+    /// SHADOWS a same-named interface symbol (the scope branch runs first).
+    Local,
 }
 
 /// The identifier occurrence under a byte position: the folded lookup key, its

@@ -102,8 +102,11 @@ pub fn resolve_definition_locations(
     unit_key: delphi_parser::context::Identifier,
     offset: u32,
 ) -> Option<Vec<Location>> {
-    let target = session.symbol_at(unit_key, offset)?;
-    let locations = session.definition(unit_key, target.key, target.owner_type);
+    // Position-aware so a body-local variable/parameter resolves to its own
+    // declaration (the key-based `definition` cannot see scope). Non-local
+    // targets delegate to the same key-based resolution as before.
+    let _ = session.symbol_at(unit_key, offset)?; // nothing under cursor → None
+    let locations = session.definition_at(unit_key, offset);
     let mapped: Vec<Location> = locations
         .into_iter()
         .filter_map(|location| code_location_to_lsp(session, location))

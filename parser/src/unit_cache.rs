@@ -23,7 +23,7 @@ use crate::meta::CodeLocation;
 use crate::parser::ParseError;
 use crate::unit_meta::UnitMeta;
 
-const CACHE_FORMAT_VERSION: u32 = 13;
+const CACHE_FORMAT_VERSION: u32 = 14;
 /// Default RAM cap for the in-memory AST cache. Lowered from 512MiB to 256MiB
 /// for an EDITOR workload (Task 16 D): the disk-backed cache means an evicted
 /// unit reloads cheaply from its per-unit file instead of re-parsing, so a
@@ -1046,9 +1046,9 @@ mod tests {
         // segment of bytes that would NOT decode under the current `UnitMeta`
         // layout. The version guard must reject before any segment is touched,
         // so these bytes are never even reached.
-        assert_eq!(CACHE_FORMAT_VERSION, 13, "update this test on a format bump");
+        assert_eq!(CACHE_FORMAT_VERSION, 14, "update this test on a format bump");
         let stale = SavedCacheDisk {
-            version: 12,
+            version: 13,
             units: vec![vec![0xDE, 0xAD, 0xBE, 0xEF]],
         };
         std::fs::write(&snapshot, bincode::serialize(&stale).unwrap()).unwrap();
@@ -1058,8 +1058,8 @@ mod tests {
         let error = result.expect_err("an old-version snapshot must be rejected");
         // the message names both the found and expected versions
         assert!(
-            error.message.contains("12") && error.message.contains("13"),
-            "version-mismatch message must name found (12) and expected (13): {}",
+            error.message.contains("13") && error.message.contains("14"),
+            "version-mismatch message must name found (13) and expected (14): {}",
             error.message
         );
     }

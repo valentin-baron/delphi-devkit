@@ -524,6 +524,18 @@ impl ProjectSession {
     /// authoritative identity is the declaration).
     pub fn symbol_at(&self, unit_key: Identifier, position: u32) -> Option<QueryTarget> {
         let meta = self.meta_of(unit_key)?;
+
+        // SCOPE FIRST (shadowing): a body-local variable/parameter in the
+        // enclosing implementation routine wins over any same-named interface
+        // symbol. Only consulted when the impl-section structure pass was fully
+        // reliable — a degraded pass falls through to today's behavior (never a
+        // wrong local attribution). Outside any routine body this finds nothing
+        // and also falls through, so an interface symbol used outside a body
+        // still resolves to the interface.
+        if let Some(local) = self.local_at(&meta, position) {
+            return Some(local);
+        }
+
         let interface = meta.interface();
 
         // Prefer a declaration/member site (most specific identity).
@@ -562,6 +574,118 @@ impl ProjectSession {
                 location: usage.location,
                 owner_type: None,
             })
+    }
+
+    /// Resolve `position` to a body-local variable/parameter of the enclosing
+    /// implementation routine, if any. Same-unit only (never a cross-unit load).
+    ///
+    /// Gating (never a wrong answer): returns `None` immediately when the unit's
+    /// impl-section structure pass was not fully reliable — a degraded pass may
+    /// carry a mis-attributed `body_span`, so we resolve nothing and let the
+    /// caller fall through to today's interface/usage logic.
+    ///
+    /// Enclosing routine = the `ImplRoutine` whose `body_span` covers `position`;
+    /// for nested routines the TIGHTEST-covering (smallest span) wins. Within it,
+    /// a match is either: the cursor sits directly on a param/local's own
+    /// declaration span, OR the identifier under the cursor (found via the flat
+    /// usage index at this position) has the folded key of one of the routine's
+    /// params/locals. Either way the returned `location` is the DECLARATION's own
+    /// span, and the target `kind` is [`TargetKind::Local`].
+    fn local_at(&self, meta: &UnitMeta, position: u32) -> Option<QueryTarget> {
+        if !meta.impl_scopes_reliable {
+            return None;
+        }
+        // ALL enclosing routines whose body covers `position`, ordered
+        // TIGHTEST→WIDEST (ascending body-span length). Nested routines overlap;
+        // this models lexical scoping — an inner routine's param/local shadows an
+        // outer routine's same-named one, and (Bug 2) an OUTER routine's local is
+        // still found before the query falls through to an interface symbol.
+        let mut covering_routines: Vec<&crate::ast::ImplRoutine> = meta
+            .impl_scopes
+            .iter()
+            .filter(|routine| {
+                let span = routine.body_span;
+                span.start <= position && position < span.end
+            })
+            .collect();
+        covering_routines.sort_by_key(|routine| routine.body_span.len());
+        if covering_routines.is_empty() {
+            return None;
+        }
+
+        // 1. Cursor directly on a param/local declaration span. Walk tightest→
+        // widest; the first covering routine that owns the declaration wins.
+        for routine in &covering_routines {
+            for declaration in routine.params.iter().chain(routine.locals.iter()) {
+                if span_covers(declaration.name.location, position) {
+                    return Some(local_target(declaration));
+                }
+            }
+        }
+
+        // 2. Cursor on a body identifier whose key matches a param/local. Find
+        // the identifier key at this position from the flat usage index (the
+        // same source `symbol_at`'s usage branch uses), then match by folded key.
+        let occurrence = meta
+            .usages
+            .iter()
+            .filter(|usage| span_covers(usage.location, position))
+            .min_by_key(|usage| usage.location.span.len())?;
+
+        // Bug 1 (never a WRONG answer): a MEMBER access such as `SomeObj.Value`
+        // must NOT bind to a scope local named `Value` — `.Value` is SomeObj's
+        // member, not the routine's local. Skip the key match when the occurrence
+        // is immediately preceded (modulo whitespace) by a `.`. The guard errs
+        // toward "possibly a member" (skip the local) whenever the buffer cannot
+        // prove the identifier is NOT dotted, so we never mis-bind a member.
+        if self.occurrence_is_member_access(occurrence.location.file, occurrence.location.span.start)
+        {
+            return None;
+        }
+        let occurrence_key = occurrence.symbol;
+
+        // Match tightest→widest so an inner routine's local shadows an outer's.
+        for routine in &covering_routines {
+            if let Some(declaration) = routine
+                .params
+                .iter()
+                .chain(routine.locals.iter())
+                .find(|declaration| declaration.name.key == occurrence_key)
+            {
+                return Some(local_target(declaration));
+            }
+        }
+        None
+    }
+
+    /// Whether the identifier starting at byte `ident_start` in `file` is a
+    /// MEMBER access — i.e. the last non-whitespace character in the source
+    /// *before* `ident_start` is a `.` (as in `SomeObj.Value`). Mirrors
+    /// [`Self::dot_precedes`]'s buffer/char-boundary guards.
+    ///
+    /// Safe default (never a wrong answer): the caller uses this to REJECT a
+    /// scope-local bind for a member access. So any case where we cannot PROVE
+    /// the identifier is not dotted — an unreadable buffer, an out-of-range or
+    /// char-boundary-splitting offset — returns `true` ("possibly a member"),
+    /// causing the caller to skip the local. We only return `false` (allow the
+    /// local bind) when the buffer is readable AND the preceding non-whitespace
+    /// character is provably not a `.`.
+    fn occurrence_is_member_access(&self, file: FileId, ident_start: u32) -> bool {
+        let Ok(content) = self.arena.content(file) else {
+            // Can't read the buffer → cannot prove it is NOT a member → treat as
+            // a possible member and skip the local (conservative).
+            return true;
+        };
+        let end = ident_start as usize;
+        // An out-of-range or non-char-boundary offset is a stale/foreign span;
+        // we cannot trust it, so treat as a possible member.
+        if end > content.len() || !content.is_char_boundary(end) {
+            return true;
+        }
+        // The last non-whitespace char before the identifier decides it. When
+        // nothing precedes it (start of buffer, or only whitespace), it is NOT a
+        // member access → allow the local bind.
+        matches!(content[..end].trim_end().chars().next_back(), Some('.'))
     }
 
     /// Declaration site(s) of a symbol. Resolution order, each cycle-safe and
@@ -606,6 +730,26 @@ impl ProjectSession {
             }
         }
         Vec::new()
+    }
+
+    /// Position-aware go-to-definition. Resolves the occurrence under `position`
+    /// via [`Self::symbol_at`], then:
+    /// - a [`TargetKind::Local`] target (a body-local variable/parameter) resolves
+    ///   directly to its own declaration span (the local's `location`) — the
+    ///   key-based [`Self::definition`] cannot see scope, so this position-aware
+    ///   entry point is required for locals;
+    /// - any other target delegates to the existing key-based
+    ///   [`Self::definition`] (own interface first, then imports), unchanged.
+    ///
+    /// Returns an empty vec when nothing resolves — never a wrong location.
+    pub fn definition_at(&self, unit_key: Identifier, position: u32) -> Vec<CodeLocation> {
+        let Some(target) = self.symbol_at(unit_key, position) else {
+            return Vec::new();
+        };
+        if target.kind == TargetKind::Local {
+            return vec![target.location];
+        }
+        self.definition(unit_key, target.key, target.owner_type)
     }
 
     /// Definition site of `member_key` on type `owner_key`, resolving the owner
@@ -659,6 +803,14 @@ impl ProjectSession {
         let target = self.symbol_at(unit_key, position)?;
         let occurrence = target.location;
 
+        // A body-local variable/parameter (same-unit scope): its facts come from
+        // its own declaration (kind + simple type key), NEVER from an interface
+        // lookup — a same-named interface symbol must not leak into a local's
+        // hover. Resolved entirely from the enclosing routine's `impl_scopes`.
+        if target.kind == TargetKind::Local {
+            return self.local_hover(&meta, position, occurrence);
+        }
+
         // A member occurrence (`Owner.Member`, or a member declaration site):
         // resolve the owner, then read the member's facts.
         if let Some(owner_key) = target.owner_type {
@@ -681,6 +833,61 @@ impl ProjectSession {
         // The occurrence resolves to no interface declaration — unknown, not
         // wrong. None (the caller shows no hover).
         None
+    }
+
+    /// Hover facts for a body-local variable/parameter at `position`: its kind
+    /// (var/const/type/param) and simple declared type key, read entirely from
+    /// the enclosing routine's `impl_scopes` — NEVER an interface lookup. `None`
+    /// if the local can no longer be located (defensive; `symbol_at` already
+    /// matched one, so this normally resolves).
+    fn local_hover(
+        &self,
+        meta: &UnitMeta,
+        position: u32,
+        occurrence: CodeLocation,
+    ) -> Option<crate::query::HoverInfo> {
+        // Re-locate the exact declaration the target matched (same tightest-cover
+        // + key logic as `local_at`), so the hover reads its kind + type key.
+        if !meta.impl_scopes_reliable {
+            return None;
+        }
+        let routine = meta
+            .impl_scopes
+            .iter()
+            .filter(|routine| {
+                let span = routine.body_span;
+                span.start <= position && position < span.end
+            })
+            .min_by_key(|routine| routine.body_span.len())?;
+
+        let matches_position = |declaration: &crate::ast::LocalDeclaration| {
+            span_covers(declaration.name.location, position)
+        };
+        let occurrence_key = meta
+            .usages
+            .iter()
+            .filter(|usage| span_covers(usage.location, position))
+            .min_by_key(|usage| usage.location.span.len())
+            .map(|usage| usage.symbol);
+
+        let declaration = routine
+            .params
+            .iter()
+            .chain(routine.locals.iter())
+            .find(|declaration| {
+                matches_position(declaration)
+                    || occurrence_key == Some(declaration.name.key)
+            })?;
+
+        Some(crate::query::HoverInfo {
+            display: declaration.name.name,
+            kind: local_completion_kind(declaration.decl_kind),
+            type_key: declaration.type_key,
+            directives: Vec::new(),
+            visibility: crate::ast::Visibility::Unspecified,
+            owner_type: None,
+            occurrence,
+        })
     }
 
     /// Hover facts for `member_key` on type `owner_key`: resolve the owner (own
@@ -1066,6 +1273,12 @@ impl ProjectSession {
             TargetKind::Declaration | TargetKind::Member | TargetKind::Usage => {
                 self.resolved_usage_kind(meta, target)
             }
+            // A body-local variable/parameter (same-unit scope, shadowing an
+            // interface symbol). It is CERTAINLY a variable-like binding — the
+            // coarse-but-correct `Variable` kind (a parameter rendered as a
+            // variable is coarser, never wrong; we do not carry the finer
+            // param/var distinction into the usage-classification path).
+            TargetKind::Local => Some(crate::query::SemanticKind::Variable),
         }
     }
 
@@ -1692,6 +1905,34 @@ impl ProjectSession {
 /// zero-length span covers nothing.
 fn span_covers(location: CodeLocation, position: u32) -> bool {
     location.span.start <= position && position < location.span.end
+}
+
+/// Map a body-local declaration kind to a [`CompletionKind`] for hover. A
+/// parameter is a variable binding, so it (like a `var`) maps to
+/// `Symbol(SymbolKind::Var)`; a `label` likewise has no richer symbol kind. This
+/// is the honest coarse classification — the parser never invents finer facts.
+fn local_completion_kind(kind: crate::ast::LocalKind) -> CompletionKind {
+    use crate::ast::LocalKind;
+    match kind {
+        LocalKind::Var | LocalKind::Param | LocalKind::Label => {
+            CompletionKind::Symbol(SymbolKind::Var)
+        }
+        LocalKind::Const => CompletionKind::Symbol(SymbolKind::Const),
+        LocalKind::Type => CompletionKind::Symbol(SymbolKind::Type),
+    }
+}
+
+/// Build a [`TargetKind::Local`] [`QueryTarget`] for a body-local declaration:
+/// its own folded key, display spelling, DECLARATION span (both `location` and
+/// the definition target), and no owner type.
+fn local_target(declaration: &crate::ast::LocalDeclaration) -> QueryTarget {
+    QueryTarget {
+        key: declaration.name.key,
+        display: declaration.name.name,
+        kind: TargetKind::Local,
+        location: declaration.name.location,
+        owner_type: None,
+    }
 }
 
 // ─── Semantic-token classification helpers (task 13) ─────────────────────────
@@ -2843,6 +3084,318 @@ mod tests {
         // unresolved target → empty, never a wrong location
         let ghost = session.definition(client_key, session.context.intern_key("Nonexistent"), None);
         assert!(ghost.is_empty());
+    }
+
+    // ─── Stage 1: same-unit local variable / parameter resolution ────────────
+
+    /// A body-local variable and a parameter both resolve — via `symbol_at` /
+    /// `definition_at` — to their OWN declaration span (never the interface,
+    /// never a usage). Cursor on a local's use inside the body → the `var Local`
+    /// decl span; cursor on a parameter's use → the parameter span.
+    #[test]
+    fn local_and_param_resolve_to_their_declaration() {
+        let directory = temp_directory("query_local_resolve");
+        let source = "unit U;\ninterface\nimplementation\n\
+             procedure Run(Amount: Integer);\nvar Local: Integer;\nbegin\n  Local := Amount;\nend;\nend.";
+        std::fs::write(directory.join("U.pas"), source).unwrap();
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("U.pas")).unwrap();
+        let unit_key = session.context.intern_key("U");
+
+        let meta = session.meta_of(unit_key).unwrap();
+        assert!(meta.impl_scopes_reliable, "sanity: reliable pass");
+        let routine = &meta.impl_scopes[0];
+        let local_decl_span = routine.locals[0].name.location;
+        let param_decl_span = routine.params[0].name.location;
+
+        // Cursor on the USE of `Local` in `Local := Amount;`.
+        let local_use = source.rfind("Local").unwrap() as u32;
+        let target = session.symbol_at(unit_key, local_use).expect("local use resolves");
+        assert_eq!(target.kind, TargetKind::Local);
+        assert_eq!(target.key, session.context.intern_key("Local"));
+        assert_eq!(target.location, local_decl_span);
+        assert_eq!(session.definition_at(unit_key, local_use), vec![local_decl_span]);
+
+        // Cursor on the USE of `Amount` in `Local := Amount;`.
+        let amount_use = source.rfind("Amount").unwrap() as u32;
+        let target = session.symbol_at(unit_key, amount_use).expect("param use resolves");
+        assert_eq!(target.kind, TargetKind::Local);
+        assert_eq!(target.key, session.context.intern_key("Amount"));
+        assert_eq!(session.definition_at(unit_key, amount_use), vec![param_decl_span]);
+
+        // Cursor directly on the `Local` DECLARATION also yields a Local target.
+        let target = session
+            .symbol_at(unit_key, local_decl_span.span.start)
+            .expect("local decl resolves");
+        assert_eq!(target.kind, TargetKind::Local);
+        assert_eq!(target.location, local_decl_span);
+    }
+
+    /// SHADOWING: an interface `type Local = class … end;` AND a body-local
+    /// `Local`. Cursor in the body resolves to the LOCAL; a cursor on an
+    /// interface-scope use of `Local` (the field type) resolves to the INTERFACE
+    /// type. A body identifier matching nothing in scope falls through.
+    #[test]
+    fn body_local_shadows_interface_symbol() {
+        let directory = temp_directory("query_shadow");
+        // `Local` is BOTH an interface type and a body-local var. `TThing` is an
+        // interface type used as the local's type (interface-scope use).
+        let source = "unit U;\ninterface\n\
+             type Local = class end;\n\
+             type TThing = class\n  Field: Local;\nend;\n\
+             implementation\n\
+             procedure Run;\nvar Local: Integer;\nbegin\n  Local := 1;\nend;\nend.";
+        std::fs::write(directory.join("U.pas"), source).unwrap();
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("U.pas")).unwrap();
+        let unit_key = session.context.intern_key("U");
+        let meta = session.meta_of(unit_key).unwrap();
+        assert!(meta.impl_scopes_reliable);
+
+        let local_key = session.context.intern_key("Local");
+        let interface_local = meta.interface().find(local_key).unwrap().location;
+        let body_local_decl = meta.impl_scopes[0].locals[0].name.location;
+        assert_ne!(interface_local, body_local_decl, "distinct sites");
+
+        // In-body use of `Local` → the body-local declaration (shadowing wins).
+        let body_use = source.rfind("Local := 1").unwrap() as u32;
+        let target = session.symbol_at(unit_key, body_use).expect("body use");
+        assert_eq!(target.kind, TargetKind::Local);
+        assert_eq!(target.location, body_local_decl, "body use resolves to the local");
+        assert_eq!(session.definition_at(unit_key, body_use), vec![body_local_decl]);
+
+        // Interface-scope use of `Local` (the `Field: Local` type) → the
+        // INTERFACE type declaration, NOT the body-local (it is outside any body).
+        let field_type_use = source.find("Field: Local").unwrap() as u32 + "Field: ".len() as u32;
+        let target = session.symbol_at(unit_key, field_type_use).expect("interface use");
+        assert_ne!(
+            target.kind,
+            TargetKind::Local,
+            "an interface-scope use must not resolve to a body local"
+        );
+        assert_eq!(
+            session.definition_at(unit_key, field_type_use),
+            vec![interface_local],
+            "interface-scope use resolves to the interface type"
+        );
+
+        // A body identifier matching nothing in scope (`TThing` used nowhere in
+        // the body) — cursor on a plain body statement identifier that is not a
+        // local falls through to interface/usage, never a wrong Local.
+        // Here `Run` (the routine name occurrence) is not a local.
+        let run_use = source.find("procedure Run").unwrap() as u32 + "procedure ".len() as u32;
+        let target = session.symbol_at(unit_key, run_use);
+        if let Some(target) = target {
+            assert_ne!(target.kind, TargetKind::Local, "the routine name is not a local");
+        }
+    }
+
+    /// Bug 1 (never a WRONG answer): a member access `SomeObj.Value` must NOT
+    /// bind `.Value` to a same-named routine local. The RECEIVER position and a
+    /// bare `Value := …` (no dot) still bind to the local — the guard is not
+    /// over-broad.
+    #[test]
+    fn member_access_does_not_bind_to_same_named_local() {
+        let directory = temp_directory("query_member_guard");
+        // Local `Value`. Body has a MEMBER access `SomeObj.Value := 1;` and a
+        // BARE `Value := 2;`. `SomeObj` is an unresolved receiver (nothing in
+        // scope) — the point is purely the dot guard on `.Value`.
+        let source = "unit U;\ninterface\nimplementation\n\
+             procedure Run;\nvar Value: Integer;\nbegin\n  SomeObj.Value := 1;\n  Value := 2;\nend;\nend.";
+        std::fs::write(directory.join("U.pas"), source).unwrap();
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("U.pas")).unwrap();
+        let unit_key = session.context.intern_key("U");
+        let meta = session.meta_of(unit_key).unwrap();
+        assert!(meta.impl_scopes_reliable, "sanity: reliable pass");
+        let local_decl_span = meta.impl_scopes[0].locals[0].name.location;
+
+        // Cursor on the `.Value` in `SomeObj.Value` — the MEMBER — must NOT
+        // resolve to the local (never a wrong local attribution).
+        let member_value = source.find("SomeObj.Value").unwrap() as u32
+            + "SomeObj.".len() as u32;
+        let target = session.symbol_at(unit_key, member_value);
+        if let Some(target) = target {
+            assert_ne!(
+                target.kind,
+                TargetKind::Local,
+                "a `.Value` member access must not bind to the local `Value`"
+            );
+        }
+        assert_ne!(
+            session.definition_at(unit_key, member_value),
+            vec![local_decl_span],
+            "definition of `.Value` must not point at the local decl"
+        );
+
+        // Cursor on the RECEIVER `SomeObj` (no dot before it) still enters the
+        // normal path; it is not a local here, but must not be misclassified.
+        let receiver = source.find("SomeObj.Value").unwrap() as u32;
+        let receiver_target = session.symbol_at(unit_key, receiver);
+        if let Some(target) = receiver_target {
+            assert_ne!(
+                target.location, local_decl_span,
+                "the receiver must not resolve to the local decl"
+            );
+        }
+
+        // Cursor on the BARE `Value := 2;` (no dot) DOES bind to the local — the
+        // guard did not over-reject.
+        let bare_value = source.find("Value := 2").unwrap() as u32;
+        let target = session.symbol_at(unit_key, bare_value).expect("bare local use");
+        assert_eq!(target.kind, TargetKind::Local, "bare `Value` binds to the local");
+        assert_eq!(target.location, local_decl_span);
+        assert_eq!(session.definition_at(unit_key, bare_value), vec![local_decl_span]);
+    }
+
+    /// Bug 2 (never a WRONG answer): a nested routine referencing an OUTER
+    /// routine's local — that also shares a name with an interface symbol — binds
+    /// to the OUTER local, not the interface type. Inner shadows outer for a name
+    /// declared in both.
+    #[test]
+    fn nested_routine_binds_outer_local_over_interface() {
+        let directory = temp_directory("query_nested_outer_local");
+        // Interface type `Helper`. `Outer` has a local `Helper: Integer` that
+        // shadows the interface name. `Inner` (nested) references `Helper` — must
+        // bind to Outer's local. `Inner` also declares its own `Shadowed` which
+        // must win over Outer's `Shadowed` (tightest scope wins).
+        let source = "unit U;\ninterface\n\
+             type Helper = class end;\n\
+             implementation\n\
+             procedure Outer;\nvar Helper: Integer;\n  Shadowed: Integer;\n\
+             \n  procedure Inner;\n  var Shadowed: string;\n  begin\n    Helper := 2;\n    Shadowed := '';\n  end;\n\
+             begin\n  Inner;\nend;\nend.";
+        std::fs::write(directory.join("U.pas"), source).unwrap();
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("U.pas")).unwrap();
+        let unit_key = session.context.intern_key("U");
+        let meta = session.meta_of(unit_key).unwrap();
+        assert!(meta.impl_scopes_reliable, "sanity: reliable pass");
+
+        let helper_key = session.context.intern_key("Helper");
+        let interface_helper = meta.interface().find(helper_key).unwrap().location;
+
+        // Locate Outer's `Helper` local and Inner's `Shadowed` local across the
+        // two recorded routines (order-independent).
+        let outer_helper_decl = meta
+            .impl_scopes
+            .iter()
+            .flat_map(|routine| routine.locals.iter())
+            .find(|declaration| declaration.name.key == helper_key)
+            .expect("Outer's Helper local")
+            .name
+            .location;
+        assert_ne!(interface_helper, outer_helper_decl, "distinct sites");
+
+        // Cursor on `Helper := 2;` inside Inner → binds to OUTER's local, NOT the
+        // interface type (Bug 2: an enclosing local is found before falling
+        // through to the interface).
+        let inner_helper_use = source.find("Helper := 2").unwrap() as u32;
+        let target = session.symbol_at(unit_key, inner_helper_use).expect("inner Helper use");
+        assert_eq!(target.kind, TargetKind::Local, "resolves to a scope local");
+        assert_eq!(
+            target.location, outer_helper_decl,
+            "binds Outer's local Helper, not the interface type"
+        );
+        assert_eq!(
+            session.definition_at(unit_key, inner_helper_use),
+            vec![outer_helper_decl],
+            "definition points at Outer's local decl, never the interface type"
+        );
+        assert_ne!(
+            session.definition_at(unit_key, inner_helper_use),
+            vec![interface_helper],
+            "must NOT resolve to the interface Helper type"
+        );
+
+        // A name declared in BOTH Inner and Outer resolves to Inner's (tightest
+        // scope wins) when the cursor is inside Inner. Inner is the TIGHTEST
+        // routine (smallest body span) that owns a `Shadowed` local.
+        let shadowed_key = session.context.intern_key("Shadowed");
+        let mut shadowed_owners: Vec<&crate::ast::ImplRoutine> = meta
+            .impl_scopes
+            .iter()
+            .filter(|routine| {
+                routine.locals.iter().any(|declaration| declaration.name.key == shadowed_key)
+            })
+            .collect();
+        assert_eq!(shadowed_owners.len(), 2, "both Inner and Outer declare Shadowed");
+        shadowed_owners.sort_by_key(|routine| routine.body_span.len());
+        let inner_shadowed_decl = shadowed_owners[0]
+            .locals
+            .iter()
+            .find(|declaration| declaration.name.key == shadowed_key)
+            .unwrap()
+            .name
+            .location;
+        let outer_shadowed_decl = shadowed_owners[1]
+            .locals
+            .iter()
+            .find(|declaration| declaration.name.key == shadowed_key)
+            .unwrap()
+            .name
+            .location;
+        assert_ne!(inner_shadowed_decl, outer_shadowed_decl, "distinct Shadowed sites");
+        let inner_shadowed_use = source.find("Shadowed := ''").unwrap() as u32;
+        let target = session.symbol_at(unit_key, inner_shadowed_use).expect("inner Shadowed use");
+        assert_eq!(target.kind, TargetKind::Local);
+        assert_eq!(
+            target.location, inner_shadowed_decl,
+            "Inner's Shadowed shadows Outer's (tightest scope wins)"
+        );
+    }
+
+    /// When `impl_scopes_reliable == false`, scope lookups return no Local — the
+    /// query falls through to today's behavior (never a wrong local answer).
+    #[test]
+    fn unreliable_impl_scopes_suppress_local_resolution() {
+        let directory = temp_directory("query_unreliable");
+        // An `asm` body degrades the impl-section pass to unreliable.
+        let source = "unit U;\ninterface\nimplementation\n\
+             procedure Run;\nvar Local: Integer;\nbegin\nasm\n  NOP\nend;\nend;\nend.";
+        std::fs::write(directory.join("U.pas"), source).unwrap();
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("U.pas")).unwrap();
+        let unit_key = session.context.intern_key("U");
+        let meta = session.meta_of(unit_key).unwrap();
+        assert!(
+            !meta.impl_scopes_reliable,
+            "sanity: the asm body degraded the pass"
+        );
+
+        // A use of `Local` in the body must NOT resolve to a Local target — the
+        // flag gates the whole scope branch off.
+        let local_use = source.rfind("Local").unwrap() as u32;
+        let target = session.symbol_at(unit_key, local_use);
+        if let Some(target) = target {
+            assert_ne!(
+                target.kind,
+                TargetKind::Local,
+                "an unreliable pass must never yield a Local target"
+            );
+        }
+    }
+
+    /// Hover on a body-local yields facts from its kind + type key, never from a
+    /// same-named interface symbol.
+    #[test]
+    fn hover_on_body_local_uses_local_facts() {
+        use crate::query::CompletionKind;
+        use crate::unit_cache::SymbolKind;
+        let directory = temp_directory("query_local_hover");
+        let source = "unit U;\ninterface\nimplementation\n\
+             procedure Run;\nvar Local: Integer;\nbegin\n  Local := 1;\nend;\nend.";
+        std::fs::write(directory.join("U.pas"), source).unwrap();
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("U.pas")).unwrap();
+        let unit_key = session.context.intern_key("U");
+
+        let local_use = source.rfind("Local").unwrap() as u32;
+        let hover = session.hover_info(unit_key, local_use).expect("local hover");
+        assert_eq!(hover.kind, CompletionKind::Symbol(SymbolKind::Var));
+        assert_eq!(hover.type_key, Some(session.context.intern_key("Integer")));
+        // display is the display-track spelling as written at the declaration.
+        assert_eq!(crate::globals::resolve(hover.display), "Local");
     }
 
     #[test]
