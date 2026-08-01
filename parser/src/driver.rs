@@ -248,10 +248,11 @@ impl ProjectSession {
         })?;
         let inserts_before = self.context.unit_cache.insert_count();
 
-        let loader = UnitLoader::new(
+        let loader = UnitLoader::with_store(
             self.arena,
             self.context.clone(),
             Some(self.index.clone()),
+            Some(self.store.clone()),
         );
         let (outcome, meta) =
             pipeline::parse_and_cache(self.arena, &self.context, file, Some(loader))
@@ -325,7 +326,12 @@ impl ProjectSession {
             .set_virtual(path.as_ref().to_path_buf(), content.to_string());
         let inserts_before = self.context.unit_cache.insert_count();
 
-        let loader = UnitLoader::new(self.arena, self.context.clone(), Some(self.index.clone()));
+        let loader = UnitLoader::with_store(
+            self.arena,
+            self.context.clone(),
+            Some(self.index.clone()),
+            Some(self.store.clone()),
+        );
         let (outcome, meta) =
             pipeline::parse_and_cache(self.arena, &self.context, file, Some(loader)).map_err(
                 |error| SessionError {
@@ -1404,7 +1410,12 @@ impl ProjectSession {
     /// `parse_source_file` uses, so cross-unit resolution during a query obeys
     /// the identical cycle/dependency rules.
     fn make_loader(&self) -> std::rc::Rc<UnitLoader> {
-        UnitLoader::new(self.arena, self.context.clone(), Some(self.index.clone()))
+        UnitLoader::with_store(
+            self.arena,
+            self.context.clone(),
+            Some(self.index.clone()),
+            Some(self.store.clone()),
+        )
     }
 
     pub fn context(&self) -> &Arc<ProjectContext> {

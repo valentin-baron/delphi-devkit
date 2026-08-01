@@ -36,6 +36,12 @@ pub struct UnitLoader {
     /// parsed as import side effects would be invisible to file-change
     /// invalidation (a MISSED invalidation, the unsafe direction).
     reverse_index: Option<Arc<crate::watcher::ReverseDependencyIndex>>,
+    /// The durable per-unit store (Task 16). On a cache MISS the loader tries to
+    /// RELOAD the unit's AST from its per-unit file (hash-validated) BEFORE
+    /// re-parsing from source: an evicted unit reloads cheaply, and source is
+    /// re-read/re-parsed only when the file hash changed. `None` for batch
+    /// parses / tests with no durable store — those always re-parse on a miss.
+    store: Option<Arc<crate::cache_store::CacheStore>>,
 }
 
 impl UnitLoader {
@@ -44,6 +50,17 @@ impl UnitLoader {
         context: Arc<ProjectContext>,
         reverse_index: Option<Arc<crate::watcher::ReverseDependencyIndex>>,
     ) -> Rc<Self> {
+        Self::with_store(arena, context, reverse_index, None)
+    }
+
+    /// Like [`Self::new`], but also threads the durable [`CacheStore`] so a
+    /// cache miss reloads from the per-unit file before re-parsing (Task 16 C).
+    pub fn with_store(
+        arena: &'static SourceArena,
+        context: Arc<ProjectContext>,
+        reverse_index: Option<Arc<crate::watcher::ReverseDependencyIndex>>,
+        store: Option<Arc<crate::cache_store::CacheStore>>,
+    ) -> Rc<Self> {
         Rc::new_cyclic(|weak| Self {
             arena,
             context,
@@ -51,6 +68,7 @@ impl UnitLoader {
             active_files: RefCell::new(Vec::new()),
             self_reference: weak.clone(),
             reverse_index,
+            store,
         })
     }
 }
@@ -66,6 +84,33 @@ impl InterfaceLoader for UnitLoader {
 
         if self.active_units.borrow().contains(&unit_key) {
             return LoadOutcome::Cycle;
+        }
+
+        // Lazy reload-from-disk (Task 16 C): BEFORE resolving the name and
+        // re-parsing from source, try the per-unit snapshot. `load_unit`
+        // hash-validates (own source + dfm + includes + dependencies); a
+        // Some means the AST is on disk AND still fresh — reload it, NO
+        // re-parse, NO source read. A None (no file / corrupt / hash changed)
+        // falls through to the parse path below, so source is read only when
+        // the file actually changed. Keyed by the requested unit's folded name;
+        // an alias whose declared name differs simply misses here and re-parses
+        // (never a wrong answer).
+        if let Some(store) = &self.store {
+            let requested_key_name = crate::globals::resolve(unit_key).to_string();
+            if let Some(meta) = store.load_unit(&requested_key_name) {
+                // Reinsert into the RAM cache under both the declared key and the
+                // requested key (they usually coincide) so subsequent hits are
+                // in-memory. `insert` re-persists via the sink — idempotent, the
+                // file already exists and re-validates.
+                self.context.unit_cache.insert(meta.name(), meta.clone());
+                if meta.name() != unit_key {
+                    self.context.unit_cache.insert(unit_key, meta.clone());
+                }
+                if let Some(index) = &self.reverse_index {
+                    index.index_artifact(meta.name(), &meta);
+                }
+                return LoadOutcome::Loaded(meta);
+            }
         }
 
         let requested_name = crate::globals::resolve(unit_key).to_string();
