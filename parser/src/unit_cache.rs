@@ -346,6 +346,23 @@ impl UnitCache {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Insert a meta that is ALREADY DURABLE on disk — WITHOUT re-persisting it
+    /// (Task 16, write-amplification fix). The reload-on-miss path
+    /// ([`crate::unit_loader`]) obtains a meta from
+    /// [`crate::cache_store::CacheStore::load_unit`], which only returns a
+    /// hash-VALID meta read from its per-unit file: the file therefore already
+    /// exists and re-validates, so calling the full `save_unit` (serialize +
+    /// temp-write + rename) on reinsert would be a redundant write of bytes
+    /// identical to what is on disk. This variant skips [`Self::persist_now`] and
+    /// only populates the RAM cache. Eviction still persists via the listener if
+    /// somehow needed, and persist-on-insert stays the rule for freshly-PARSED
+    /// disk units (which reach [`Self::insert`]).
+    pub fn insert_durable(&self, unit: Identifier, meta: Arc<UnitMeta>) {
+        self.entries.insert(unit, CacheEntry::Done(meta));
+        self.inserts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn insert_failed(&self, unit: Identifier, error: Arc<ParseError>) {
         self.entries.insert(unit, CacheEntry::Failed(error));
         self.inserts
@@ -1161,6 +1178,64 @@ mod tests {
             report.skipped[0].error.contains("identifier not in current interner"),
             "skip carries the identifier serde error, got: {}",
             report.skipped[0].error
+        );
+    }
+
+    /// Write-amplification fix (Task 16): `insert` persists (a freshly-parsed
+    /// disk unit must reach disk before it can be evicted), but `insert_durable`
+    /// does NOT (its meta already came from disk, hash-valid — re-persisting
+    /// would rewrite identical bytes). A counting persister proves each path's
+    /// persist behaviour exactly.
+    #[test]
+    fn insert_durable_skips_persist_but_insert_persists() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct CountingPersister {
+            calls: Arc<AtomicU64>,
+        }
+        impl UnitPersister for CountingPersister {
+            fn persist(&self, _meta: &UnitMeta) {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let directory = std::env::temp_dir().join("delphi_parser_insert_durable");
+        let unit_path = write_temp(&directory, "UnitA.pas", "unit UnitA;");
+        let dependency_path = write_temp(&directory, "UnitB.pas", "unit UnitB;");
+
+        let calls = Arc::new(AtomicU64::new(0));
+        // A large cap so nothing is EVICTED — the eviction listener also calls
+        // `persist` (belt-and-suspenders), and re-inserting the SAME key triggers
+        // a replace-eviction; using distinct keys under a roomy cap isolates the
+        // insert-path `persist_now` (the write-amp under test) from that.
+        let cache = UnitCache::with_capacity(256 * 1024 * 1024);
+        cache.attach_persister(Arc::new(CountingPersister {
+            calls: calls.clone(),
+        }));
+
+        let meta = Arc::new(build_meta(&unit_path, &dependency_path));
+
+        // insert → one persist (persist-on-insert for a freshly-parsed unit).
+        cache.insert(crate::globals::intern_key("FreshUnit"), meta.clone());
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "insert must persist once");
+
+        // insert_durable (distinct key, no eviction) → NO persist: the reload
+        // path's meta is already on disk, hash-valid; re-persisting would rewrite
+        // identical bytes (the write-amplification this fix removes).
+        cache.insert_durable(crate::globals::intern_key("ReloadedUnit"), meta.clone());
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "insert_durable must NOT persist — the meta is already on disk"
+        );
+
+        // a second insert_durable under an ALIAS key must ALSO not persist:
+        // proves the reload alias path is free of the double-write.
+        cache.insert_durable(crate::globals::intern_key("AliasUnit"), meta);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "aliasing via insert_durable must not write a second time"
         );
     }
 

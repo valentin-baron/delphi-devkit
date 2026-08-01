@@ -100,11 +100,16 @@ impl InterfaceLoader for UnitLoader {
             if let Some(meta) = store.load_unit(&requested_key_name) {
                 // Reinsert into the RAM cache under both the declared key and the
                 // requested key (they usually coincide) so subsequent hits are
-                // in-memory. `insert` re-persists via the sink — idempotent, the
-                // file already exists and re-validates.
-                self.context.unit_cache.insert(meta.name(), meta.clone());
+                // in-memory. Use `insert_durable`, NOT `insert`: this meta came
+                // straight from `load_unit`, which only returns a hash-VALID meta
+                // read from its per-unit file — the file already exists and
+                // re-validates, so re-persisting it (full serialize + temp-write +
+                // rename) would be a redundant write of identical bytes. The alias
+                // path (name != key) must not write twice either; both inserts are
+                // durable-skip (write-amplification fix, Task 16).
+                self.context.unit_cache.insert_durable(meta.name(), meta.clone());
                 if meta.name() != unit_key {
-                    self.context.unit_cache.insert(unit_key, meta.clone());
+                    self.context.unit_cache.insert_durable(unit_key, meta.clone());
                 }
                 if let Some(index) = &self.reverse_index {
                     index.index_artifact(meta.name(), &meta);
@@ -144,9 +149,14 @@ impl InterfaceLoader for UnitLoader {
         match result {
             Ok((_, Some(meta))) => {
                 // requested `SysUtils`, unit declares `System.SysUtils`:
-                // alias the requested key to the same meta
+                // alias the requested key to the same meta. `parse_and_cache`
+                // ALREADY inserted (and persisted) this meta under its declared
+                // name `meta.name()`; the per-unit file is addressed by that
+                // declared name, so aliasing must use `insert_durable` — a plain
+                // `insert` here would re-run `save_unit` and write the IDENTICAL
+                // file a second time (the alias double-write, Task 16).
                 if meta.name() != unit_key {
-                    self.context.unit_cache.insert(unit_key, meta.clone());
+                    self.context.unit_cache.insert_durable(unit_key, meta.clone());
                 }
                 if let Some(index) = &self.reverse_index {
                     index.index_artifact(meta.name(), &meta);
