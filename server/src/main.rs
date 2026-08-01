@@ -1,3 +1,4 @@
+mod diagnostics;
 mod documents;
 mod positions;
 mod session;
@@ -44,11 +45,85 @@ impl DelphiLsp {
         }
     }
 
-    /// Analyze an open document and publish its diagnostics. The parse/session
-    /// wiring is added in a later step; for now this is the single hook the
-    /// lifecycle handlers call so publishing is centralized.
-    async fn analyze(&self, _uri: Url, _version: i32) {
-        // Session-backed parse + publishDiagnostics wired in a subsequent step.
+    /// Analyze an open document and publish its diagnostics: parse the buffer
+    /// through the project session (on a blocking task) and map the unified
+    /// diagnostics to LSP ranges via the buffer's line index.
+    ///
+    /// Async/lock discipline: the document lock and session lock are each taken
+    /// for a short synchronous section; neither is held across `.await`. The
+    /// blocking parse runs inside `spawn_blocking`, so the async executor is
+    /// never stalled.
+    async fn analyze(&self, uri: Url, version: i32) {
+        // Only analyze real file paths (skip untitled:/ and other schemes).
+        let Some(path) = session::uri_to_path(&uri) else {
+            return;
+        };
+
+        // Copy the current buffer text out under the store lock (short section),
+        // then release the lock before the parse.
+        let text = {
+            let store = self.documents.lock().await;
+            match store.get(&uri) {
+                // A stale notification (a newer version already applied) must
+                // not publish diagnostics for old text.
+                Some(document) if document.version == version => document.text().to_string(),
+                _ => return,
+            }
+        };
+
+        // Ensure the project session is open (blocking open, off-executor).
+        let inputs = session::resolve_active_project_inputs().await;
+        self.session
+            .ensure_open(
+                inputs.dproj,
+                inputs.configuration,
+                inputs.platform,
+                inputs.profile,
+                inputs.standard_source_paths,
+            )
+            .await;
+
+        // Parse the buffer and collect LSP diagnostics on a blocking thread.
+        let session_handle = self.session.handle();
+        let parse_path = session::document_path(&path);
+        let result = tokio::task::spawn_blocking(move || {
+            let index = positions::LineIndex::new(text);
+            let mut guard = session_handle.blocking_lock();
+            let Some(project_session) = guard.as_mut() else {
+                // No session (unresolvable + fallback failed) → clear
+                // diagnostics rather than leaving a stale set.
+                return Some(Vec::new());
+            };
+            match project_session.parse_buffer(&parse_path, index.text()) {
+                Ok((_, Some(meta))) => {
+                    let unit_key = meta.name();
+                    let buffer_file = meta.ast.name.location.file;
+                    let unified = project_session.diagnostics(unit_key);
+                    Some(diagnostics::to_lsp_diagnostics(&unified, buffer_file, &index))
+                }
+                // A non-unit source (program/library/package) produces no
+                // importable meta and thus no unit-keyed diagnostics here; clear.
+                Ok((_, None)) => Some(Vec::new()),
+                // A hard parse failure (unrecoverable directive structure): do
+                // not fabricate — publish nothing new (leave the prior set until
+                // the next successful parse). `None` signals "skip publish".
+                Err(_) => None,
+            }
+        })
+        .await;
+
+        match result {
+            Ok(Some(lsp_diagnostics)) => {
+                self.client
+                    .publish_diagnostics(uri, lsp_diagnostics, Some(version))
+                    .await;
+            }
+            // Parse error → keep the previous diagnostics (skip publish).
+            Ok(None) => {}
+            Err(join_error) => {
+                lsp_error!(self.client, "analyze task failed: {}", join_error);
+            }
+        }
     }
 
     async fn projects_compile(
@@ -332,4 +407,74 @@ async fn main() -> Result<()> {
     Server::new(stdin(), stdout(), socket).serve(service).await;
 
     return Ok(())
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    //! End-to-end proof of the analyze pipeline WITHOUT the LSP transport: the
+    //! exact steps `analyze` runs inside `spawn_blocking` — parse the buffer
+    //! through a session, then map its unified diagnostics to LSP diagnostics via
+    //! the buffer's line index. A live `Client` is needed only for the final
+    //! `publish_diagnostics` call, so these tests exercise everything up to (and
+    //! including) the produced `Vec<Diagnostic>` — the part that could be wrong.
+
+    use crate::diagnostics::to_lsp_diagnostics;
+    use crate::positions::LineIndex;
+    use crate::session::build_fallback_session_for_test as build_fallback;
+    use tower_lsp::lsp_types::DiagnosticSeverity;
+
+    /// didOpen/didChange → parse → correctly-ranged diagnostics. An unknown
+    /// `{$IF}` on a known line must surface a WARNING whose range covers that
+    /// directive, mapped through the buffer's line index.
+    #[test]
+    fn parse_buffer_produces_correctly_ranged_diagnostic() {
+        let mut session = build_fallback();
+        // The {$IF} on line 2 references an unknown external type → parse
+        // diagnostic. Byte layout puts the directive on line index 2.
+        let text = "unit Editing;\ninterface\n{$IF SizeOf(TMysteryExternal) > 4} const A = 1; {$IFEND}\ntype TThing = class end;\nimplementation\nend.";
+        let index = LineIndex::new(text.to_string());
+        let path = std::env::temp_dir().join("ddk-server-e2e").join("Editing.pas");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let (_, meta) = session.parse_buffer(&path, index.text()).unwrap();
+        let meta = meta.expect("unit meta");
+        let buffer_file = meta.ast.name.location.file;
+        let unified = session.diagnostics(meta.name());
+        assert!(!unified.is_empty(), "an unknown {{$IF}} yields a diagnostic");
+
+        let lsp = to_lsp_diagnostics(&unified, buffer_file, &index);
+        assert!(!lsp.is_empty(), "diagnostics map to LSP");
+        // every produced diagnostic is a WARNING with a valid range on a real
+        // line (not a fabricated one), and the {$IF} finding sits on line 2.
+        let on_directive_line = lsp.iter().any(|d| d.range.start.line == 2);
+        assert!(
+            on_directive_line,
+            "the {{$IF}} diagnostic maps onto its source line (line 2): {lsp:?}"
+        );
+        assert!(lsp.iter().all(|d| d.severity == Some(DiagnosticSeverity::WARNING)));
+        // ranges are non-degenerate for in-buffer findings on the directive line
+        let directive = lsp.iter().find(|d| d.range.start.line == 2).unwrap();
+        assert!(
+            directive.range.end.character > directive.range.start.character
+                || directive.range.end.line > directive.range.start.line,
+            "the range spans the directive, not a zero-length point: {directive:?}"
+        );
+    }
+
+    /// A clean buffer produces an empty diagnostic set (didChange to valid code
+    /// clears the squiggles).
+    #[test]
+    fn clean_buffer_produces_no_diagnostics() {
+        let mut session = build_fallback();
+        let text = "unit Clean;\ninterface\ntype TThing = class end;\nimplementation\nend.";
+        let index = LineIndex::new(text.to_string());
+        let path = std::env::temp_dir().join("ddk-server-e2e").join("Clean.pas");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let (_, meta) = session.parse_buffer(&path, index.text()).unwrap();
+        let meta = meta.expect("unit meta");
+        let unified = session.diagnostics(meta.name());
+        let lsp = to_lsp_diagnostics(&unified, meta.ast.name.location.file, &index);
+        assert!(lsp.is_empty(), "a clean unit has no diagnostics: {lsp:?}");
+    }
 }

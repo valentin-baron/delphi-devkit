@@ -263,6 +263,14 @@ fn build_fallback_session(
     ))
 }
 
+/// Test-only: build a fallback (no-dproj) session for the default Debug/Win32
+/// context. Exposed so the server's end-to-end lifecycle tests can drive the
+/// analyze pipeline without live ddk-core project state.
+#[cfg(test)]
+pub fn build_fallback_session_for_test() -> ProjectSession {
+    build_fallback_session("Debug", "Win32", Vec::new()).expect("fallback session builds")
+}
+
 /// Bridge a ddk-core [`CompilerConfiguration`] + target platform into a parser
 /// [`CompilerProfile`]. The `VERxxx` condition plus the standard compiler +
 /// platform auto-defines dcc emits for the target.
@@ -300,6 +308,136 @@ pub fn compiler_profile(compiler: &CompilerConfiguration, platform: &str) -> Com
         rtl_version: None,
         defines,
     }
+}
+
+/// The project/compiler inputs a session needs, resolved from ddk-core state.
+#[derive(Debug, Clone)]
+pub struct ProjectInputs {
+    pub dproj: Option<PathBuf>,
+    pub configuration: String,
+    pub platform: String,
+    pub profile: CompilerProfile,
+    pub standard_source_paths: Vec<PathBuf>,
+}
+
+/// Resolve the inputs for the active project from ddk-core's `PROJECTS_DATA` and
+/// `COMPILER_CONFIGURATIONS`. Degrades gracefully:
+///
+/// - no active project, or an active project with no `.dproj` → a fallback
+///   (`dproj: None`) with a default Delphi-12 Win32 profile — buffers still
+///   parse, just without project search paths / dproj defines;
+/// - the active project's workspace names its compiler; its
+///   `installation_path/source` subtree provides the standard-unit search paths.
+///
+/// This is the FOUNDATION resolver: one session for the active project. A
+/// per-document project match (which project owns an arbitrary opened file) is a
+/// later refinement — noted, not silently assumed.
+pub async fn resolve_active_project_inputs() -> ProjectInputs {
+    use ddk_core::state::{COMPILER_CONFIGURATIONS, PROJECTS_DATA};
+
+    let projects = PROJECTS_DATA.read().await;
+    let Some(project) = projects.active_project() else {
+        return fallback_inputs();
+    };
+
+    // The compiler for this project = its workspace's compiler_id.
+    let compiler_id = projects
+        .workspaces
+        .iter()
+        .find(|workspace| {
+            workspace
+                .project_links
+                .iter()
+                .any(|link| link.project_id == project.id)
+        })
+        .map(|workspace| workspace.compiler_id.clone())
+        .unwrap_or_else(|| projects.group_project_compiler_id.clone());
+
+    let compilers = COMPILER_CONFIGURATIONS.read().await;
+    let Some(compiler) = compilers.get(&compiler_id) else {
+        return fallback_inputs();
+    };
+
+    // Resolve config/platform: the project's dproj (if any) supplies the active
+    // defaults, honoring per-project overrides.
+    let dproj_path = project.dproj.as_ref().map(PathBuf::from);
+    let (configuration, platform) = match &dproj_path {
+        Some(path) => match ddk_core::files::dproj::get_or_load(project.id, path) {
+            Ok(dproj) => project.effective_config_platform(&dproj),
+            Err(_) => (
+                project
+                    .active_configuration
+                    .clone()
+                    .unwrap_or_else(|| "Debug".to_string()),
+                project
+                    .active_platform
+                    .clone()
+                    .unwrap_or_else(|| "Win32".to_string()),
+            ),
+        },
+        None => (
+            project
+                .active_configuration
+                .clone()
+                .unwrap_or_else(|| "Debug".to_string()),
+            project
+                .active_platform
+                .clone()
+                .unwrap_or_else(|| "Win32".to_string()),
+        ),
+    };
+
+    let profile = compiler_profile(compiler, &platform);
+    let standard_source_paths = standard_source_paths(&compiler.installation_path);
+
+    ProjectInputs {
+        dproj: dproj_path,
+        configuration,
+        platform,
+        profile,
+        standard_source_paths,
+    }
+}
+
+/// The default fallback inputs (Delphi 12 / Win32) when no project is
+/// resolvable — never panics, always parseable.
+fn fallback_inputs() -> ProjectInputs {
+    ProjectInputs {
+        dproj: None,
+        configuration: "Debug".to_string(),
+        platform: "Win32".to_string(),
+        profile: CompilerProfile {
+            compiler_version: 36.0,
+            rtl_version: None,
+            defines: vec![
+                "VER360".to_string(),
+                "MSWINDOWS".to_string(),
+                "WIN32".to_string(),
+                "CPUX86".to_string(),
+                "UNICODE".to_string(),
+                "CONDITIONALEXPRESSIONS".to_string(),
+            ],
+        },
+        standard_source_paths: Vec::new(),
+    }
+}
+
+/// The standard-unit source directories under a compiler installation
+/// (`<install>\source\...` dirs containing `.pas`). Empty on any failure — a
+/// missing RTL source tree degrades to "RTL units unresolved", never a crash.
+fn standard_source_paths(installation_path: &str) -> Vec<PathBuf> {
+    use delphi_parser::ddk::{standard_source_directories, CompilerInstallation};
+    if installation_path.trim().is_empty() {
+        return Vec::new();
+    }
+    let installation = CompilerInstallation {
+        key: String::new(),
+        product_name: String::new(),
+        product_version: 0.0,
+        compiler_version: 36.0,
+        installation_path: PathBuf::from(installation_path),
+    };
+    standard_source_directories(&installation).unwrap_or_default()
 }
 
 /// A `file://` URL → local filesystem path. Returns `None` for a non-file URL.
