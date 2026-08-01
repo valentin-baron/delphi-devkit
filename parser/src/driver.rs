@@ -2341,12 +2341,24 @@ mod tests {
         // Parse the consumer: materializes Con19 AND its import Lib19 into the
         // arena. All borrows from the parse are dropped when it returns.
         let (_, meta) = session.parse_source_file(directory.join("Con19.pas")).unwrap();
-        let con_key = meta.expect("consumer meta").name();
+        let con_meta = meta.expect("consumer meta");
+        let con_key = con_meta.name();
 
-        // CHECKPOINT: trim to zero — clears every resident DISK entry. Safe here
-        // because no arena borrow is live (the parse returned). This is exactly
-        // what `trim_arena` does at a real checkpoint, at the harshest cap.
-        session.arena().trim_disk_content(0);
+        // CHECKPOINT: clear THIS session's disk entries (Con19 + Lib19) — the
+        // effect a trim has on them, applied to the KNOWN FileIds so the shared
+        // global arena test runner is not disturbed (in production the session
+        // lock serializes; the harness has no cross-test lock, so a cap-based
+        // trim-to-zero here would race other tests — see
+        // `clear_disk_entry_for_test`). No arena borrow is live (the parse
+        // returned), exactly the checkpoint condition.
+        let con_file = con_meta.ast.name.location.file;
+        let lib_file = session.arena().register(directory.join("Lib19.pas")).unwrap();
+        // Con19 (the parsed unit) is definitely resident → clearing frees bytes.
+        assert!(session.arena().clear_disk_entry_for_test(con_file) > 0, "Con19 was resident and cleared");
+        // Lib19 may be resident (materialized during import) or not (interface
+        // loaded without retaining decoded content) — either way, clear it so the
+        // cross-unit query below must re-read it from disk on demand.
+        session.arena().clear_disk_entry_for_test(lib_file);
 
         // Queries now re-read trimmed content on demand. A definition into Con19
         // resolves its own type; a definition of TLib resolves cross-unit into

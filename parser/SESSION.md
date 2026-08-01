@@ -135,7 +135,7 @@ TARGET. Rationale traced in the 2026-07-31 session.
 | `token.rs` | logos lexer, all reserved words, directives opaque, trivia preserved, lex failures → spanned Error tokens |
 | `meta.rs` | Span / FileId / CodeLocation; `FileId`/`Span`/`CodeLocation` serde (FileId ↔ path via global arena) |
 | `globals.rs` | process-global interner + arena statics (AtomicPtr over leaked Box; reads lock-free, test-only `reset_for_tests` leaks-and-swaps); free `intern`/`intern_key`/`resolve`/`arena`; ONE `fold_identifier` (ordinal ASCII fold, non-ASCII byte-identical) = the single source of truth for every folded comparison key (it. 14, L9) |
-| `source.rs` | arena: eager `load` / lazy `register`, BOM/UTF-16/ANSI decoding, stable refs across growth; RETAINS raw on-disk bytes per file (`raw_bytes(FileId)`) so stamps hash without a re-read (it. 14, L15) |
+| `source.rs` | arena: eager `load` / lazy `register`, BOM/UTF-16/ANSI decoding, stable refs across growth; RETAINS raw on-disk bytes per file (`raw_bytes(FileId)`) so stamps hash without a re-read (it. 14, L15); DISK content+raw are now CLEARABLE+re-readable (`Mutex<Option<Box<..>>>`), per-entry `last_access` LRU + `trim_disk_content(cap)` evicts coldest disk entries (never virtual) at a checkpoint; `content`/`raw_bytes`/`loaded_content`/`text` re-read a cleared disk file on demand (Task-19) |
 | `context.rs` | ProjectContext from dproj (defines, search paths, namespaces, aliases, resolved config/platform names); CompilerProfile supplied by integrator (incl. `rtl_version: Option<f64>`, `None`=compiler_version); `ProjectContext.rtl_version` distinct from `compiler_version` (it. 14, L10); `Identifier` = newtype over Spur with transparent serde; `intern`/`intern_key`(→`fold_identifier`)/`is_defined`(→`fold_identifier`)/`resolve` delegate to `globals` |
 | `parse_state.rs` | per-unit state: define/switch copies, conditional stack, include tracking, imports, own symbols/constants, own-type members (member→member-type, for scoped Declared #19), dependencies, usages, cycle taint, InterfaceLoader hook |
 | `if_eval.rs` | full $IF/$ELSEIF evaluator, Kleene tri-state; `Value`/`Token` gained `UInt(u64)` with EXACT mixed-width Int/UInt comparison+arithmetic via i128 (it. 14, L6); Declared (own + imports via loader) incl. SCOPED `Declared(A.B[.C])` over own + imported type members with dependency recording (#19 closed), SizeOf (builtin table), const values (own + imports); `RTLVersion` reads `context.rtl_version` independently of `CompilerVersion` (L10); `resolve_qualified_type` skips unrelated unresolvable imports (task-4 review); dotted CONST values still Unknown (#30) |
@@ -824,6 +824,38 @@ value: uncertainty → Unknown/None throughout (esp. L6 mixed-width, L9 fold).
   `be.core.gui.dpk`'s dead branch resolved (its own dproj defines
   `BE_CORE_D11_USES`). Tree now clean: 464 units + 4 pkg/prog, **0 failures**;
   guard asserts `total_failures == 0`.
+
+- **Task-19 — bound the arena's disk-file text (last unbounded term).** DISK
+  `SourceEntry.content`/`raw` changed from write-once `OnceLock` to clearable
+  `Mutex<Option<Box<str>>>`/`Mutex<Option<Box<[u8]>>>`; a per-entry `last_access`
+  tick (global `access_clock`) drives an LRU. `SourceArena::trim_disk_content(cap)`
+  evicts the coldest DISK entries' content+raw until resident ≤ cap; VIRTUAL
+  entries are NEVER trimmed (their display path can't be re-read → data loss —
+  Task-15's bound owns them). `content`/`raw_bytes`/`loaded_content`/`text`
+  re-read a cleared/never-read disk file on demand via the same lifetime-extend
+  transmute as `virtual_content_ref` (`disk_content_ref`/`disk_raw_ref`).
+  `ProjectSession::trim_arena()` = `trim_disk_content(ARENA_DISK_CONTENT_CAP =
+  64 MiB)`, called ONLY at SAFE CHECKPOINTS: the end of every blocking
+  parse/query section (analyze, all six read handlers, didSave
+  `parse_disk_and_save`), after owned LSP results are built, still under the
+  session `blocking_lock()`, before it releases — NEVER reactively inside
+  `content` (a same-parse borrow could be live → UAF). SOUNDNESS (mirrors L15's
+  virtual note, argued in-code at `trim_disk_content` + `trim_arena` + each call
+  site): no arena `&str`/`&[u8]` escapes a blocking section (every caller copies
+  to owned or uses it within the synchronous parse/query and drops it before
+  returning); the single session lock serializes all parses/queries so a trim
+  between them cannot race a live borrow; the moka persister serializes paths not
+  text, the loader reads only during a parse. Preserves virtual-never-persist,
+  Task-15 virtual bound, Task-16 reload+hash-validation, dual-track, never-wrong,
+  panic-free (a failed re-read → the existing `FileReadError` path). Tests:
+  `trim_disk_content_bounds_and_reread_is_correct`,
+  `trim_then_disk_change_rereads_new_bytes_without_crash`,
+  `trim_never_clears_virtual_entries`, `trim_evicts_least_recently_accessed_first`
+  (source.rs local arena); `parse_then_trim_then_query_is_sound_and_correct`
+  (driver checkpoint); `trim_arena_at_checkpoint_bounds_disk_content_and_query_
+  still_resolves` (server). UNVERIFIED: live-editor process RAM not measured, only
+  the trim/re-read/bound tests; the 64 MiB cap is a reasoned choice, not tuned
+  against a real workload.
 
 - **Format-version delta:** v10 → v11 (L6 `ConstantValue::UInt`). Old snapshots
   reject cleanly (`old_version_snapshot_is_cleanly_rejected`, updated to v10→v11).

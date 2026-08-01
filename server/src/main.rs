@@ -1528,9 +1528,8 @@ mod lifecycle_tests {
         .unwrap();
         let mut session = build_fallback_session_with_search_path(directory.clone());
         // Parse the import from disk so it becomes a resident on-disk arena entry.
-        session
-            .parse_source_file(directory.join("Imported19.pas"))
-            .unwrap();
+        let import_path = directory.join("Imported19.pas");
+        session.parse_source_file(&import_path).unwrap();
 
         // A consumer buffer that uses the import and references its type.
         let text = "unit Consumer19;\ninterface\nuses Imported19;\n\
@@ -1542,25 +1541,25 @@ mod lifecycle_tests {
             .unwrap();
         let unit_key = meta.expect("unit meta").name();
 
-        // The import's disk content is resident before the trim.
-        let before = session.arena().resident_disk_bytes();
-        assert!(before > 8192, "the large import is resident before trim: {before}");
-
-        // CHECKPOINT trim to zero (the harshest cap): clears every resident DISK
-        // entry. This is what `trim_arena` does after a blocking section, when no
-        // arena borrow is live. resident_disk_bytes drops accordingly.
-        session.arena().trim_disk_content(0);
-        assert_eq!(
-            session.arena().resident_disk_bytes(),
-            0,
-            "trim(0) clears all resident disk content"
+        // CHECKPOINT: clear THIS session's disk import entry — the effect a trim
+        // has on it, applied to the KNOWN FileId so the shared global arena test
+        // runner is not disturbed. Production serializes trims via the session
+        // lock; the parallel test harness has no cross-test lock, so a cap-based
+        // trim-to-zero on the global arena here would race other tests' live
+        // borrows. No arena borrow is live (the parse returned) — the checkpoint
+        // condition. The import was resident (a big chunk) before the clear.
+        let import_file = session.arena().register(&import_path).unwrap();
+        let import_resident_before = session.arena().clear_disk_entry_for_test(import_file);
+        assert!(
+            import_resident_before > 8192,
+            "the large import was resident before the clear: {import_resident_before}"
         );
 
-        // A cross-unit definition query now RE-READS the trimmed import on demand
+        // A cross-unit definition query now RE-READS the cleared import on demand
         // and resolves correctly — no panic, right answer.
         let t_imported = delphi_parser::globals::intern_key("TImported19");
         let def = session.definition(unit_key, t_imported, None);
-        assert_eq!(def.len(), 1, "TImported19 resolves cross-unit after trim");
+        assert_eq!(def.len(), 1, "TImported19 resolves cross-unit after clear");
         assert_eq!(
             session.arena().location_text(def[0]),
             "TImported19",

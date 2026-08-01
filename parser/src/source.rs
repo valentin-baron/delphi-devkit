@@ -494,6 +494,29 @@ impl SourceArena {
         self.files.is_empty()
     }
 
+    /// Clear a SPECIFIC disk entry's resident content+raw (what a trim would do
+    /// to that one entry), returning the bytes freed. No-op for a virtual entry
+    /// (never trimmed — its path can't be re-read). Same checkpoint-only
+    /// soundness contract as [`Self::trim_disk_content`]: the caller must hold no
+    /// live `&str`/`&[u8]` borrow into this entry.
+    ///
+    /// Exists for driver/server CHECKPOINT tests to exercise the clear+re-read
+    /// path on a KNOWN FileId WITHOUT the cap-based `trim_disk_content`, which —
+    /// on the shared process-global arena under the PARALLEL test runner — would
+    /// evict OTHER concurrently-parsing tests' entries and race their live
+    /// borrows (the harness has no cross-test session lock; production's session
+    /// lock provides exactly that serialization). Not on the LSP hot path.
+    pub fn clear_disk_entry_for_test(&self, file: FileId) -> usize {
+        let entry = self.entry(file);
+        if entry.is_virtual {
+            return 0;
+        }
+        let freed = entry_resident_bytes(entry);
+        *entry.content.lock().unwrap() = None;
+        *entry.raw.lock().unwrap() = None;
+        freed
+    }
+
     fn push_entry(&self, path: PathBuf, content: Option<String>) -> FileId {
         // A pushed-with-content entry is a virtual buffer (no disk bytes): `raw`
         // stays empty, so `raw_bytes` returns None and the stamp falls back to
