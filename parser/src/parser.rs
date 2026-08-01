@@ -2993,6 +2993,10 @@ impl UnitParser<'_> {
 
     /// Consume everything up to and including `target` (top-level scan;
     /// `implementation` is a reserved word, so a plain token scan is safe).
+    /// Currently unused — a coarse resync helper kept for the error-tolerant
+    /// recovery path (ledger #10/#39), which resyncs at declaration boundaries;
+    /// a future coarser fallback (skip to `implementation`/`end`) would use this.
+    #[allow(dead_code)]
     fn skip_to_token(&mut self, target: Token) -> Result<(), ParseError> {
         loop {
             match self.cursor.advance()? {

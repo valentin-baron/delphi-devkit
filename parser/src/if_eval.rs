@@ -95,6 +95,12 @@ enum ScopeStep {
     /// whose type is cross-unit and not followed) → `Unknown`.
     Unknown,
     /// A uses-cycle was hit while consulting an import → taint + `Unknown`.
+    /// Not yet constructed: the only cycle-producing path is cross-unit member
+    /// descent (`Declared(A.B.C)` where `B`'s type lives in another unit), which
+    /// is currently conservative-Unknown and not followed (ledger #31). Retained
+    /// (with its `mark_cycle_tainted` handling at the call sites) so #31 lands
+    /// cycle-safe by construction rather than needing a new variant then.
+    #[allow(dead_code)]
     Cycle,
 }
 
