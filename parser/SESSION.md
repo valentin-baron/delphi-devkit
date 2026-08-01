@@ -128,6 +128,71 @@ TARGET. Rationale traced in the 2026-07-31 session.
   live per keystroke (error-tolerant reparse); only OTHER units load from the
   snapshot. `cycle_tainted`/virtual-buffer artifacts remain never-persisted.
 
+## Memory & loading architecture (LSP integration) — the consolidated model
+
+The parser was designed for BOUNDED parses (batch/CLI). An editor reparses
+continuously and navigates a huge dependency graph (be.core + RTL/VCL), which
+broke that assumption catastrophically: opening one real unit force-loaded its
+whole `{$IF Declared/SizeOf}` closure (nested parses pin every ancestor's text +
+AST) → 14 GB. The fix is a layered memory model; each layer is independently
+verified (tests + RSS probe, since the LSP can't be driven headlessly). The
+through-line: **no parse ever cascades; the working set is bounded; precision is
+restored by background indexing, not eager-during-parse.**
+
+1. **One project per process** → the interner + `SourceArena` are process-global
+   statics (`globals.rs`). Bounds are enforced per-operation and via LRU, not by
+   holding everything resident.
+2. **Editor parse is resident-only** (`UnitLoader` `LoadMode::Budgeted(0)`, used
+   by `ProjectSession::parse_buffer`): opening/typing a unit parses ONLY that
+   unit; cross-unit `{$IF Declared/SizeOf}` resolves from the RESIDENT moka cache
+   or degrades to Unknown (safe AssumeFalse) — never force-parses an import. No
+   cascade. (Proven: parsing a 10-deep `uses` closure leaves 1 unit cached.)
+3. **Every Full parse is budgeted** (`LoadMode::Budgeted(MAX_TRANSITIVE_LOADS=32)`,
+   used by `parse_source_file` = didSave / navigation / indexing, and `make_loader`
+   = query cross-unit resolution): a chain force-loads at most 32 units then
+   degrades to Unknown. Caps didSave/go-to-def peak (a cache HIT is always free
+   and never counts). The counter is chain-shared via the loader's `Rc`.
+4. **Disk-backed AST cache** (`cache_store` `save_unit`/`load_unit`, `unit_cache`
+   moka + eviction-listener): a parsed disk unit's AST is persisted per-unit; on
+   a cache miss the loader RELOADS the AST from disk (hash-validated: source +
+   includes + deps) before re-parsing — source is re-read/re-parsed ONLY when its
+   hash changed. moka evicts to disk at a 256 MiB weigher cap (weigher =
+   `estimated_bytes` = source_len×16 + structural interface-index charge; RSS-
+   verified real cache RAM ≈ 188 MiB ≤ cap). Virtual/tainted/recovered units
+   never persist.
+5. **Arena LRU trim** (`source.rs` clearable disk content + `trim_disk_content`,
+   `ProjectSession::trim_arena`, cap 64 MiB): a disk file's decoded text + raw
+   bytes are FREED between units (LRU) and re-read from disk on demand — "source
+   not needed until the file hash changes". `trim_arena` runs only at SAFE
+   CHECKPOINTS (after owned results are built, under the session lock, no live
+   `&str` borrow) — the same unsafe-lifetime discipline as the virtual buffer
+   mechanism (see the SAFETY note on `disk_content_ref`/`virtual_content_ref`).
+6. **Idle background indexing** (`server/indexing.rs`, `SessionManager::index_unit`,
+   `run_indexing_pass`): on editor idle (1.5 s debounce), parse the PROJECT's own
+   units one BUDGETED unit at a time, persist each, `trim_arena` between — RAM
+   flat across thousands of units. Foreground-preemptible (a generation token
+   bumped on any didChange/request; checked between units; a foreground request
+   waits ≤ one unit). NEVER indexes a unit OPEN in the editor (path→URL vs the
+   documents-store snapshot) — so an open, unsaved buffer's meta is never
+   overwritten with disk content. Warming restores the cross-unit precision that
+   resident-only/budget trade away — completeness only, never correctness.
+7. **Status** (`server/status.rs` `ddk/serverStatus` + the extension status bar):
+   Ready / Analyzing <file> / Indexing N/M / Bootstrapping — what the server is
+   doing, at a glance.
+
+Net bound: moka AST cache ≤ ~256 MiB (RSS ~188) + arena disk text ≤ 64 MiB +
+interner (distinct strings) ≈ a **~300 MiB bounded footprint**; no entry point
+(open / save / navigate / index) can pull the full closure into RAM.
+
+INVARIANTS THIS ADDS (breaking these is a wrong answer or a crash):
+- No parse cascades (resident-only editor / budgeted Full).
+- An OPEN editor buffer's cached meta is NEVER overwritten by the indexer.
+- Arena content is cleared ONLY at safe checkpoints under the session lock (no
+  live borrow) — the `disk_content_ref`/`virtual_content_ref` `unsafe` is sound
+  by that serialization, not the type system alone.
+- A query never maps a span onto text that differs from what the span was parsed
+  against (staleness-guarded — see the stale-import guard in `code_location_to_lsp`).
+
 ## Module status (current, end of iteration 7)
 
 | Module | Status |
