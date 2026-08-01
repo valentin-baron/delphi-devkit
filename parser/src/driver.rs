@@ -449,6 +449,19 @@ impl ProjectSession {
         }
     }
 
+    /// Public accessor for the cached meta of a unit key — the LSP read handlers
+    /// use it to REUSE the meta produced by the last `analyze` (which parsed the
+    /// buffer) instead of re-parsing on every hover/completion/definition
+    /// request. Returns `None` when the unit was never parsed or its last parse
+    /// failed. The returned meta's spans index the arena content of the version
+    /// `analyze` last parsed; a read handler maps request positions through the
+    /// requesting document's own current [`crate::meta::LineIndex`], which is the
+    /// same version because a newer edit triggers a fresh `analyze` on
+    /// `didChange`.
+    pub fn meta_for(&self, unit_key: Identifier) -> Option<Arc<UnitMeta>> {
+        self.meta_of(unit_key)
+    }
+
     /// The identifier occurrence under a byte `position` in `file`'s unit. Scans
     /// the unit's interface symbol + member declaration spans and its recorded
     /// usages for the span covering `position`; returns the folded key, display

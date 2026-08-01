@@ -50,6 +50,25 @@ struct DelphiLsp {
     /// diagnostics are never overwritten by staler ones (the never-a-wrong-answer
     /// rule: never show squiggles for an older buffer version).
     published_versions: Arc<Mutex<HashMap<Url, i32>>>,
+    /// `Url → the folded unit key of its last successful `analyze` parse`. Read
+    /// handlers (definition/hover/references/completion/signatureHelp/
+    /// semanticTokens) use this to REUSE the meta the last `analyze` cached,
+    /// instead of re-parsing the buffer on every request. This is the Task-15
+    /// OOM fix, part 1: without it, each read re-ran `parse_buffer`, appending a
+    /// fresh virtual entry to the process-global arena (6× the parse rate on top
+    /// of `didChange`). `analyze` records the key here after a successful parse;
+    /// a read handler looks it up, fetches the cached meta from the session, and
+    /// runs the query with NO parse. `did_close` drops the entry.
+    ///
+    /// Correctness: `analyze` runs on every `didChange`, so the cached meta is
+    /// always the one for the buffer version the editor last sent. A read
+    /// handler maps its request position through the requesting document's OWN
+    /// current line index — the same version the cached meta parsed, because a
+    /// newer edit would have triggered a fresh `analyze` before the read. When
+    /// no key is recorded yet (a read arrived before any `analyze` completed for
+    /// this URL), the handler triggers a single `analyze` and retries once —
+    /// never a re-parse loop.
+    analyzed_units: Arc<Mutex<HashMap<Url, delphi_parser::context::Identifier>>>,
 }
 
 /// The monotonic publish-slot decision, extracted so the out-of-order race is
@@ -72,8 +91,15 @@ fn claim_publish_slot(published: &mut HashMap<Url, i32>, uri: &Url, version: i32
 /// the `Client`) and publish under the version guard.
 enum AnalyzeOutcome {
     /// A normal diagnostics set to publish (an empty vec CLEARS the buffer's
-    /// squiggles — no session, non-unit source, or clean parse).
-    Publish(Vec<Diagnostic>),
+    /// squiggles — no session, non-unit source, or clean parse). `unit_key`
+    /// carries the folded unit key when the parse produced an importable unit
+    /// meta, so the async layer can record `Url → unit_key` for read handlers to
+    /// reuse (Task-15 part 1). `None` for a non-unit source (program/library/
+    /// package) or no session — nothing to reuse.
+    Publish {
+        diagnostics: Vec<Diagnostic>,
+        unit_key: Option<delphi_parser::context::Identifier>,
+    },
     /// A hard, unrecoverable parse failure: publish `diagnostics` (a single
     /// ERROR finding replacing the stale set) and log `message`.
     ParseFailure {
@@ -89,6 +115,7 @@ impl DelphiLsp {
             documents: Arc::new(Mutex::new(DocumentStore::new())),
             session: Arc::new(SessionManager::new()),
             published_versions: Arc::new(Mutex::new(HashMap::new())),
+            analyzed_units: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -177,22 +204,33 @@ impl DelphiLsp {
             let Some(project_session) = guard.as_mut() else {
                 // No session (unresolvable + fallback failed) → clear
                 // diagnostics rather than leaving a stale set.
-                return AnalyzeOutcome::Publish(Vec::new());
+                return AnalyzeOutcome::Publish {
+                    diagnostics: Vec::new(),
+                    unit_key: None,
+                };
             };
             match project_session.parse_buffer(&parse_path, index.text()) {
                 Ok((_, Some(meta))) => {
                     let unit_key = meta.name();
                     let buffer_file = meta.ast.name.location.file;
                     let unified = project_session.diagnostics(unit_key);
-                    AnalyzeOutcome::Publish(diagnostics::to_lsp_diagnostics(
-                        &unified,
-                        buffer_file,
-                        &index,
-                    ))
+                    AnalyzeOutcome::Publish {
+                        diagnostics: diagnostics::to_lsp_diagnostics(
+                            &unified,
+                            buffer_file,
+                            &index,
+                        ),
+                        // Record this key so read handlers reuse THIS meta (the
+                        // buffer version just parsed) instead of re-parsing.
+                        unit_key: Some(unit_key),
+                    }
                 }
                 // A non-unit source (program/library/package) produces no
                 // importable meta and thus no unit-keyed diagnostics here; clear.
-                Ok((_, None)) => AnalyzeOutcome::Publish(Vec::new()),
+                Ok((_, None)) => AnalyzeOutcome::Publish {
+                    diagnostics: Vec::new(),
+                    unit_key: None,
+                },
                 // A hard, unrecoverable parse failure: the buffer no longer
                 // parses at all, so the prior granular set is stale. Do NOT keep
                 // it and do NOT stay silent — REPLACE it with a single honest
@@ -215,11 +253,29 @@ impl DelphiLsp {
         .await;
 
         let lsp_diagnostics = match result {
-            Ok(AnalyzeOutcome::Publish(lsp_diagnostics)) => lsp_diagnostics,
+            Ok(AnalyzeOutcome::Publish { diagnostics, unit_key }) => {
+                // Record (or clear) the Url→unit_key mapping read handlers reuse.
+                // A parse that produced a unit meta records its key; a non-unit
+                // source or no session clears any stale key so a read handler
+                // never reuses a meta for a URL whose latest parse produced none.
+                let mut analyzed = self.analyzed_units.lock().await;
+                match unit_key {
+                    Some(key) => {
+                        analyzed.insert(uri.clone(), key);
+                    }
+                    None => {
+                        analyzed.remove(&uri);
+                    }
+                }
+                diagnostics
+            }
             // Hard parse failure: publish the single ERROR diagnostic (replacing
             // the stale set) AND still log — a failing buffer is now both visible
-            // to the user (a squiggle) and recorded in the log.
+            // to the user (a squiggle) and recorded in the log. The buffer no
+            // longer parses, so drop any stale key: a read handler must not reuse
+            // a meta from a prior version once the current buffer fails to parse.
             Ok(AnalyzeOutcome::ParseFailure { diagnostics, message }) => {
+                self.analyzed_units.lock().await.remove(&uri);
                 lsp_error!(self.client, "parse of {} failed: {}", uri, message);
                 diagnostics
             }
@@ -247,6 +303,28 @@ impl DelphiLsp {
         self.publish_if_newer(uri, lsp_diagnostics, version).await;
     }
 
+    /// The folded unit key a read handler should query for `uri`, reusing the
+    /// meta the last `analyze` cached (Task-15 part 1 — read handlers never
+    /// re-parse). If no key is recorded yet (a read arrived before any `analyze`
+    /// completed for this URL, e.g. the very first hover after open), run a
+    /// SINGLE `analyze` for the document's current version and look up once more.
+    /// Never loops: at most one analyze, then whatever the map holds (possibly
+    /// still `None` for a non-unit source or unparseable buffer → the caller
+    /// returns an honest empty result, never a wrong answer).
+    async fn unit_key_for_read(&self, uri: &Url) -> Option<delphi_parser::context::Identifier> {
+        if let Some(key) = self.analyzed_units.lock().await.get(uri).copied() {
+            return Some(key);
+        }
+        // Not analyzed yet — trigger exactly one analyze for the current version,
+        // then retry the lookup once.
+        let version = {
+            let store = self.documents.lock().await;
+            store.get(uri)?.version
+        };
+        self.analyze(uri.clone(), version).await;
+        self.analyzed_units.lock().await.get(uri).copied()
+    }
+
     /// Resolve go-to-definition for `(uri, position)`.
     ///
     /// Steps (all the parser work on a single `spawn_blocking` task, the session
@@ -268,37 +346,28 @@ impl DelphiLsp {
         uri: Url,
         position: Position,
     ) -> Option<Vec<Location>> {
-        let path = session::uri_to_path(&uri)?;
-
         // The open buffer's authoritative text (unsaved edits live only here).
+        // Used ONLY to build this document's line index and map position→offset;
+        // the meta itself is REUSED from the last analyze (no re-parse here).
         let text = {
             let store = self.documents.lock().await;
             store.get(&uri)?.text().to_string()
         };
 
-        // Ensure a session is open for the active project (same as `analyze`).
-        let inputs = session::resolve_active_project_inputs().await;
-        self.session
-            .ensure_open(
-                inputs.dproj,
-                inputs.configuration,
-                inputs.platform,
-                inputs.profile,
-                inputs.standard_source_paths,
-            )
-            .await;
+        // The unit key of the last analyze for this URL (triggers one analyze if
+        // never analyzed). No key → non-unit source or unparseable → no
+        // definition here (honest None, never a fabricated jump).
+        let unit_key = self.unit_key_for_read(&uri).await?;
 
         let session_handle = self.session.handle();
-        let parse_path = session::document_path(&path);
         let result = tokio::task::spawn_blocking(move || {
             let index = positions::LineIndex::new(text);
             let offset = index.offset_of(position) as u32;
             let mut guard = session_handle.blocking_lock();
             let project_session = guard.as_mut()?;
-            // Parse the buffer to get its unit key; a non-unit source (program/
-            // library/package) yields no importable meta → no definition here.
-            let (_, meta) = project_session.parse_buffer(&parse_path, index.text()).ok()?;
-            let unit_key = meta?.name();
+            // Reuse the analyzed meta (no parse_buffer). Its spans index the
+            // buffer version analyze parsed — the same version this request's
+            // line index maps against (a newer edit re-analyzes first).
             // Identifier under the cursor → its declaration site(s), each mapped
             // to an LSP Location from the TARGET file's own text. Unresolved or
             // unmappable → None (never a fabricated jump).
@@ -325,33 +394,20 @@ impl DelphiLsp {
     /// through the requesting document's OWN line index (the occurrence is in
     /// this buffer). No honest facts → `None`, never a fabricated signature.
     async fn resolve_hover(&self, uri: Url, position: Position) -> Option<Hover> {
-        let path = session::uri_to_path(&uri)?;
-
         let text = {
             let store = self.documents.lock().await;
             store.get(&uri)?.text().to_string()
         };
 
-        let inputs = session::resolve_active_project_inputs().await;
-        self.session
-            .ensure_open(
-                inputs.dproj,
-                inputs.configuration,
-                inputs.platform,
-                inputs.profile,
-                inputs.standard_source_paths,
-            )
-            .await;
+        let unit_key = self.unit_key_for_read(&uri).await?;
 
         let session_handle = self.session.handle();
-        let parse_path = session::document_path(&path);
         let result = tokio::task::spawn_blocking(move || {
             let index = positions::LineIndex::new(text);
             let offset = index.offset_of(position) as u32;
             let mut guard = session_handle.blocking_lock();
             let project_session = guard.as_mut()?;
-            let (_, meta) = project_session.parse_buffer(&parse_path, index.text()).ok()?;
-            let unit_key = meta?.name();
+            // Reuse the analyzed meta (no re-parse).
             let info = project_session.hover_info(unit_key, offset)?;
             // The occurrence span is in THIS buffer, so its range maps through
             // this document's own line index (already built as `index`).
@@ -396,33 +452,20 @@ impl DelphiLsp {
         position: Position,
         include_declaration: bool,
     ) -> Option<Vec<Location>> {
-        let path = session::uri_to_path(&uri)?;
-
         let text = {
             let store = self.documents.lock().await;
             store.get(&uri)?.text().to_string()
         };
 
-        let inputs = session::resolve_active_project_inputs().await;
-        self.session
-            .ensure_open(
-                inputs.dproj,
-                inputs.configuration,
-                inputs.platform,
-                inputs.profile,
-                inputs.standard_source_paths,
-            )
-            .await;
+        let unit_key = self.unit_key_for_read(&uri).await?;
 
         let session_handle = self.session.handle();
-        let parse_path = session::document_path(&path);
         let result = tokio::task::spawn_blocking(move || {
             let index = positions::LineIndex::new(text);
             let offset = index.offset_of(position) as u32;
             let mut guard = session_handle.blocking_lock();
             let project_session = guard.as_mut()?;
-            let (_, meta) = project_session.parse_buffer(&parse_path, index.text()).ok()?;
-            let unit_key = meta?.name();
+            // Reuse the analyzed meta (no re-parse).
             locations::resolve_references(project_session, unit_key, offset, include_declaration)
         })
         .await;
@@ -455,33 +498,20 @@ impl DelphiLsp {
         uri: Url,
         position: Position,
     ) -> Option<Vec<CompletionItem>> {
-        let path = session::uri_to_path(&uri)?;
-
         let text = {
             let store = self.documents.lock().await;
             store.get(&uri)?.text().to_string()
         };
 
-        let inputs = session::resolve_active_project_inputs().await;
-        self.session
-            .ensure_open(
-                inputs.dproj,
-                inputs.configuration,
-                inputs.platform,
-                inputs.profile,
-                inputs.standard_source_paths,
-            )
-            .await;
+        let unit_key = self.unit_key_for_read(&uri).await?;
 
         let session_handle = self.session.handle();
-        let parse_path = session::document_path(&path);
         let result = tokio::task::spawn_blocking(move || {
             let index = positions::LineIndex::new(text);
             let offset = index.offset_of(position) as u32;
             let mut guard = session_handle.blocking_lock();
             let project_session = guard.as_mut()?;
-            let (_, meta) = project_session.parse_buffer(&parse_path, index.text()).ok()?;
-            let unit_key = meta?.name();
+            // Reuse the analyzed meta (no re-parse).
             Some(completion::resolve_completions(project_session, unit_key, offset))
         })
         .await;
@@ -516,26 +546,14 @@ impl DelphiLsp {
         uri: Url,
         position: Position,
     ) -> Option<SignatureHelp> {
-        let path = session::uri_to_path(&uri)?;
-
         let text = {
             let store = self.documents.lock().await;
             store.get(&uri)?.text().to_string()
         };
 
-        let inputs = session::resolve_active_project_inputs().await;
-        self.session
-            .ensure_open(
-                inputs.dproj,
-                inputs.configuration,
-                inputs.platform,
-                inputs.profile,
-                inputs.standard_source_paths,
-            )
-            .await;
+        let unit_key = self.unit_key_for_read(&uri).await?;
 
         let session_handle = self.session.handle();
-        let parse_path = session::document_path(&path);
         let result = tokio::task::spawn_blocking(move || {
             let index = positions::LineIndex::new(text);
             let offset = index.offset_of(position) as u32;
@@ -544,8 +562,7 @@ impl DelphiLsp {
             let context = call_context::enclosing_call(index.text(), offset as usize)?;
             let mut guard = session_handle.blocking_lock();
             let project_session = guard.as_mut()?;
-            let (_, meta) = project_session.parse_buffer(&parse_path, index.text()).ok()?;
-            let unit_key = meta?.name();
+            // Reuse the analyzed meta (no re-parse).
             signature::resolve_signature_help(
                 project_session,
                 unit_key,
@@ -579,32 +596,19 @@ impl DelphiLsp {
     /// Returns `None` when there is no session/meta (the editor shows nothing);
     /// an empty token list is a legitimate answer (e.g. an empty document).
     async fn resolve_semantic_tokens(&self, uri: Url) -> Option<SemanticTokensResult> {
-        let path = session::uri_to_path(&uri)?;
-
         let text = {
             let store = self.documents.lock().await;
             store.get(&uri)?.text().to_string()
         };
 
-        let inputs = session::resolve_active_project_inputs().await;
-        self.session
-            .ensure_open(
-                inputs.dproj,
-                inputs.configuration,
-                inputs.platform,
-                inputs.profile,
-                inputs.standard_source_paths,
-            )
-            .await;
+        let unit_key = self.unit_key_for_read(&uri).await?;
 
         let session_handle = self.session.handle();
-        let parse_path = session::document_path(&path);
         let result = tokio::task::spawn_blocking(move || {
             let index = positions::LineIndex::new(text);
             let mut guard = session_handle.blocking_lock();
             let project_session = guard.as_mut()?;
-            let (_, meta) = project_session.parse_buffer(&parse_path, index.text()).ok()?;
-            let unit_key = meta?.name();
+            // Reuse the analyzed meta (no re-parse).
             let data = semantic::resolve_semantic_tokens(project_session, unit_key, &index);
             Some(SemanticTokensResult::Tokens(SemanticTokens {
                 result_id: None,
@@ -1124,6 +1128,12 @@ impl LanguageServer for DelphiLsp {
         {
             let mut published = self.published_versions.lock().await;
             published.remove(&uri);
+        }
+        // Drop the Url→unit_key mapping so a reopened document re-analyzes from
+        // scratch rather than reusing a stale key (Task-15 part 1 cleanup).
+        {
+            let mut analyzed = self.analyzed_units.lock().await;
+            analyzed.remove(&uri);
         }
         // Clear diagnostics for the closed document: the editor keeps showing
         // the last published set until we send an empty one.
