@@ -633,6 +633,87 @@ impl ProjectSession {
         self.reference_index.occurrences(symbol_key).to_vec()
     }
 
+    /// The resolved signature of a routine callee, for
+    /// `textDocument/signatureHelp`. Reads parameters + return type from the
+    /// AST's [`crate::ast::RoutineType`] — the derived interface index does NOT
+    /// carry parameters, so this query walks `UnitMeta.ast`.
+    ///
+    /// Resolution (SAME cross-unit loader as [`Self::definition`]):
+    /// - `owner = Some(type)` (a member routine `Obj.Method`): resolve the owner
+    ///   type (own interface first, then imports), then its `Member::Method`
+    ///   whose folded name == `callee_key`; read the method's `routine`.
+    /// - `owner = None` (a top-level routine): the interface declaration of kind
+    ///   `Procedure`/`Function` with that key (own then imports); its
+    ///   `type_expression` is a `TypeExpression::Routine`.
+    ///
+    /// Never fabricated: an unresolved callee, a non-routine symbol, or a member
+    /// on an unresolved owner yields `None`. A procedure carries
+    /// `return_type = None`; an untyped parameter renders without a `: Type`; a
+    /// defaulted parameter carries its ` = default`.
+    ///
+    /// OVERLOADS: the interface index folds overloads to one key; the AST keeps
+    /// every declaration. This walks ALL declarations/members matching the key
+    /// and returns one [`crate::query::SignatureInfo`] per matching routine, in
+    /// source order — so distinguishable overloads each get a signature. (A
+    /// top-level `overload` set spread across units resolves only within the
+    /// first declaring unit found, matching `definition`'s own-then-first-import
+    /// order; noted as the cross-unit-overload limitation.)
+    pub fn signature_help(
+        &self,
+        unit_key: Identifier,
+        callee_key: Identifier,
+        owner: Option<Identifier>,
+    ) -> Vec<crate::query::SignatureInfo> {
+        let Some(meta) = self.meta_of(unit_key) else {
+            return Vec::new();
+        };
+
+        // Member routine: resolve the owner type, then its method(s).
+        if let Some(owner_key) = owner {
+            return self.member_signatures(&meta, owner_key, callee_key);
+        }
+
+        // Top-level routine: own interface declarations first.
+        let own = top_level_signatures(&meta, callee_key);
+        if !own.is_empty() {
+            return own;
+        }
+        // Then imports (reverse uses order); first declaring unit wins.
+        let loader = self.make_loader();
+        for import in imports_reversed(&meta) {
+            if let crate::parse_state::LoadOutcome::Loaded(imported) = loader.interface_of(import) {
+                let signatures = top_level_signatures(&imported, callee_key);
+                if !signatures.is_empty() {
+                    return signatures;
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    /// Signatures of `method_key` on type `owner_key`: resolve the owner (own
+    /// interface first, then imports) and read its matching `Member::Method`
+    /// routine(s). Empty if the owner or method is unresolved (never fabricated).
+    fn member_signatures(
+        &self,
+        meta: &UnitMeta,
+        owner_key: Identifier,
+        method_key: Identifier,
+    ) -> Vec<crate::query::SignatureInfo> {
+        if let Some(declaration) = find_type_declaration(meta, owner_key) {
+            return method_signatures(declaration, method_key);
+        }
+        let loader = self.make_loader();
+        for import in imports_reversed(meta) {
+            if let crate::parse_state::LoadOutcome::Loaded(imported) = loader.interface_of(import) {
+                if let Some(declaration) = find_type_declaration(&imported, owner_key) {
+                    return method_signatures(declaration, method_key);
+                }
+            }
+        }
+        Vec::new()
+    }
+
     /// Context-sensitive completions at `position` in `unit_key`'s source.
     ///
     /// - After a `.` (member access): the members of the type of the identifier
@@ -1052,6 +1133,247 @@ fn member_completion(member: &crate::unit_cache::MemberSymbol) -> Completion {
         directives: member.directives.clone(),
         visibility: member.visibility,
     }
+}
+
+// ─── Signature-help helpers (read RoutineType from the AST) ──────────────
+
+/// Every top-level routine declaration (`procedure`/`function`) in `meta`'s
+/// interface whose folded name == `callee_key`, rendered as a signature. Returns
+/// one entry per matching declaration (overloads → multiple).
+fn top_level_signatures(
+    meta: &UnitMeta,
+    callee_key: Identifier,
+) -> Vec<crate::query::SignatureInfo> {
+    use crate::ast::{DeclarationKind, TypeExpression};
+    meta.ast
+        .interface_declarations
+        .iter()
+        .filter(|declaration| {
+            declaration.name.key == callee_key
+                && matches!(
+                    declaration.kind,
+                    DeclarationKind::Procedure | DeclarationKind::Function
+                )
+        })
+        .filter_map(|declaration| match &declaration.type_expression {
+            // A top-level routine stores its signature as a Routine type
+            // expression (see parser::parse_routine_header).
+            Some(TypeExpression::Routine(routine)) => {
+                Some(render_signature(declaration.name.name, routine))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The interface `InterfaceDeclaration` for a TYPE named `owner_key`, if present
+/// (`None` for a non-type or absent symbol).
+fn find_type_declaration<'meta>(
+    meta: &'meta UnitMeta,
+    owner_key: Identifier,
+) -> Option<&'meta crate::ast::InterfaceDeclaration> {
+    use crate::ast::DeclarationKind;
+    meta.ast
+        .interface_declarations
+        .iter()
+        .find(|declaration| {
+            declaration.name.key == owner_key && declaration.kind == DeclarationKind::Type
+        })
+}
+
+/// Signatures of the method(s) named `method_key` declared directly on the type
+/// `declaration` (class/record/interface). Walks the type's visibility sections.
+/// Returns one entry per matching method (overloads → multiple). Empty when the
+/// declaration is not a structured type or has no such method.
+fn method_signatures(
+    declaration: &crate::ast::InterfaceDeclaration,
+    method_key: Identifier,
+) -> Vec<crate::query::SignatureInfo> {
+    let mut signatures = Vec::new();
+    for member in type_members(declaration) {
+        if let crate::ast::Member::Method(method) = member {
+            // A method-resolution clause (`procedure IFoo.M = Impl;`) carries no
+            // real signature — skip it (never a fabricated signature).
+            if method.resolution_target.is_some() {
+                continue;
+            }
+            if method.name.key == method_key {
+                signatures.push(render_signature(method.name.name, &method.routine));
+            }
+        }
+    }
+    signatures
+}
+
+/// Every direct member of a structured type (class/record via visibility
+/// sections, interface via its flat member list). Empty for any other type
+/// expression (an alias, enum, pointer — no members).
+fn type_members(
+    declaration: &crate::ast::InterfaceDeclaration,
+) -> Vec<&crate::ast::Member> {
+    use crate::ast::TypeExpression;
+    match declaration.type_expression.as_ref() {
+        Some(TypeExpression::Class(class)) => class
+            .sections
+            .iter()
+            .flat_map(|section| section.members.iter())
+            .collect(),
+        Some(TypeExpression::Record(record)) => record
+            .sections
+            .iter()
+            .flat_map(|section| section.members.iter())
+            .collect(),
+        Some(TypeExpression::Interface(interface)) => interface.members.iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Render a [`crate::query::SignatureInfo`] from a routine's display name and
+/// its [`crate::ast::RoutineType`]. The label is
+/// `<keyword> <name>(<params>)[: <return>]`, built from the resolved parts —
+/// never fabricated.
+fn render_signature(
+    name: Identifier,
+    routine: &crate::ast::RoutineType,
+) -> crate::query::SignatureInfo {
+    use crate::ast::RoutineKind;
+    let keyword = match routine.kind {
+        RoutineKind::Procedure => "procedure",
+        RoutineKind::Function => "function",
+        RoutineKind::Constructor => "constructor",
+        RoutineKind::Destructor => "destructor",
+        RoutineKind::Operator => "operator",
+    };
+    // One ParameterInfo per parameter-group NAME (a `const A, B: Integer` group
+    // is two parameters A and B, each carrying the group's modifier/type).
+    let parameters: Vec<crate::query::ParameterInfo> = routine
+        .parameters
+        .iter()
+        .flat_map(render_parameter_group)
+        .collect();
+    let parameter_list = parameters
+        .iter()
+        .map(|parameter| parameter.label.clone())
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    // Return type only for a function (or an operator with one). A procedure /
+    // constructor / destructor carries none; a function whose return type is not
+    // renderable leaves it None (never fabricated).
+    let return_type = routine
+        .return_type
+        .as_ref()
+        .and_then(render_type_expression);
+
+    let mut label = format!("{keyword} {}({parameter_list})", crate::globals::resolve(name));
+    if let Some(return_display) = &return_type {
+        label.push_str(": ");
+        label.push_str(return_display);
+    }
+
+    crate::query::SignatureInfo {
+        label,
+        parameters,
+        return_type,
+    }
+}
+
+/// Render one parameter GROUP (`const A, B: Integer = 0`) to one
+/// [`crate::query::ParameterInfo`] PER NAME, each carrying the shared
+/// modifier/type/default. An untyped group (`var Buffer`) renders each name with
+/// no `: Type`. The default (` = ...`) is rendered from its source span text.
+fn render_parameter_group(parameter: &crate::ast::Parameter) -> Vec<crate::query::ParameterInfo> {
+    use crate::ast::ParameterModifier;
+    let modifier = match parameter.modifier {
+        ParameterModifier::None => "",
+        ParameterModifier::Var => "var ",
+        ParameterModifier::Const => "const ",
+        ParameterModifier::Out => "out ",
+    };
+    let type_suffix = parameter
+        .parameter_type
+        .as_ref()
+        .and_then(render_type_expression)
+        .map(|type_display| format!(": {type_display}"))
+        .unwrap_or_default();
+    // A default value (`= 0`) is a source span — render it from the arena text,
+    // trimmed. Rendered once for the group (Delphi allows a default only on a
+    // single-name group, but we render defensively for whatever the AST holds).
+    let default_suffix = parameter
+        .default
+        .and_then(render_span_text)
+        .map(|default_text| format!(" = {}", default_text.trim()))
+        .unwrap_or_default();
+
+    // An anonymous parameter group (no names) is impossible in valid Delphi;
+    // render nothing rather than a fabricated placeholder.
+    parameter
+        .names
+        .iter()
+        .map(|name| crate::query::ParameterInfo {
+            label: format!(
+                "{modifier}{}{type_suffix}{default_suffix}",
+                crate::globals::resolve(name.name)
+            ),
+        })
+        .collect()
+}
+
+/// Render a [`crate::ast::TypeExpression`] to a display string. A simple
+/// `Reference` uses the display track of its (possibly dotted) name plus any
+/// generic arguments; other shapes render structurally. Returns `None` only for
+/// a shape we cannot honestly render (never a fabricated type name).
+fn render_type_expression(type_expression: &crate::ast::TypeExpression) -> Option<String> {
+    use crate::ast::TypeExpression;
+    match type_expression {
+        TypeExpression::Reference {
+            name,
+            type_arguments,
+        } => {
+            let base = crate::globals::resolve(name.name).to_string();
+            if type_arguments.is_empty() {
+                return Some(base);
+            }
+            let arguments: Vec<String> = type_arguments
+                .iter()
+                .map(|argument| render_type_expression(argument).unwrap_or_else(|| "…".to_string()))
+                .collect();
+            Some(format!("{base}<{}>", arguments.join(", ")))
+        }
+        TypeExpression::Pointer(inner) => {
+            render_type_expression(inner).map(|inner| format!("^{inner}"))
+        }
+        TypeExpression::ClassReference(name) => {
+            Some(format!("class of {}", crate::globals::resolve(name.name)))
+        }
+        TypeExpression::Array { element, .. } => {
+            render_type_expression(element).map(|element| format!("array of {element}"))
+        }
+        TypeExpression::ArrayOfConst => Some("array of const".to_string()),
+        TypeExpression::SetOf(inner) => {
+            render_type_expression(inner).map(|inner| format!("set of {inner}"))
+        }
+        // Anonymous/complex shapes (inline records, procedural types, subranges)
+        // are not reduced to a simple display here — None, so the caller renders
+        // the parameter without a `: Type` rather than fabricating one.
+        _ => None,
+    }
+}
+
+/// The trimmed source text a [`CodeLocation`] span covers, via the global arena.
+/// `None` if the file is unreadable or the span is out of bounds / splits a
+/// UTF-8 boundary (never a wrong substring).
+fn render_span_text(location: CodeLocation) -> Option<String> {
+    let content = crate::globals::arena().content(location.file).ok()?;
+    let (start, end) = (location.span.start as usize, location.span.end as usize);
+    if end > content.len()
+        || start > end
+        || !content.is_char_boundary(start)
+        || !content.is_char_boundary(end)
+    {
+        return None;
+    }
+    Some(content[start..end].to_string())
 }
 
 /// Build [`crate::query::HoverInfo`] from a top-level interface symbol. A
@@ -1736,6 +2058,208 @@ mod tests {
         assert!(
             !top_keys.contains(&session.context.intern_key("Area")),
             "no dot → TShape members must NOT be returned: {top_keys:?}"
+        );
+    }
+
+    // ─── Deliverable B: signature_help query ────────────────────────────
+
+    #[test]
+    fn signature_help_own_method_params_and_return() {
+        // A method on an OWN type: read its parameters + return type from the AST.
+        let directory = temp_directory("sig_own_method");
+        std::fs::write(
+            directory.join("Calc.pas"),
+            "unit Calc;\ninterface\n\
+             type TCalc = class\npublic\n\
+               function Compute(const A: Integer; B: string): Boolean;\n\
+             end;\n\
+             implementation\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("Calc.pas")).unwrap();
+        let key = session.context.intern_key("CALC");
+
+        let signatures = session.signature_help(
+            key,
+            session.context.intern_key("Compute"),
+            Some(session.context.intern_key("TCalc")),
+        );
+        assert_eq!(signatures.len(), 1, "one Compute method: {signatures:?}");
+        let signature = &signatures[0];
+        assert_eq!(
+            signature.label,
+            "function Compute(const A: Integer; B: string): Boolean"
+        );
+        assert_eq!(signature.parameters.len(), 2);
+        assert_eq!(signature.parameters[0].label, "const A: Integer");
+        assert_eq!(signature.parameters[1].label, "B: string");
+        assert_eq!(signature.return_type.as_deref(), Some("Boolean"));
+    }
+
+    #[test]
+    fn signature_help_cross_unit_routine_and_procedure_no_return() {
+        // A top-level routine imported from another unit (cross-unit, SAME loader
+        // as definition), and a PROCEDURE (no return type).
+        let directory = temp_directory("sig_cross_unit");
+        std::fs::write(
+            directory.join("Lib.pas"),
+            "unit Lib;\ninterface\n\
+             function Add(X: Integer; Y: Integer): Integer;\n\
+             procedure Log(const Message: string);\n\
+             implementation\nend.",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("Main.pas"),
+            "unit Main;\ninterface\nuses Lib;\n\
+             implementation\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("Main.pas")).unwrap();
+        let main_key = session.context.intern_key("MAIN");
+
+        // cross-unit function
+        let add = session.signature_help(main_key, session.context.intern_key("Add"), None);
+        assert_eq!(add.len(), 1, "Add resolves cross-unit: {add:?}");
+        assert_eq!(
+            add[0].label,
+            "function Add(X: Integer; Y: Integer): Integer"
+        );
+        assert_eq!(add[0].return_type.as_deref(), Some("Integer"));
+
+        // cross-unit procedure → NO return type
+        let log = session.signature_help(main_key, session.context.intern_key("Log"), None);
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].label, "procedure Log(const Message: string)");
+        assert_eq!(log[0].return_type, None, "a procedure has no return type");
+    }
+
+    #[test]
+    fn signature_help_untyped_and_defaulted_params() {
+        // An untyped `var` parameter (`var Buffer`) renders without `: Type`; a
+        // defaulted parameter (`= 0`) carries its default.
+        let directory = temp_directory("sig_untyped_default");
+        std::fs::write(
+            directory.join("Io.pas"),
+            "unit Io;\ninterface\n\
+             procedure Read(var Buffer; Count: Integer = 0);\n\
+             implementation\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("Io.pas")).unwrap();
+        let key = session.context.intern_key("IO");
+
+        let signatures = session.signature_help(key, session.context.intern_key("Read"), None);
+        assert_eq!(signatures.len(), 1, "{signatures:?}");
+        let signature = &signatures[0];
+        assert_eq!(signature.parameters.len(), 2);
+        // untyped var parameter — no `: Type`
+        assert_eq!(signature.parameters[0].label, "var Buffer");
+        // defaulted parameter carries its default
+        assert_eq!(signature.parameters[1].label, "Count: Integer = 0");
+        assert_eq!(
+            signature.label,
+            "procedure Read(var Buffer; Count: Integer = 0)"
+        );
+    }
+
+    #[test]
+    fn signature_help_multiple_names_per_group_and_overloads() {
+        // A `const A, B: Integer` group expands to two parameters; two methods
+        // sharing a name (overloads) each yield a distinct signature.
+        let directory = temp_directory("sig_group_overload");
+        std::fs::write(
+            directory.join("Over.pas"),
+            "unit Over;\ninterface\n\
+             type TOver = class\npublic\n\
+               procedure Same(A, B: Integer); overload;\n\
+               procedure Same(S: string); overload;\n\
+             end;\n\
+             implementation\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("Over.pas")).unwrap();
+        let key = session.context.intern_key("OVER");
+
+        let signatures = session.signature_help(
+            key,
+            session.context.intern_key("Same"),
+            Some(session.context.intern_key("TOver")),
+        );
+        // two overloads → two signatures
+        assert_eq!(signatures.len(), 2, "both overloads returned: {signatures:?}");
+        // the (A, B: Integer) overload expands the group to two parameters
+        let grouped = signatures
+            .iter()
+            .find(|signature| signature.parameters.len() == 2)
+            .expect("the (A, B: Integer) overload has two parameters");
+        assert_eq!(grouped.parameters[0].label, "A: Integer");
+        assert_eq!(grouped.parameters[1].label, "B: Integer");
+        // The grouped `A, B: Integer` is expanded so every parameter label is a
+        // self-contained substring of the signature label — the editor can then
+        // highlight the active parameter by matching its label.
+        assert_eq!(grouped.label, "procedure Same(A: Integer; B: Integer)");
+        assert!(grouped.label.contains(&grouped.parameters[0].label));
+        assert!(grouped.label.contains(&grouped.parameters[1].label));
+        // the (S: string) overload
+        assert!(
+            signatures
+                .iter()
+                .any(|signature| signature.label == "procedure Same(S: string)"),
+            "the string overload: {signatures:?}"
+        );
+    }
+
+    #[test]
+    fn signature_help_unknown_callee_and_non_routine_is_empty() {
+        // An unknown callee, and a NON-routine symbol (a type), both yield no
+        // signature — never fabricated.
+        let directory = temp_directory("sig_unknown");
+        std::fs::write(
+            directory.join("Types.pas"),
+            "unit Types;\ninterface\n\
+             type TThing = class end;\n\
+             procedure Real(X: Integer);\n\
+             implementation\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("Types.pas")).unwrap();
+        let key = session.context.intern_key("TYPES");
+
+        // unknown name
+        assert!(
+            session
+                .signature_help(key, session.context.intern_key("Nonexistent"), None)
+                .is_empty(),
+            "an unknown callee yields no signature"
+        );
+        // a TYPE is not a routine → no signature
+        assert!(
+            session
+                .signature_help(key, session.context.intern_key("TThing"), None)
+                .is_empty(),
+            "a non-routine symbol yields no signature"
+        );
+        // a member on an unresolved owner → no signature
+        assert!(
+            session
+                .signature_help(
+                    key,
+                    session.context.intern_key("Whatever"),
+                    Some(session.context.intern_key("TGhost"))
+                )
+                .is_empty(),
+            "a member on an unresolved owner yields no signature"
         );
     }
 

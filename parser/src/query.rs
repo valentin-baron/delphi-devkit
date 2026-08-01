@@ -116,6 +116,40 @@ pub struct HoverInfo {
     pub occurrence: CodeLocation,
 }
 
+/// A resolved routine signature for `textDocument/signatureHelp`, read from the
+/// AST's [`crate::ast::RoutineType`] (parameters + return type).
+///
+/// Never fabricated: [`crate::driver::ProjectSession::signature_help`] returns
+/// `None` when the callee does not resolve to a routine (an unknown name, a
+/// non-routine symbol, a member on an unresolved owner). A procedure carries
+/// `return_type = None`. Parameter labels are built from the declared parameter
+/// modifier/names/type as written (display track via `globals::resolve`), with
+/// an untyped parameter (`var Buffer`) rendered without a `: Type` and a
+/// defaulted parameter (`X: Integer = 0`) carrying its ` = default`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignatureInfo {
+    /// The whole signature line, e.g.
+    /// `function Compute(const A: Integer; B: string = ''): Boolean` — built from
+    /// the resolved parts, never a fabrication.
+    pub label: String,
+    /// One entry per PARAMETER GROUP name (a `const A, B: Integer` group yields
+    /// two parameters `const A: Integer` and `const B: Integer`), in source
+    /// order. The `label` of each is a substring of [`Self::label`] so the editor
+    /// can highlight the active parameter.
+    pub parameters: Vec<ParameterInfo>,
+    /// The return type display, `None` for a procedure/constructor/destructor
+    /// (no return) or a function whose return type is anonymous/complex and could
+    /// not be rendered (never fabricated).
+    pub return_type: Option<String>,
+}
+
+/// One parameter of a [`SignatureInfo`]: its rendered label
+/// (`const Name: Type`, `var Buffer`, `X: Integer = 0`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParameterInfo {
+    pub label: String,
+}
+
 /// Where a diagnostic came from, so the devkit can group/filter them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagnosticSource {
