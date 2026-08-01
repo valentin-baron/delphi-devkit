@@ -1214,9 +1214,11 @@ fn top_level_signatures(
         .filter_map(|declaration| match &declaration.type_expression {
             // A top-level routine stores its signature as a Routine type
             // expression (see parser::parse_routine_header).
-            Some(TypeExpression::Routine(routine)) => {
-                Some(render_signature(declaration.name.name, routine))
-            }
+            Some(TypeExpression::Routine(routine)) => Some(render_signature(
+                declaration.name.name,
+                routine,
+                &declaration.generic_parameters,
+            )),
             _ => None,
         })
         .collect()
@@ -1254,7 +1256,11 @@ fn method_signatures(
                 continue;
             }
             if method.name.key == method_key {
-                signatures.push(render_signature(method.name.name, &method.routine));
+                signatures.push(render_signature(
+                    method.name.name,
+                    &method.routine,
+                    &method.generic_parameters,
+                ));
             }
         }
     }
@@ -1291,6 +1297,7 @@ fn type_members(
 fn render_signature(
     name: Identifier,
     routine: &crate::ast::RoutineType,
+    generic_parameters: &[crate::ast::GenericParameter],
 ) -> crate::query::SignatureInfo {
     use crate::ast::RoutineKind;
     let keyword = match routine.kind {
@@ -1321,7 +1328,25 @@ fn render_signature(
         .as_ref()
         .and_then(render_type_expression);
 
-    let mut label = format!("{keyword} {}({parameter_list})", crate::globals::resolve(name));
+    // A GENERIC routine (`function Map<T>(...)`) carries a type-parameter
+    // clause that belongs AFTER the name and BEFORE the `(`. Render only the
+    // parameter NAMES (`<T, U>`); constraint clauses are spans not rendered
+    // here. Empty for a non-generic routine → no clause.
+    let generic_clause = if generic_parameters.is_empty() {
+        String::new()
+    } else {
+        let names = generic_parameters
+            .iter()
+            .map(|parameter| crate::globals::resolve(parameter.name.name).to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("<{names}>")
+    };
+
+    let mut label = format!(
+        "{keyword} {}{generic_clause}({parameter_list})",
+        crate::globals::resolve(name)
+    );
     if let Some(return_display) = &return_type {
         label.push_str(": ");
         label.push_str(return_display);
@@ -2271,6 +2296,52 @@ mod tests {
                 .iter()
                 .any(|signature| signature.label == "procedure Same(S: string)"),
             "the string overload: {signatures:?}"
+        );
+    }
+
+    #[test]
+    fn signature_help_generic_method_renders_type_parameter_clause() {
+        // A GENERIC method (`function Map<T>(...)`) carries a type-parameter
+        // clause that must appear after the name and before the `(`. It must
+        // not be silently dropped. A multi-parameter generic renders `<T, U>`.
+        let directory = temp_directory("sig_generic_method");
+        std::fs::write(
+            directory.join("Gen.pas"),
+            "unit Gen;\ninterface\n\
+             type TGen = class\npublic\n\
+               function Map<T>(const Item: T): T;\n\
+               function Pair<K, V>(const Key: K; const Value: V): Boolean;\n\
+             end;\n\
+             implementation\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("Gen.pas")).unwrap();
+        let key = session.context.intern_key("GEN");
+
+        let map = session.signature_help(
+            key,
+            session.context.intern_key("Map"),
+            Some(session.context.intern_key("TGen")),
+        );
+        assert_eq!(map.len(), 1, "{map:?}");
+        assert!(
+            map[0].label.contains("<T>"),
+            "generic clause `<T>` must appear: {}",
+            map[0].label
+        );
+        assert_eq!(map[0].label, "function Map<T>(const Item: T): T");
+
+        let pair = session.signature_help(
+            key,
+            session.context.intern_key("Pair"),
+            Some(session.context.intern_key("TGen")),
+        );
+        assert_eq!(pair.len(), 1, "{pair:?}");
+        assert_eq!(
+            pair[0].label,
+            "function Pair<K, V>(const Key: K; const Value: V): Boolean"
         );
     }
 
