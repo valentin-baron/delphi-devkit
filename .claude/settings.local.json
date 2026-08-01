@@ -1,0 +1,14 @@
+{
+  "enabledMcpjsonServers": [
+    "rocketchat",
+    "kill-process",
+    "outlook-calendar",
+    "mcp-atlassian"
+  ],
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/baron/**)",
+      "Read(//c/Delphi/VSS/Intern/**)"
+    ]
+  }
+}

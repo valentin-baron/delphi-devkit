@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "rocketchat": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "--directory", "C:\\workspaces\\mcp-rocketchat",
+        "run", "rocketchat.py",
+        "--transport", "stdio"
+      ],
+      "env": {}
+    }
+  }
+}

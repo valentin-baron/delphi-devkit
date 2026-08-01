@@ -249,6 +249,69 @@ impl ProjectSession {
         Ok((outcome, meta))
     }
 
+    /// Parse an in-memory (unsaved editor) buffer for `path` through the SAME
+    /// pipeline as [`Self::parse_source_file`], seeding the arena with the
+    /// caller-supplied `content` via [`SourceArena::insert_virtual`] instead of
+    /// reading from disk. This is the LSP entry point: an editor holds unsaved
+    /// text that must be analyzed before it is saved.
+    ///
+    /// INVARIANT PRESERVED (#21/#25): a virtual buffer never persists. The
+    /// buffer's `FileId` carries a display-only path that does not canonicalize,
+    /// so its source stamp hashes decoded content (never matches a disk read)
+    /// and its serialized `FileId` fails to `register` on load — the meta is
+    /// dropped as unreadable. `save_now` therefore never writes a virtual unit
+    /// as if it were on-disk state. Tested by
+    /// [`tests::parse_buffer_virtual_unit_is_not_persisted`].
+    ///
+    /// The returned `meta.name()` is the parsed unit's folded key — the handle
+    /// the LSP maps its `Url` onto for subsequent query calls
+    /// (`diagnostics`/`symbol_at`/…).
+    ///
+    /// A fresh virtual `FileId` is issued on every call (the arena does not
+    /// deduplicate virtual buffers), so re-parsing an edited buffer never reads
+    /// a stale prior version. The cache entry for the unit key is replaced by
+    /// the pipeline's `insert`, so a query after `parse_buffer` sees the newest
+    /// buffer.
+    pub fn parse_buffer(
+        &mut self,
+        path: impl AsRef<Path>,
+        content: &str,
+    ) -> Result<(ParseOutcome, Option<Arc<UnitMeta>>), SessionError> {
+        let file = self
+            .arena
+            .insert_virtual(path.as_ref().to_path_buf(), content.to_string());
+        let inserts_before = self.context.unit_cache.insert_count();
+
+        let loader = UnitLoader::new(self.arena, self.context.clone(), Some(self.index.clone()));
+        let (outcome, meta) =
+            pipeline::parse_and_cache(self.arena, &self.context, file, Some(loader)).map_err(
+                |error| SessionError {
+                    message: format!("parse failed: {error:?}"),
+                },
+            )?;
+
+        if let Some(meta) = &meta {
+            self.index.index_artifact(meta.name(), meta);
+            self.reference_index.index_unit(meta.name(), meta);
+            self.record_parse_diagnostics(meta.name(), &outcome);
+            self.link_sibling_dfm(meta);
+        }
+        // Imports pulled in as side effects (from disk — an editor buffer's
+        // `uses` still resolves against on-disk units) also belong in the
+        // reference index, exactly as `parse_source_file` folds them.
+        if self.context.unit_cache.insert_count() != inserts_before {
+            self.index_nested_units();
+        }
+        // A virtual buffer's own meta is NOT durable (it never validates on
+        // load), but nested on-disk units pulled in as side effects ARE — mark
+        // dirty only when such a real unit was cached, so an unsaved-buffer edit
+        // alone does not trigger an autosave of nothing persistable.
+        if self.context.unit_cache.insert_count() != inserts_before {
+            self.dirty = true;
+        }
+        Ok((outcome, meta))
+    }
+
     /// If the unit has a sibling `.dfm`, parse it and run the DFM↔PAS linker,
     /// storing the result under the unit key for later query. A dfm that fails
     /// to read/parse (deleted between stamp and link, binary form, syntax
@@ -1561,6 +1624,149 @@ mod tests {
             report.written, 0,
             "a recovered meta must not be persisted as a clean interface"
         );
+    }
+
+    // ─── Part A: parse_buffer (unsaved editor content) ──────────────────
+
+    #[test]
+    fn parse_buffer_parses_unsaved_content_same_interface_as_disk() {
+        // The same source parsed from an in-memory buffer and from disk must
+        // yield the same interface surface (symbols, kinds).
+        let directory = temp_directory("parse_buffer_same");
+        let source = "unit Widgets;\ninterface\n\
+             type TWidget = class\n  Width: Integer;\n  procedure Draw;\nend;\n\
+             const MaxWidgets = 7;\n\
+             implementation\nend.";
+
+        // on-disk parse
+        let disk_path = directory.join("Widgets.pas");
+        std::fs::write(&disk_path, source).unwrap();
+        let mut disk_session = query_session(&directory);
+        let (_, disk_meta) = disk_session.parse_source_file(&disk_path).unwrap();
+        let disk_meta = disk_meta.expect("on-disk unit meta");
+
+        // in-memory buffer parse (unsaved) — a DIFFERENT display path so it
+        // cannot collide with the on-disk file
+        let mut buffer_session = query_session(&directory);
+        let (outcome, buffer_meta) = buffer_session
+            .parse_buffer(directory.join("Widgets_unsaved.pas"), source)
+            .unwrap();
+        let buffer_meta = buffer_meta.expect("buffer unit meta");
+
+        assert!(!outcome.recovered, "clean source must not be flagged recovered");
+        // same unit name
+        assert_eq!(buffer_meta.name(), disk_meta.name());
+        // same interface symbol set (folded keys)
+        let disk_keys: std::collections::HashSet<_> =
+            disk_meta.interface().symbols.iter().map(|s| s.key).collect();
+        let buffer_keys: std::collections::HashSet<_> =
+            buffer_meta.interface().symbols.iter().map(|s| s.key).collect();
+        assert_eq!(disk_keys, buffer_keys, "interface surface must match on-disk");
+        // and the member surface of TWidget matches
+        let key = buffer_session.context.intern_key("TWidget");
+        let buffer_members: std::collections::HashSet<_> = buffer_meta
+            .interface()
+            .find(key)
+            .unwrap()
+            .members
+            .iter()
+            .map(|m| m.key)
+            .collect();
+        let disk_members: std::collections::HashSet<_> = disk_meta
+            .interface()
+            .find(key)
+            .unwrap()
+            .members
+            .iter()
+            .map(|m| m.key)
+            .collect();
+        assert_eq!(buffer_members, disk_members, "member surface must match");
+    }
+
+    #[test]
+    fn parse_buffer_virtual_unit_is_not_persisted() {
+        // The proving invariant (#21/#25): a unit parsed from an unsaved buffer
+        // must never MASQUERADE as on-disk state across sessions. A virtual
+        // FileId carries a display-only path that does not exist on disk, so on
+        // load its `FileId` fails to `register` (canonicalize) — the meta is
+        // dropped as `unreadable` and never re-enters a fresh cache. This is the
+        // load-time gate SESSION.md #21/#25 describe: unsaved state does not
+        // survive a save/load round-trip.
+        let directory = temp_directory("parse_buffer_no_persist");
+        let mut session = query_session(&directory);
+        // The buffer's display path is a NON-EXISTENT file (nothing was written
+        // to disk) — the essence of an unsaved editor buffer.
+        let virtual_path = directory.join("OnlyInEditor_unsaved.pas");
+        assert!(!virtual_path.exists(), "the buffer path must not exist on disk");
+        let source = "unit OnlyInEditor;\ninterface\n\
+             type TDraft = class end;\n\
+             implementation\nend.";
+        let (_, meta) = session.parse_buffer(&virtual_path, source).unwrap();
+        let meta = meta.expect("buffer produces a meta");
+        let key = meta.name();
+        // it IS in the live cache (queryable this session)
+        assert!(session.meta_of(key).is_some(), "queryable in-session");
+
+        // Save, then load into a FRESH cache: the virtual unit must NOT come
+        // back — its FileId path cannot re-register, so it is counted unreadable
+        // and dropped. A future session therefore never sees unsaved state.
+        let snapshot = directory.join("virtual_roundtrip.bin");
+        session.context.unit_cache.save(&snapshot).unwrap();
+
+        let fresh = UnitCache::default();
+        let report = fresh.load(&snapshot).unwrap();
+        assert_eq!(
+            report.loaded, 0,
+            "the virtual (unsaved) unit must not load back: {report:?}"
+        );
+        assert!(
+            fresh.get(key).is_none(),
+            "the virtual unit must be absent from a freshly loaded cache"
+        );
+        assert!(
+            report.unreadable >= 1,
+            "the virtual unit is dropped as unreadable on load: {report:?}"
+        );
+    }
+
+    #[test]
+    fn parse_buffer_diagnostics_and_symbol_queries_work() {
+        // After parse_buffer the LSP query surface (diagnostics, symbol_at)
+        // works against the buffer's unit key — this is the handle the LSP maps
+        // its Url onto.
+        let directory = temp_directory("parse_buffer_query");
+        let mut session = query_session(&directory);
+        // an unknown {$IF} leaves a parse diagnostic; a clean type declares a
+        // symbol we can hit with symbol_at.
+        let source = "unit Editing;\ninterface\n\
+             {$IF SizeOf(TMysteryExternal) > 4} const A = 1; {$IFEND}\n\
+             type TThing = class end;\n\
+             implementation\nend.";
+        let (_, meta) = session
+            .parse_buffer(directory.join("Editing.pas"), source)
+            .unwrap();
+        let meta = meta.expect("buffer meta");
+        let key = meta.name();
+
+        // diagnostics query returns the parse finding from the unknown {$IF}
+        let diagnostics = session.diagnostics(key);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.source == DiagnosticSource::Parse),
+            "unknown {{$IF}} leaves a queryable parse diagnostic: {diagnostics:?}"
+        );
+
+        // symbol_at hits the TThing declaration in the buffer
+        let thing = meta
+            .interface()
+            .find(session.context.intern_key("TThing"))
+            .unwrap();
+        let target = session
+            .symbol_at(key, thing.location.span.start)
+            .expect("symbol_at hits TThing in the buffer");
+        assert_eq!(target.key, session.context.intern_key("TThing"));
+        assert_eq!(target.kind, TargetKind::Declaration);
     }
 
     #[test]
