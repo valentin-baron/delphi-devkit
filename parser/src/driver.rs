@@ -1427,8 +1427,20 @@ fn render_type_expression(type_expression: &crate::ast::TypeExpression) -> Optio
         TypeExpression::ClassReference(name) => {
             Some(format!("class of {}", crate::globals::resolve(name.name)))
         }
-        TypeExpression::Array { element, .. } => {
-            render_type_expression(element).map(|element| format!("array of {element}"))
+        TypeExpression::Array { bounds, element } => {
+            let element_display = render_type_expression(element)?;
+            // A FIXED array (`array[0..3] of T`) carries a bounds span; a
+            // DYNAMIC array carries None. These are DIFFERENT types, so never
+            // render a fixed array as a bare `array of T`. Render the bounds
+            // from their source span; if the span is unrenderable, return None
+            // (omit the `: Type`) rather than misrepresent the fixed array.
+            match bounds {
+                Some(bounds_span) => {
+                    let bounds_text = render_span_text(*bounds_span)?;
+                    Some(format!("array[{}] of {element_display}", bounds_text.trim()))
+                }
+                None => Some(format!("array of {element_display}")),
+            }
         }
         TypeExpression::ArrayOfConst => Some("array of const".to_string()),
         TypeExpression::SetOf(inner) => {
@@ -2296,6 +2308,50 @@ mod tests {
                 .iter()
                 .any(|signature| signature.label == "procedure Same(S: string)"),
             "the string overload: {signatures:?}"
+        );
+    }
+
+    #[test]
+    fn signature_help_fixed_array_param_renders_bounds_not_bare_dynamic() {
+        // A FIXED-length array parameter (`array[0..3] of Byte`) is a DIFFERENT
+        // type from a dynamic/open `array of Byte`. Its bounds must be rendered
+        // (never dropped, which would misrepresent it as dynamic). A dynamic
+        // array in the same signature still renders as `array of T`.
+        let directory = temp_directory("sig_fixed_array");
+        std::fs::write(
+            directory.join("Buf.pas"),
+            "unit Buf;\ninterface\n\
+             type TBuf = class\npublic\n\
+               procedure Fill(const A: array[0..3] of Byte; const D: array of Byte);\n\
+             end;\n\
+             implementation\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("Buf.pas")).unwrap();
+        let key = session.context.intern_key("BUF");
+
+        let signatures = session.signature_help(
+            key,
+            session.context.intern_key("Fill"),
+            Some(session.context.intern_key("TBuf")),
+        );
+        assert_eq!(signatures.len(), 1, "{signatures:?}");
+        let signature = &signatures[0];
+        assert_eq!(signature.parameters.len(), 2);
+        // FIXED array — bounds rendered, NOT a bare `array of Byte`
+        assert_eq!(signature.parameters[0].label, "const A: array[0..3] of Byte");
+        assert!(
+            !signature.parameters[0].label.contains("A: array of Byte"),
+            "a fixed array must not render as a dynamic array: {}",
+            signature.parameters[0].label
+        );
+        // DYNAMIC array — bare `array of Byte`
+        assert_eq!(signature.parameters[1].label, "const D: array of Byte");
+        assert_eq!(
+            signature.label,
+            "procedure Fill(const A: array[0..3] of Byte; const D: array of Byte)"
         );
     }
 
