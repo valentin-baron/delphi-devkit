@@ -131,6 +131,20 @@ impl DocumentStore {
         self.documents.get(uri)
     }
 
+    /// A snapshot of every currently-open document's `Url`. This is the
+    /// AUTHORITATIVE set of what the editor holds open (all open docs, whether or
+    /// not any `analyze` has recorded a unit key for them yet). The Task-18 idle
+    /// indexer snapshots this at the START of each pass and skips any candidate
+    /// unit whose file path maps (via `Url::from_file_path`) into this set, so an
+    /// open buffer's VIRTUAL meta is never overwritten by a DISK re-parse — even
+    /// when the buffer's cache entry has been LRU-evicted (the residency
+    /// freshness-skip cannot see an evicted entry, so path→URL exclusion is the
+    /// correctness guard, not that skip). Cloned out under the store lock so the
+    /// caller holds no lock across its indexing pass.
+    pub fn open_urls(&self) -> Vec<Url> {
+        self.documents.keys().cloned().collect()
+    }
+
     // Store-introspection accessors used by tests today; wired to feature
     // providers (definition/hover/references decide "is this file open?" before
     // reading from the store vs. disk) in a later task. Kept as the store's

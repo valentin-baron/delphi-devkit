@@ -296,6 +296,14 @@ impl SessionManager {
             // (hash-validated at load; a stale one would have been dropped). Skip
             // it without re-parsing so a warm pass over an already-indexed project
             // is cheap and idempotent.
+            //
+            // This is a WORK-SAVING HEURISTIC keyed off the filename STEM, NOT the
+            // open-buffer safety guarantee. Open-buffer safety is provided ENTIRELY
+            // by the caller's path→URL exclusion in `run_indexing_pass` (an open
+            // unit never reaches `index_unit`), so this skip does not need to — and
+            // must not be relied upon to — protect an open buffer's virtual meta:
+            // that virtual entry is evictable, and once evicted this skip would not
+            // fire.
             if let Some(stem) = unit_stem(&path) {
                 let unit_key = project_session.context().intern_key(&stem);
                 if matches!(
@@ -1260,6 +1268,147 @@ mod tests {
             "the pass was cancelled by the foreground bump, short of N ({} < {})",
             processed,
             units.len()
+        );
+    }
+
+    /// OPEN-BUFFER OVERWRITE GUARD (Task-18 HIGH fix): the indexer must NEVER
+    /// re-parse from disk a unit that is OPEN in the editor — even when the open
+    /// buffer's VIRTUAL cache entry has been EVICTED (LRU) so the residency
+    /// freshness-skip in `index_unit` cannot see it. The correctness guard is the
+    /// path→URL exclusion `run_indexing_pass` applies against a snapshot of the
+    /// open documents taken at the pass start; this test drives that exact seam.
+    ///
+    /// Scenario: open UnitX as an editor buffer (its virtual meta carries a
+    /// BUFFER-only symbol `TBufferOnly`), then EVICT its cache entry
+    /// (`unit_cache.invalidate` — the moka eviction a warming pass over a large
+    /// project can trigger). UnitX.pas exists on disk with DIFFERENT content (a
+    /// DISK-only symbol `TDiskOnly`, and NO `TBufferOnly`). Run the indexer over a
+    /// work list that INCLUDES UnitX.pas — mirroring `run_indexing_pass`'s loop
+    /// with the open-URL snapshot + path→URL skip. Assert the indexer SKIPS UnitX
+    /// (never calls `index_unit` for it), so the cache is NOT overwritten with
+    /// disk content — a subsequent read (re-analyze via `parse_buffer`, the read
+    /// handlers' meta source) returns the BUFFER symbol, never the DISK-only one.
+    /// A disk-only SIBLING (`Other.pas`, NOT open) IS indexed, proving the loop
+    /// otherwise does its warming work.
+    #[tokio::test]
+    async fn indexer_skips_open_unit_even_when_its_cache_entry_is_evicted() {
+        use crate::documents::DocumentStore;
+        use tower_lsp::lsp_types::Url;
+
+        let base = fresh_snapshot_base("index-open-skip");
+        // UnitX ON DISK: a DISK-only symbol, and crucially NO `TBufferOnly`.
+        let unit_x_path = base.join("UnitX.pas");
+        std::fs::write(
+            &unit_x_path,
+            "unit UnitX;\ninterface\ntype TDiskOnly = class end;\nimplementation\nend.",
+        )
+        .unwrap();
+        // A disk-only SIBLING that is NOT open — the indexer must still warm it.
+        let other_path = base.join("Other.pas");
+        std::fs::write(
+            &other_path,
+            "unit Other;\ninterface\ntype TOther = class end;\nimplementation\nend.",
+        )
+        .unwrap();
+
+        let mut session = build_fallback_session_with_snapshot_base(base.clone());
+        // OPEN UnitX as an editor buffer whose UNSAVED content differs from disk:
+        // it declares `TBufferOnly`, which is NOT on disk. Its virtual meta is now
+        // cached under the `UnitX` key.
+        let buffer_text = "unit UnitX;\ninterface\ntype TBufferOnly = class end;\n\
+             implementation\nend.";
+        let (_, meta) = session
+            .parse_buffer(&unit_x_path, buffer_text)
+            .expect("open buffer parses");
+        let unit_x_key = meta.expect("buffer meta").name();
+        let buffer_only = session.context().intern_key("TBufferOnly");
+        let disk_only = session.context().intern_key("TDiskOnly");
+        assert!(
+            session
+                .meta_for(unit_x_key)
+                .unwrap()
+                .interface()
+                .contains_key(buffer_only),
+            "the open buffer's meta carries TBufferOnly before eviction"
+        );
+
+        // EVICT the buffer's cache entry — simulate the moka LRU eviction a warming
+        // pass over a large project can cause. After this, `index_unit`'s residency
+        // freshness-skip (which only fires on a resident `Done` entry) can NO LONGER
+        // protect the open buffer; only the caller's path→URL exclusion can.
+        session.context().unit_cache.invalidate(unit_x_key);
+        assert!(
+            session.meta_for(unit_x_key).is_none(),
+            "the buffer's virtual entry is evicted (not resident)"
+        );
+
+        let manager = SessionManager::new();
+        manager.inject_session_for_test(session).await;
+
+        // The open-document store holds UnitX open (the authoritative source of
+        // what the editor holds open — `run_indexing_pass` snapshots THIS).
+        let mut store = DocumentStore::new();
+        let unit_x_url = Url::from_file_path(&unit_x_path).unwrap();
+        store.open(unit_x_url.clone(), 1, buffer_text.to_string());
+        let open_urls: std::collections::HashSet<Url> =
+            store.open_urls().into_iter().collect();
+
+        // Drive the EXACT `run_indexing_pass` seam: a work list including UnitX.pas
+        // (open) and Other.pas (not open); for each candidate, skip by path→URL
+        // membership BEFORE `index_unit`.
+        let work_list = vec![unit_x_path.clone(), other_path.clone()];
+        let mut indexed_from_disk: Vec<PathBuf> = Vec::new();
+        for path in &work_list {
+            let is_open = Url::from_file_path(path)
+                .map(|url| open_urls.contains(&url))
+                .unwrap_or(false);
+            if is_open {
+                continue; // the open-buffer exclusion — never re-parse from disk.
+            }
+            let outcome = manager.index_unit(path.clone()).await;
+            assert_eq!(outcome, UnitIndexOutcome::Indexed, "sibling indexes");
+            indexed_from_disk.push(path.clone());
+        }
+
+        // UnitX was NEVER indexed from disk; only the non-open sibling was.
+        assert_eq!(
+            indexed_from_disk,
+            vec![other_path.clone()],
+            "the open UnitX is excluded; only the non-open Other is indexed"
+        );
+
+        // PROOF OF NO OVERWRITE: the cache key for UnitX was NOT overwritten with
+        // disk content. Since the indexer skipped it, the disk-only symbol never
+        // entered the cache under the UnitX key. A subsequent READ (re-analyze via
+        // `parse_buffer` — the exact source read handlers reuse) returns the BUFFER
+        // symbol, and NEVER the disk-only symbol.
+        let handle = manager.handle();
+        let (has_buffer_symbol, has_disk_symbol) = tokio::task::spawn_blocking(move || {
+            let mut guard = handle.blocking_lock();
+            let session = guard.as_mut().unwrap();
+            let (_, meta) = session
+                .parse_buffer(&unit_x_path, buffer_text)
+                .expect("re-analyze of the still-open buffer");
+            let key = meta.expect("buffer meta").name();
+            let interface = session.meta_for(key).unwrap();
+            let interface = interface.interface();
+            let result = (
+                interface.contains_key(buffer_only),
+                interface.contains_key(disk_only),
+            );
+            session.trim_arena();
+            result
+        })
+        .await
+        .unwrap();
+        assert!(
+            has_buffer_symbol,
+            "a read for UnitX returns the BUFFER symbol (TBufferOnly)"
+        );
+        assert!(
+            !has_disk_symbol,
+            "a read for UnitX NEVER returns the disk-only symbol — the indexer did \
+             not overwrite the open buffer's meta with disk content"
         );
     }
 

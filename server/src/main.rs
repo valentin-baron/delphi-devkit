@@ -204,6 +204,27 @@ impl DelphiLsp {
         if units.is_empty() {
             return;
         }
+
+        // Snapshot the set of OPEN document URLs at the START of the pass, from the
+        // authoritative source of what the editor holds open — the `documents`
+        // store. This is the correctness guard against the open-buffer overwrite:
+        // the unit cache is keyed by unit NAME, so an open editor buffer's VIRTUAL
+        // meta (from `parse_buffer`) and the indexer's DISK meta (from
+        // `parse_source_file`) share a key. `index_unit`'s residency freshness-skip
+        // only fires on a RESIDENT `Done` entry — but the open buffer's virtual
+        // entry is EVICTABLE from the moka cache (a warming pass over a large
+        // project can evict it), after which that skip fails and a disk re-parse
+        // would overwrite the key, so read handlers (which reuse the cached meta,
+        // no re-parse) would then serve DISK content for the UNSAVED buffer. We
+        // therefore NEVER index a unit that is open in the editor, regardless of
+        // cache residency, by excluding it by PATH→URL below (no unit-name guess,
+        // no filename-stem reliance). Cloned out under the store lock so the lock
+        // is not held across the pass.
+        let open_urls: std::collections::HashSet<Url> = {
+            let store = self.documents.lock().await;
+            store.open_urls().into_iter().collect()
+        };
+
         let total = units.len();
 
         // A single work-done progress for the whole pass ("Delphi: indexing",
@@ -221,6 +242,30 @@ impl DelphiLsp {
             // before another unit's parse can start.
             if self.index_generation.changed_since(start_generation) {
                 break;
+            }
+
+            // OPEN-BUFFER EXCLUSION (correctness guard): never re-parse from disk a
+            // unit that is OPEN in the editor. Membership is by PATH→URL against the
+            // pass-start snapshot — robust (no unit-name guessing, no filename-stem
+            // reliance) and done BEFORE `index_unit` parses/inserts, so an open
+            // unit's virtual buffer meta is never overwritten with disk content. A
+            // path that cannot form a `file://` URL (never a real editor buffer) is
+            // simply not in the set and indexes normally.
+            let is_open = Url::from_file_path(path)
+                .map(|url| open_urls.contains(&url))
+                .unwrap_or(false);
+            if is_open {
+                // Still advance progress so the N/M percentage covers the whole
+                // work list; the open unit is left to `analyze`, which owns its
+                // (fresher) virtual meta.
+                if let Some(reporter) = progress.as_ref() {
+                    let done = position + 1;
+                    let percentage = ((done * 100) / total) as u32;
+                    reporter
+                        .report(Some(percentage), Some(format!("{done}/{total} — (open, skipped)")))
+                        .await;
+                }
+                continue;
             }
 
             let outcome = self.session.index_unit(path.clone()).await;
@@ -1174,6 +1219,10 @@ impl LanguageServer for DelphiLsp {
     }
 
     async fn shutdown(&self) -> jsonrpc::Result<()> {
+        // Preempt any running background indexing pass promptly: bump the
+        // generation so a pass in flight cancels at its next between-units check
+        // rather than racing the shutdown save for the session lock.
+        self.note_foreground_activity();
         ddk_core::projects::compiler_state::cancel();
         // Best-effort final persistence: write the session snapshot so edits
         // made this session survive into the next. NEVER panic or fail shutdown
