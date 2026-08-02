@@ -4,6 +4,85 @@ use std::path::{Path, PathBuf, Component};
 mod document;
 pub use document::*;
 
+/// The custom environment-variable overrides configured in the Delphi IDE
+/// (Tools > Options > IDE > Environment Variables), stored per BDS version at
+/// `HKCU\SOFTWARE\<vendor>\BDS\<ver>\Environment Variables`. The IDE injects
+/// these into its own process (and thus into IDE-run MSBuild), so dproj
+/// values routinely reference them (e.g. a site-specific `$(VEGADIR)`) even
+/// though they exist in no real environment. Reads the set of the given BDS
+/// major version (`23` for Delphi 12 Athens — the same number as
+/// `CompilerConfiguration::product_version`); returns an empty list when the
+/// key does not exist (or off Windows).
+#[cfg(windows)]
+pub fn bds_environment_overrides(bds_major_version: usize) -> Vec<(String, String)> {
+    use winreg::RegKey;
+    use winreg::enums::HKEY_CURRENT_USER;
+
+    // The registry root moved as the product changed hands: Borland up to
+    // BDS 5.0 (Delphi 2007), CodeGear for 6.0/7.0 (2009/2010), Embarcadero
+    // from 8.0 (XE) onwards.
+    let vendor = match bds_major_version {
+        0..=5 => "Borland",
+        6..=7 => "CodeGear",
+        _ => "Embarcadero",
+    };
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let key_path = format!(r"SOFTWARE\{vendor}\BDS\{bds_major_version}.0\Environment Variables");
+    let Ok(env_key) = hkcu.open_subkey(key_path) else {
+        return Vec::new();
+    };
+    env_key
+        .enum_values()
+        .flatten()
+        .map(|(name, value)| (name, value.to_string()))
+        .collect()
+}
+
+#[cfg(not(windows))]
+pub fn bds_environment_overrides(_bds_major_version: usize) -> Vec<(String, String)> {
+    Vec::new()
+}
+
+/// Fallback variant of [`bds_environment_overrides`] for projects with no
+/// owning workspace or group project to pick a compiler configuration from:
+/// reads the highest installed BDS version's non-empty set.
+#[cfg(windows)]
+pub fn ide_environment_overrides() -> Vec<(String, String)> {
+    use winreg::RegKey;
+    use winreg::enums::HKEY_CURRENT_USER;
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let Ok(bds) = hkcu.open_subkey(r"SOFTWARE\Embarcadero\BDS") else {
+        return Vec::new();
+    };
+    let mut versions: Vec<String> = bds.enum_keys().flatten().collect();
+    // Version keys are "20.0", "22.0", "23.0", ... — lexicographic order is
+    // wrong across the 9.x/10.x boundary, so compare numerically.
+    versions.sort_by(|a, b| {
+        let parse = |v: &str| v.split('.').next().and_then(|n| n.parse::<u32>().ok()).unwrap_or(0);
+        parse(a).cmp(&parse(b))
+    });
+    for version in versions.iter().rev() {
+        let Ok(env_key) = bds.open_subkey(format!(r"{version}\Environment Variables")) else {
+            continue;
+        };
+        let overrides: Vec<(String, String)> = env_key
+            .enum_values()
+            .flatten()
+            .map(|(name, value)| (name, value.to_string()))
+            .collect();
+        if !overrides.is_empty() {
+            return overrides;
+        }
+    }
+    Vec::new()
+}
+
+#[cfg(not(windows))]
+pub fn ide_environment_overrides() -> Vec<(String, String)> {
+    Vec::new()
+}
+
 /// Normalise a path by:
 ///   1. Resolving `.` and `..` segments purely (without touching the filesystem).
 ///   2. Stripping the Windows extended-length prefix (`\\?\`) if present.

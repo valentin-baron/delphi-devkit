@@ -18,12 +18,34 @@ pub struct CompileResult {
     pub success: bool,
     pub cancelled: bool,
     pub code: i32,
+    /// Structured description of what was compiled, lifted from the banner.
+    pub header: CompileHeader,
+}
+
+/// Structured header metadata for a compile, mirroring the banner fields.
+#[derive(Debug, Clone, Default)]
+pub struct CompileHeader {
+    /// The compiled project/target path (or a description for multi-project runs).
+    pub target: String,
+    /// Product name of the compiler, e.g. "Delphi 12.0 Athens".
+    pub compiler: String,
+    /// Effective build configuration (single-project compiles only).
+    pub config: Option<String>,
+    /// Effective target platform (single-project compiles only).
+    pub platform: Option<String>,
+    /// Whether this was a rebuild (Clean;Build) rather than a compile (Clean;Make).
+    pub rebuild: bool,
 }
 
 pub struct Compiler {
     client: Option<tower_lsp::Client>,
     params: CompileProjectParams,
     projects_data: ProjectsData,
+    /// Additional free-form arguments appended to the MSBuild command line
+    /// (from the CLI `-- <args...>` passthrough). Ignored for bare
+    /// `.dpr`/`.dpk` compiles, which use the command-line compiler (dcc)
+    /// rather than MSBuild.
+    extra_msbuild_args: Vec<String>,
 }
 
 impl Compiler {
@@ -33,6 +55,7 @@ impl Compiler {
             client: Some(client),
             params: params.clone(),
             projects_data: PROJECTS_DATA.read().await.clone(),
+            extra_msbuild_args: Vec::new(),
         }
     }
 
@@ -44,7 +67,17 @@ impl Compiler {
             client: None,
             params: params.clone(),
             projects_data: PROJECTS_DATA.read().await.clone(),
+            extra_msbuild_args: Vec::new(),
         }
+    }
+
+    /// Append additional free-form arguments to the MSBuild invocation. These
+    /// are placed **after** the built-in `/p:Config`/`/p:Platform` args so a
+    /// user-supplied `/p:` override wins (MSBuild takes the last value). Has no
+    /// effect on bare `.dpr`/`.dpk` compiles (which do not use MSBuild).
+    pub fn with_extra_msbuild_args(mut self, args: Vec<String>) -> Self {
+        self.extra_msbuild_args = args;
+        self
     }
 
     /// Create a standalone compiler operating on an explicit, caller-supplied
@@ -60,6 +93,7 @@ impl Compiler {
             client: None,
             params: params.clone(),
             projects_data,
+            extra_msbuild_args: Vec::new(),
         }
     }
 
@@ -358,10 +392,18 @@ impl Compiler {
         let cancelled = compiler_state::is_cancelled();
         // Treat cancellation as a non-error outcome so no upstream error is logged
         let result = if cancelled { Ok(()) } else { result };
+        let banner = &parameters.banner;
         let compile_result = CompileResult {
             success: compiler_state::is_success(),
             cancelled,
             code: compiler_state::get_code(),
+            header: CompileHeader {
+                target: banner.target.clone(),
+                compiler: banner.compiler_name.clone(),
+                config: banner.config_platform.as_ref().map(|(c, _)| c.clone()),
+                platform: banner.config_platform.as_ref().map(|(_, p)| p.clone()),
+                rebuild: banner.rebuild,
+            },
         };
         CompilerProgress::notify_completed(
             self.client.as_ref(),
@@ -443,9 +485,22 @@ impl Compiler {
                     .args(args.split_whitespace())
                     .arg(format!("/p:Config={}", eff_config))
                     .arg(format!("/p:Configuration={}", eff_config))
-                    .arg(format!("/p:Platform={}", eff_platform));
+                    .arg(format!("/p:Platform={}", eff_platform))
+                    // prevent MSB60002/MSB60003 (32000-character command line limit
+                    .arg("/p:DCC_UseMSBuildExternally=true")
+                    // User passthrough last so a `/p:` override wins.
+                    .args(&self.extra_msbuild_args);
                 command
             } else {
+                if !self.extra_msbuild_args.is_empty() {
+                    CompilerProgress::notify_stdout(
+                        self.client.as_ref(),
+                        format!(
+                            "Ignoring extra build arguments ({}): a bare .dpr/.dpk is compiled with dcc, not MSBuild.",
+                            self.extra_msbuild_args.join(" ")
+                        ),
+                    ).await;
+                }
                 let dcc_path = find_dcc(&parameters.configuration.installation_path, &eff_platform)?;
                 let mut command = Command::new(dcc_path);
                 command
@@ -558,9 +613,10 @@ impl Compiler {
                 let exe_missing = project.exe.as_deref()
                     .map_or(true, |p| p.is_empty() || !PathBuf::from(p).exists());
                 if exe_missing {
+                    let ide_env = parameters.configuration.ide_environment_overrides();
                     let mut projects_data = PROJECTS_DATA.write().await;
                     if let Some(project) = projects_data.get_project_mut(project.id) &&
-                       let Ok(_) = project.discover_paths()
+                       let Ok(_) = project.discover_paths(&ide_env)
                     {
                         let _ = projects_data.save().await;
                     }

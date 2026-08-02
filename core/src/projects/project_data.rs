@@ -65,6 +65,34 @@ impl ProjectsData {
             .clone();
     }
 
+    /// The IDE environment-variable overrides applying to a workspace's
+    /// projects: those of the workspace's compiler configuration.
+    pub async fn ide_environment_for_workspace(&self, workspace_id: usize) -> Vec<(String, String)> {
+        match self.workspaces.iter().find(|ws| ws.id == workspace_id) {
+            Some(workspace) => workspace.compiler().await.ide_environment_overrides(),
+            _ => crate::utils::ide_environment_overrides(),
+        }
+    }
+
+    /// The IDE environment-variable overrides applying to a project: those of
+    /// the compiler configuration of the first workspace containing it, else
+    /// the group project's compiler when it is a group-project member, else
+    /// (no owning context to pick a configuration from) the fallback set of
+    /// the highest installed BDS version.
+    pub async fn ide_environment_for_project(&self, project_id: usize) -> Vec<(String, String)> {
+        for workspace in &self.workspaces {
+            if workspace.project_links.iter().any(|link| link.project_id == project_id) {
+                return workspace.compiler().await.ide_environment_overrides();
+            }
+        }
+        if let Some(group_project) = &self.group_project {
+            if group_project.project_links.iter().any(|link| link.project_id == project_id) {
+                return self.group_projects_compiler().await.ide_environment_overrides();
+            }
+        }
+        crate::utils::ide_environment_overrides()
+    }
+
     async fn validate_compilers(&self) -> Result<()> {
         for workspace in &self.workspaces {
             if !compiler_exists(&workspace.compiler_id).await {
@@ -174,7 +202,7 @@ impl ProjectsData {
         return false;
     }
 
-    pub fn new_project(&mut self, file_path: &String, workspace_id: usize) -> Result<()> {
+    pub fn new_project(&mut self, file_path: &String, workspace_id: usize, ide_env: &[(String, String)]) -> Result<()> {
         let (project_id, link_id) = (self.id_counter + 1, self.id_counter + 2);
         let workspace = match self.workspaces.iter_mut().find(|ws| ws.id == workspace_id) {
             Some(ws) => ws,
@@ -218,7 +246,6 @@ impl ProjectsData {
         workspace.project_links.push(ProjectLink {
             id: link_id,
             project_id: project.id,
-            sort_rank: LexoRank::default(),
         });
         self.projects.push(project);
         self.next_id(); // for project_id
@@ -227,7 +254,7 @@ impl ProjectsData {
         // Discover exe/ini paths from the dproj right away so they are
         // populated even when the executable hasn't been built yet.
         if let Some(proj) = self.projects.last_mut() {
-            let _ = proj.discover_paths();
+            let _ = proj.discover_paths(ide_env);
         }
 
         return Ok(());
@@ -246,7 +273,6 @@ impl ProjectsData {
         workspace.project_links.push(ProjectLink {
             id,
             project_id,
-            sort_rank: LexoRank::default(),
         });
         self.next_id();
         return Ok(());
@@ -351,12 +377,12 @@ impl ProjectsData {
         return false;
     }
 
-    pub fn refresh_project_paths(&mut self, project_id: usize) -> Result<()> {
+    pub fn refresh_project_paths(&mut self, project_id: usize, ide_env: &[(String, String)]) -> Result<()> {
         let project = match self.get_project_mut(project_id) {
             Some(proj) => proj,
             _ => anyhow::bail!("Project with id {} not found", project_id),
         };
-        return project.discover_paths();
+        return project.discover_paths(ide_env);
     }
 
     pub fn update_project(&mut self, project_id: usize, data: ProjectUpdateData) -> Result<()> {
@@ -413,6 +439,10 @@ impl ProjectsData {
             let start_parameters = start_parameters.trim().to_string();
             project.start_parameters = if start_parameters.is_empty() { None } else { Some(start_parameters) };
         }
+        if let Some(host_application) = data.host_application {
+            let host_application = host_application.trim().to_string();
+            project.host_application = if host_application.is_empty() { None } else { Some(host_application) };
+        }
         return Ok(());
     }
 
@@ -430,12 +460,8 @@ impl ProjectsData {
            anyhow::bail!("Compiler not found: {}", compiler);
         }
         let workspace_id = self.next_id();
-        let lexo_rank = if let Some(last_ws) = self.workspaces.last() {
-            &last_ws.sort_rank
-        } else {
-            &LexoRank::default()
-        };
-        let workspace = Workspace::new(workspace_id, name.clone(), compiler.clone(), lexo_rank.next());
+        // Order is defined by position in the Vec; new workspaces append to the end.
+        let workspace = Workspace::new(workspace_id, name.clone(), compiler.clone());
         self.workspaces.push(workspace);
         return Ok(());
     }
@@ -488,8 +514,6 @@ impl ProjectsData {
             }
             _ => anyhow::bail!("Invalid drop target with id {}.", drop_target_id),
         }
-        let mut workspaces: Vec<&mut dyn HasLexoRank> = self.workspaces.iter_mut().map(|ws| ws as &mut dyn HasLexoRank).collect();
-        LexoRank::apply(&mut workspaces);
         return Ok(());
     }
 
@@ -510,7 +534,7 @@ impl ProjectsData {
         return Ok(());
     }
 
-    pub fn set_group_project(&mut self, groupproj_path: &String) -> Result<()> {
+    pub fn set_group_project(&mut self, groupproj_path: &String, ide_env: &[(String, String)]) -> Result<()> {
         let path = PathBuf::from(groupproj_path);
         if !path.exists() {
             anyhow::bail!("Group project file does not exist: {}", groupproj_path);
@@ -522,7 +546,7 @@ impl ProjectsData {
             active_configuration: None,
             active_platform: None,
         };
-        group_project.fill(self)?;
+        group_project.fill(self, ide_env)?;
         self.group_project = Some(group_project);
         return Ok(());
     }
@@ -565,16 +589,6 @@ impl ProjectsData {
 
     pub fn find_project_by_dproj(&self, dproj: &String) -> Option<&Project> {
         return self.projects.iter().find(|proj| proj.dproj.as_ref().map_or(false, |p| p == dproj));
-    }
-
-    pub fn sort(&mut self) {
-        self.workspaces.sort_by(|a: &Workspace, b: &Workspace| a.sort_rank.cmp(&b.sort_rank));
-        for workspace in &mut self.workspaces {
-            workspace.project_links.sort_by(|a: &ProjectLink, b: &ProjectLink| a.sort_rank.cmp(&b.sort_rank));
-        }
-        if let Some(group_project) = &mut self.group_project {
-            group_project.project_links.sort_by(|a: &ProjectLink, b: &ProjectLink| a.sort_rank.cmp(&b.sort_rank));
-        }
     }
 
     pub fn active_project(&self) -> Option<&Project> {

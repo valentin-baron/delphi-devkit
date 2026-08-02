@@ -2,7 +2,7 @@
   "name": "delphi-devkit",
   "displayName": "DDK - Delphi Development Kit",
   "description": "Utilities for developing in Delphi using VS Code",
-  "version": "2.4.0",
+  "version": "2.5.1",
   "publisher": "Snowcaloid",
   "license": "SEE LICENSE IN LICENSE",
   "homepage": "https://www.github.com/valentin-baron",
@@ -111,6 +111,12 @@
         "command": "ddk.projects.setStartParameters",
         "title": "Set Start Parameters",
         "icon": "$(terminal)",
+        "category": "DDK"
+      },
+      {
+        "command": "ddk.projects.setHostApplication",
+        "title": "Set Host Application",
+        "icon": "$(vm)",
         "category": "DDK"
       },
       {
@@ -401,6 +407,10 @@
           "when": "false"
         },
         {
+          "command": "ddk.projects.setHostApplication",
+          "when": "false"
+        },
+        {
           "command": "ddk.projects.compileAllFromHere",
           "when": "false"
         },
@@ -580,6 +590,11 @@
           "command": "ddk.projects.setStartParameters",
           "when": "view =~ /^ddk\\.view\\.projects.*/ && (viewItem == ddk.context.projects.project || viewItem == ddk.context.projects.projectFile)",
           "group": "4_exe_actions@3"
+        },
+        {
+          "command": "ddk.projects.setHostApplication",
+          "when": "view =~ /^ddk\\.view\\.projects.*/ && (viewItem == ddk.context.projects.project || viewItem == ddk.context.projects.projectFile)",
+          "group": "4_exe_actions@4"
         },
         {
           "command": "ddk.projects.renameWorkspace",

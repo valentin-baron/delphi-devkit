@@ -91,7 +91,7 @@ fn discover_paths_resolves_exe_from_dproj_name() {
         ..Default::default()
     };
 
-    project.discover_paths().unwrap();
+    project.discover_paths(&[]).unwrap();
 
     // The exe must end with example.debug.test.exe
     let exe = project.exe.expect("exe should be set after discover_paths");
@@ -130,7 +130,7 @@ fn discover_paths_resolves_exe_for_bare_dpr_without_dproj() {
     };
 
     // Must succeed (previously bailed with "DPROJ file not found").
-    project.discover_paths().unwrap();
+    project.discover_paths(&[]).unwrap();
 
     // No .dproj should have been invented.
     assert!(project.dproj.is_none(), "bare .dpr must not gain a .dproj");
@@ -165,7 +165,7 @@ fn discover_paths_bare_dpk_has_no_exe() {
         ..Default::default()
     };
 
-    project.discover_paths().unwrap();
+    project.discover_paths(&[]).unwrap();
 
     assert!(project.dproj.is_none(), "bare .dpk must not gain a .dproj");
     assert!(project.exe.is_none(), "a package has no executable");

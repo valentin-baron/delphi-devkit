@@ -7,7 +7,7 @@ import { Coroutine, DelphiProjectTreeItemType } from '../types';
 import { Entities } from './entities';
 import { BaseFileItem } from './trees/items/baseFile';
 import { ProjectItem } from './trees/items/project';
-import { assertError, basenameNoExt, fuseStartParameters, launchExecutable } from '../utils';
+import { assertError, basenameNoExt, launchExecutable } from '../utils';
 import { WorkspaceItem } from './trees/items/workspaceItem';
 import { Change } from '../client';
 import { Option } from '../types';
@@ -24,9 +24,10 @@ export namespace ProjectsCommands {
    */
   function resolveEffectiveStartParameters(entity: Entities.Project): Option<string> {
     const useDebuggerRunParams = workspace.getConfiguration(PROJECTS.CONFIG.KEY).get<boolean>(PROJECTS.CONFIG.USE_DEBUGGER_RUN_PARAMS, true);
-    if (useDebuggerRunParams) return fuseStartParameters(entity.dproj_run_params, entity.start_parameters);
-    return entity.start_parameters;
+    return Entities.resolveEffectiveStartParameters(entity, useDebuggerRunParams);
   }
+
+  const resolveRunTarget = Entities.resolveRunTarget;
 
   export function register() {
     Runtime.extension.subscriptions.push(
@@ -68,13 +69,14 @@ export namespace ProjectsCommands {
     private static async runSelectedProject() {
       await this.selectedProjectAction(async (link) => {
         const project = Runtime.getProjectOfLink(link);
-        if (!project?.exe) {
-          window.showWarningMessage('Selected project has no associated executable to run.');
+        const target = project ? resolveRunTarget(project) : undefined;
+        if (!project || !target) {
+          window.showWarningMessage('Selected project has no associated executable or Host Application to run.');
           return;
         }
         try {
-          launchExecutable(project.exe, resolveEffectiveStartParameters(project));
-          window.showInformationMessage(`Running: ${project.exe}`);
+          launchExecutable(target, resolveEffectiveStartParameters(project));
+          window.showInformationMessage(`Running: ${target}`);
         } catch (error) {
           window.showErrorMessage(`Failed to launch executable: ${error}`);
         }
@@ -92,6 +94,7 @@ export namespace ProjectsCommands {
         commands.registerCommand(PROJECTS.COMMAND.RUN_EXECUTABLE, this.runExecutable.bind(this)),
         commands.registerCommand(PROJECTS.COMMAND.CONFIGURE_OR_CREATE_INI, this.configureOrCreateIni.bind(this)),
         commands.registerCommand(PROJECTS.COMMAND.SET_START_PARAMETERS, this.setStartParameters.bind(this)),
+        commands.registerCommand(PROJECTS.COMMAND.SET_HOST_APPLICATION, this.setHostApplication.bind(this)),
         commands.registerCommand(PROJECTS.COMMAND.SELECT_PROJECT, this.selectProject.bind(this)),
         commands.registerCommand(PROJECTS.COMMAND.COMPILE_ALL_IN_WORKSPACE, this.compileAllInWorkspace.bind(this)),
         commands.registerCommand(PROJECTS.COMMAND.RECREATE_ALL_IN_WORKSPACE, this.recreateAllInWorkspace.bind(this)),
@@ -129,21 +132,22 @@ export namespace ProjectsCommands {
     }
 
     private static async runExecutable(item: BaseFileItem): Promise<void> {
-      if (!item.projectExe) {
-        window.showWarningMessage(`No executable found for: ${item.label}`);
+      const target = resolveRunTarget(item.project.entity);
+      if (!target) {
+        window.showWarningMessage(`No executable or Host Application found for: ${item.label}`);
         return;
       }
       try {
-        launchExecutable(item.projectExe.fsPath, resolveEffectiveStartParameters(item.project.entity));
-        window.showInformationMessage(`Running: ${item.projectExe.fsPath}`);
+        launchExecutable(target, resolveEffectiveStartParameters(item.project.entity));
+        window.showInformationMessage(`Running: ${target}`);
       } catch (error) {
         window.showErrorMessage(`Failed to launch executable: ${error}`);
       }
     }
 
     private static async setStartParameters(item: BaseFileItem): Promise<void> {
-      if (!assertError(item.projectExe, `No executable for: ${item.label} - cannot set start parameters.`)) return;
       const project = item.project;
+      if (!assertError(resolveRunTarget(project.entity), `No executable or Host Application for: ${item.label} - cannot set start parameters.`)) return;
       const dprojDefault = project.entity.dproj_run_params;
       const value = await window.showInputBox({
         title: `Start Parameters – ${project.entity.name}`,
@@ -165,6 +169,32 @@ export namespace ProjectsCommands {
       ]);
       window.showInformationMessage(
         value.trim() ? `Updated start parameters for: ${project.entity.name}` : `Cleared start parameters for: ${project.entity.name}`
+      );
+    }
+
+    private static async setHostApplication(item: BaseFileItem): Promise<void> {
+      const project = item.project;
+      const dprojDefault = project.entity.dproj_host_application;
+      const value = await window.showInputBox({
+        title: `Host Application – ${project.entity.name}`,
+        prompt: 'Executable launched to host this project when run (e.g. the application loading this package)',
+        placeHolder: dprojDefault
+          ? `Overrides the dproj's Host Application (${dprojDefault}); leave empty to use that`
+          : 'e.g. C:\\path\\to\\HostApp.exe',
+        value: project.entity.host_application ?? ''
+      });
+      if (value === undefined) return;
+      await Runtime.client.applyChanges([
+        {
+          type: 'UpdateProject',
+          project_id: project.entity.id,
+          data: {
+            host_application: value
+          }
+        }
+      ]);
+      window.showInformationMessage(
+        value.trim() ? `Updated Host Application for: ${project.entity.name}` : `Cleared Host Application for: ${project.entity.name}`
       );
     }
 

@@ -62,6 +62,9 @@ ddk compile <PATH> --config Release --platform Win64   # ...with build overrides
 ddk compile --show-warnings            # Include warnings verbatim
 ddk compile --show-hints               # Include hints verbatim
 ddk compile --summarize-diagnostics    # Append `<file>: X warn, Y hint` per project
+ddk compile -e windows-1252            # Decode compiler output with a specific encoding
+ddk compile --fail-on-error            # Exit non-zero when the compile fails
+ddk compile <ID|NAME> -- /p:Foo=Bar    # Pass extra arguments verbatim to MSBuild (after `--`)
 ddk run                                # Run the active project's executable
 ddk run <ID|NAME>                      # Run a project by ID or name (= -p; lists candidates if ambiguous)
 ddk run <PATH>                         # Run a .exe directly, or a .dproj/.dpr/.dpk's owning project
@@ -84,6 +87,28 @@ builds). For the ad-hoc case `--compiler`/`-c` selects the compiler by exact key
 compiler. The same is exposed to AI tooling via the MCP `delphi_compile_file`,
 `delphi_add_project`, and `delphi_add_workspace` tools.
 
+Anything after a `--` separator on `ddk compile` is passed verbatim to MSBuild
+(e.g. `ddk compile be -- /p:DCC_Define=FOO /m`). These extra arguments are
+appended after DDK's own `/p:Config`/`/p:Platform` args, so a `/p:` override
+here wins (MSBuild takes the last value). They have no effect on a bare
+`.dpr`/`.dpk` target, which is compiled with the command-line compiler (`dcc`)
+rather than MSBuild — DDK prints a note when they are ignored.
+
+`ddk compile --json` (and the MCP compile tools) return a fully machine-coded
+result: structured header fields (`project`, `project_path`, `compiler`,
+`config`, `platform`, `action`, `success`, `code`) plus a `diagnostics` object
+grouped into `errors`/`warnings`/`hints`, each entry carrying
+`{code, file, line, message}`. There is no raw log text. Diagnostics obey the
+same `--show-warnings` / `--show-hints` filters — errors always appear, warnings
+only with `--show-warnings`, hints only with `--show-hints` — so a slim compile
+stays slim; pass both flags to get every diagnostic. Compiler output is
+decoded using the active console output codepage
+(what `chcp` sets); use `-e`/`--encoding` (or the `DDK_COMPILER_ENCODING`
+environment variable) to force a specific encoding. By default `ddk compile`
+exits 0 even on a failed compile (the result is in the JSON); pass
+`--fail-on-error` to exit with the compiler's exit code instead (a cancelled
+compile exits 2).
+
 Compile output for the CLI and the MCP `delphi_compile_project` tool is
 trimmed for AI / token-efficient consumption: the decorative banner box is
 stripped and warning / hint lines are hidden by default. Errors and the final
@@ -92,7 +117,11 @@ status line are always shown.
 `ddk run <PATH>` dispatches on the file extension: a `.exe` is launched
 directly; a `.dproj`/`.dpr`/`.dpk` must already belong to a managed project
 (its stored executable is run, same resolution as by name) — it is never
-compiled or run ad-hoc. `--args`/`-a` overrides the run parameters for that
+compiled or run ad-hoc. A project with a configured **Host Application**
+(the `Debugger_HostApplication` from Project > Options > Debugger in the
+Delphi IDE, or the DevKit `Set Host Application` override, which wins) runs
+that host executable instead — matching the IDE, and making a `.dpk`
+package project runnable at all. `--args`/`-a` overrides the run parameters for that
 one run; the process is launched detached, so the CLI/MCP call returns
 immediately without waiting for it to exit. The same is exposed to AI
 tooling via the MCP `delphi_run_project` and `delphi_run_file` tools.
@@ -220,6 +249,7 @@ in, since there is no extension setting for them to consult.
 * `Cancel Compilation` - Cancel the active compilation (Ctrl+F2)
 * `Run Selected Project` - Execute the selected project (F9)
 * `Set Start Parameters` - Configure command-line arguments passed to the executable when run
+* `Set Host Application` - Configure the executable that hosts the project when run (e.g. the application loading a .dpk package); overrides the dproj's own `Debugger_HostApplication`
 * `Configure/Create .ini` - Create or edit INI configuration files
 * `Set Manual Path` - Manually set the .dproj path for a project
 

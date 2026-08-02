@@ -26,6 +26,11 @@ pub struct ProjectSummary {
     pub directory: String,
     pub dproj: Option<String>,
     pub exe: Option<String>,
+    /// Effective Host Application (DevKit override or the dproj's own
+    /// `Debugger_HostApplication`): the executable RunProgram launches to
+    /// host a project with no standalone exe (e.g. a package or DLL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     pub active: bool,
 }
 
@@ -72,6 +77,9 @@ impl fmt::Display for ProjectListResult {
                     if let Some(exe) = &p.exe {
                         writeln!(f, "       exe: {exe}")?;
                     }
+                    if let Some(host) = &p.host {
+                        writeln!(f, "       host: {host}")?;
+                    }
                 }
             }
         }
@@ -86,6 +94,9 @@ impl fmt::Display for ProjectListResult {
                     writeln!(f, "  [{}]{} {} ({})", p.id, marker, p.name, p.directory)?;
                     if let Some(exe) = &p.exe {
                         writeln!(f, "       exe: {exe}")?;
+                    }
+                    if let Some(host) = &p.host {
+                        writeln!(f, "       host: {host}")?;
                     }
                 }
             }
@@ -218,14 +229,59 @@ impl fmt::Display for SetCompilerResult {
     }
 }
 
-/// Full compilation output.
+/// A single structured compiler diagnostic.
+///
+/// Parsed from the normalized diagnostic lines ddk already produces, so all
+/// three source compiler formats (dcc32, Delphi 2007 MSBuild wrapper, plain)
+/// collapse into the same shape. Severity is conveyed by which
+/// [`CompileDiagnostics`] group the entry lives in, so it is not repeated here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompileDiagnostic {
+    /// Compiler code, e.g. `"W1035"`.
+    pub code: String,
+    /// Absolute source file path.
+    pub file: String,
+    /// 1-based line number.
+    pub line: u32,
+    pub message: String,
+}
+
+/// Compiler diagnostics grouped by severity.
+///
+/// Subject to the same `show_warnings` / `show_hints` filters as `lines`:
+/// errors always appear, warnings only with `show_warnings`, hints only with
+/// `show_hints`. The filters slim the output for machine consumers, so they
+/// gate the structured data and the human-readable lines uniformly.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CompileDiagnostics {
+    pub errors: Vec<CompileDiagnostic>,
+    pub warnings: Vec<CompileDiagnostic>,
+    pub hints: Vec<CompileDiagnostic>,
+}
+
+/// Full, machine-coded compilation output. Every field is structured — there
+/// is no raw log text; the header banner is split into fields and all
+/// recognised compiler messages live in `diagnostics`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompileOutput {
-    pub project_name: String,
+    /// Project name.
+    pub project: String,
+    /// Absolute path of the compiled project/target.
+    pub project_path: String,
+    /// Compiler product name, e.g. "Delphi 12.0 Athens".
+    pub compiler: String,
+    /// Effective build configuration (e.g. "Release"), if known.
+    pub config: Option<String>,
+    /// Effective target platform (e.g. "Win32"), if known.
+    pub platform: Option<String>,
+    /// `"compile"` (Clean;Make) or `"rebuild"` (Clean;Build).
+    pub action: String,
     pub success: bool,
-    pub cancelled: bool,
     pub code: i32,
-    pub lines: Vec<String>,
+    /// Structured diagnostics grouped by severity, subject to the
+    /// `show_warnings` / `show_hints` filters (errors are always included).
+    #[serde(default)]
+    pub diagnostics: CompileDiagnostics,
 }
 
 pub type CompileProgressCallback = std::sync::Arc<dyn Fn(String) + Send + Sync>;
@@ -253,22 +309,24 @@ pub struct CompileFilterOptions {
 
 impl fmt::Display for CompileOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let summary = if self.cancelled {
-            format!("Compilation of \"{}\" was cancelled.", self.project_name)
-        } else if self.success {
-            format!(
-                "Project \"{}\" compiled successfully.",
-                self.project_name
-            )
+        if self.success {
+            write!(f, "Project \"{}\" compiled successfully.", self.project)?;
         } else {
-            format!(
+            write!(
+                f,
                 "Compilation of \"{}\" finished with errors (exit code {}).",
-                self.project_name, self.code
-            )
-        };
-        write!(f, "{summary}")?;
-        if !self.lines.is_empty() {
-            write!(f, "\n\nCompiler output:\n{}", self.lines.join("\n"))?;
+                self.project, self.code
+            )?;
+        }
+        let d = &self.diagnostics;
+        if !d.errors.is_empty() || !d.warnings.is_empty() || !d.hints.is_empty() {
+            write!(
+                f,
+                " ({} errors, {} warnings, {} hints)",
+                d.errors.len(),
+                d.warnings.len(),
+                d.hints.len()
+            )?;
         }
         Ok(())
     }
@@ -311,11 +369,69 @@ fn trim_banner_lines(lines: Vec<String>) -> Vec<String> {
 
 lazy_static::lazy_static! {
     /// Matches the formatted-diagnostic line emitted by
-    /// `CompilerLineDiagnostic::Display`:
+    /// `CompilerLineDiagnostic::Display`, capturing every field:
     ///   `HH:MM:SS.mmm: [KIND][CODE] file:line[:col] - message`
-    static ref FORMATTED_DIAG_REGEX: regex::Regex = regex::Regex::new(
-        r"^\d{2}:\d{2}:\d{2}\.\d+:\s+\[(?P<kind>WARN|HINT|ERROR)\]\[[A-Z]\d+\]\s+(?P<file>.+?):\d+(?::\d+)?\s+-\s"
+    static ref FORMATTED_DIAG_FULL_REGEX: regex::Regex = regex::Regex::new(
+        r"^\d{2}:\d{2}:\d{2}\.\d+:\s+\[(?P<kind>WARN|HINT|ERROR)\]\[(?P<code>[A-Z]\d+)\]\s+(?P<file>.+?):(?P<line>\d+)(?::\d+)?\s+-\s(?P<message>.*)$"
     ).unwrap();
+}
+
+/// Parse a formatted diagnostic line into its severity group and a structured
+/// [`CompileDiagnostic`]. Returns `None` for non-diagnostic lines.
+fn parse_formatted_diagnostic(line: &str) -> Option<(DiagKind, CompileDiagnostic)> {
+    let caps = FORMATTED_DIAG_FULL_REGEX.captures(line)?;
+    let kind = match caps.name("kind")?.as_str() {
+        "WARN" => DiagKind::Warn,
+        "HINT" => DiagKind::Hint,
+        "ERROR" => DiagKind::Error,
+        _ => return None,
+    };
+    let diag = CompileDiagnostic {
+        code: caps.name("code")?.as_str().to_string(),
+        file: caps.name("file")?.as_str().to_string(),
+        line: caps.name("line")?.as_str().parse().ok()?,
+        message: caps.name("message")?.as_str().to_string(),
+    };
+    Some((kind, diag))
+}
+
+#[cfg(test)]
+mod diagnostics_parse_tests {
+    use super::*;
+
+    #[test]
+    fn parses_warning_line() {
+        let line = "15:55:33.909: [WARN][W1035] C:\\proj\\Hello.dpr:7 - \
+                    Rückgabewert der Funktion 'F' könnte undefiniert sein";
+        let (kind, d) = parse_formatted_diagnostic(line).unwrap();
+        assert_eq!(kind, DiagKind::Warn);
+        assert_eq!(d.code, "W1035");
+        assert_eq!(d.file, "C:\\proj\\Hello.dpr");
+        assert_eq!(d.line, 7);
+        assert!(d.message.contains("Rückgabewert"));
+    }
+
+    #[test]
+    fn parses_error_line_with_column() {
+        let line = "10:00:00.000: [ERROR][E2003] C:\\a\\B.pas:12:5 - Undeclared identifier";
+        let (kind, d) = parse_formatted_diagnostic(line).unwrap();
+        assert_eq!(kind, DiagKind::Error);
+        assert_eq!(d.code, "E2003");
+        assert_eq!(d.line, 12);
+        assert_eq!(d.message, "Undeclared identifier");
+    }
+
+    #[test]
+    fn parses_hint_line() {
+        let line = "10:00:00.000: [HINT][H2077] C:\\a\\B.pas:3 - Value assigned to 'x' never used";
+        let (kind, _d) = parse_formatted_diagnostic(line).unwrap();
+        assert_eq!(kind, DiagKind::Hint);
+    }
+
+    #[test]
+    fn ignores_non_diagnostic_line() {
+        assert!(parse_formatted_diagnostic("just some banner text").is_none());
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -323,20 +439,6 @@ enum DiagKind {
     Warn,
     Hint,
     Error,
-}
-
-/// Attempt to classify a streamed compiler line as a formatted diagnostic.
-/// Returns `(kind, file_basename_without_extension)` on match.
-fn classify_diagnostic_line(line: &str) -> Option<(DiagKind, String)> {
-    let caps = FORMATTED_DIAG_REGEX.captures(line)?;
-    let kind = match caps.name("kind")?.as_str() {
-        "WARN" => DiagKind::Warn,
-        "HINT" => DiagKind::Hint,
-        "ERROR" => DiagKind::Error,
-        _ => return None,
-    };
-    let file = caps.name("file")?.as_str();
-    Some((kind, diag_file_basename(file)))
 }
 
 /// Extract `<filename without extension>` from a path string.
@@ -389,6 +491,12 @@ impl DiagCounts {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Case-insensitive path equality on normalized forms — used to hide a
+/// Host Application that is just the project's own executable.
+fn paths_equal_ci(a: &str, b: &str) -> bool {
+    normalize_path(a).to_string_lossy().to_lowercase() == normalize_path(b).to_string_lossy().to_lowercase()
+}
 
 /// Find the first `ProjectLink.id` for a given project, searching workspaces
 /// first, then the group project.
@@ -695,6 +803,11 @@ pub async fn cmd_list_projects() -> Result<ProjectListResult> {
         directory: p.directory.clone(),
         dproj: p.dproj.clone(),
         exe: p.exe.clone(),
+        // A Host Application that is just the project's own exe adds no
+        // information — only surface a host that actually differs.
+        host: p.effective_host_application().filter(|host| {
+            !p.exe.as_deref().is_some_and(|exe| paths_equal_ci(host, exe))
+        }),
         active: Some(p.id) == active_id,
     };
 
@@ -986,7 +1099,7 @@ pub async fn cmd_compile(
     project_id: Option<usize>,
     filter: CompileFilterOptions,
 ) -> Result<CompileOutput> {
-    cmd_compile_with_progress(rebuild, project_id, filter, None).await
+    cmd_compile_with_progress(rebuild, project_id, filter, Vec::new(), None).await
 }
 
 /// Compiles a project selected by a reference (project name or numeric id).
@@ -999,8 +1112,9 @@ pub async fn cmd_compile_ref(
     rebuild: bool,
     project: Option<String>,
     filter: CompileFilterOptions,
+    extra_msbuild_args: Vec<String>,
 ) -> Result<CompileOrAmbiguity> {
-    cmd_compile_ref_with_progress(rebuild, project, filter, None).await
+    cmd_compile_ref_with_progress(rebuild, project, filter, extra_msbuild_args, None).await
 }
 
 /// Like [`cmd_compile_ref`] but streams each compiler output line to
@@ -1009,6 +1123,7 @@ pub async fn cmd_compile_ref_with_progress(
     rebuild: bool,
     project: Option<String>,
     filter: CompileFilterOptions,
+    extra_msbuild_args: Vec<String>,
     on_progress: Option<CompileProgressCallback>,
 ) -> Result<CompileOrAmbiguity> {
     let project_id: Option<usize> = match project {
@@ -1029,7 +1144,9 @@ pub async fn cmd_compile_ref_with_progress(
             }
         }
     };
-    let output = cmd_compile_with_progress(rebuild, project_id, filter, on_progress).await?;
+    let output =
+        cmd_compile_with_progress(rebuild, project_id, filter, extra_msbuild_args, on_progress)
+            .await?;
     Ok(CompileOrAmbiguity::Output(output))
 }
 
@@ -1039,6 +1156,7 @@ pub async fn cmd_compile_with_progress(
     rebuild: bool,
     project_id: Option<usize>,
     filter: CompileFilterOptions,
+    extra_msbuild_args: Vec<String>,
     on_progress: Option<CompileProgressCallback>,
 ) -> Result<CompileOutput> {
     let (project_name, resolved_id, link_id) = {
@@ -1069,7 +1187,9 @@ pub async fn cmd_compile_with_progress(
         event_id: "cmd-compile".to_string(),
     };
 
-    let compiler = Compiler::new_standalone(&params).await;
+    let compiler = Compiler::new_standalone(&params)
+        .await
+        .with_extra_msbuild_args(extra_msbuild_args);
     run_compile_collecting(compiler, project_name, filter, on_progress).await
 }
 
@@ -1096,9 +1216,19 @@ pub async fn cmd_compile_file(
     platform: Option<String>,
     rebuild: bool,
     filter: CompileFilterOptions,
+    extra_msbuild_args: Vec<String>,
 ) -> Result<CompileOrAmbiguity> {
-    cmd_compile_file_with_progress(file_path, compiler, config, platform, rebuild, filter, None)
-        .await
+    cmd_compile_file_with_progress(
+        file_path,
+        compiler,
+        config,
+        platform,
+        rebuild,
+        filter,
+        extra_msbuild_args,
+        None,
+    )
+    .await
 }
 
 /// Like [`cmd_compile_file`] but invokes `on_progress` for each emitted
@@ -1110,6 +1240,7 @@ pub async fn cmd_compile_file_with_progress(
     platform: Option<String>,
     rebuild: bool,
     filter: CompileFilterOptions,
+    extra_msbuild_args: Vec<String>,
     on_progress: Option<CompileProgressCallback>,
 ) -> Result<CompileOrAmbiguity> {
     // Prefer a managed project that owns this file: compile it like a named
@@ -1128,7 +1259,9 @@ pub async fn cmd_compile_file_with_progress(
         }
     };
     if let Some(id) = managed_id {
-        let output = cmd_compile_with_progress(rebuild, Some(id), filter, on_progress).await?;
+        let output =
+            cmd_compile_with_progress(rebuild, Some(id), filter, extra_msbuild_args, on_progress)
+                .await?;
         return Ok(CompileOrAmbiguity::Output(output));
     }
 
@@ -1142,7 +1275,8 @@ pub async fn cmd_compile_file_with_progress(
     let mut data = ProjectsData::default();
     data.new_workspace(&"ad-hoc".to_string(), &compiler_key).await?;
     let workspace_id = data.workspaces[0].id;
-    data.new_project(&file_path, workspace_id)?;
+    let ide_env = data.ide_environment_for_workspace(workspace_id).await;
+    data.new_project(&file_path, workspace_id, &ide_env)?;
     let project = data
         .projects
         .last_mut()
@@ -1165,7 +1299,9 @@ pub async fn cmd_compile_file_with_progress(
         event_id: "cmd-compile-file".to_string(),
     };
 
-    let compiler = Compiler::new_standalone_with_data(&params, data).await;
+    let compiler = Compiler::new_standalone_with_data(&params, data)
+        .await
+        .with_extra_msbuild_args(extra_msbuild_args);
     let output = run_compile_collecting(compiler, project_name, filter, on_progress).await?;
     Ok(CompileOrAmbiguity::Output(output))
 }
@@ -1179,78 +1315,85 @@ async fn run_compile_collecting(
     filter: CompileFilterOptions,
     on_progress: Option<CompileProgressCallback>,
 ) -> Result<CompileOutput> {
-    // Collect broadcast messages concurrently with compilation.
-    let collected: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let collected_clone = collected.clone();
+    // Parse structured diagnostics from the broadcast output concurrently with
+    // compilation, and stream every line to the progress callback for live
+    // (human) output. No raw log text is retained — the JSON is fully
+    // machine-coded (structured header + diagnostics).
+    let diagnostics: std::sync::Arc<std::sync::Mutex<CompileDiagnostics>> =
+        std::sync::Arc::new(std::sync::Mutex::new(CompileDiagnostics::default()));
+    let diagnostics_clone = diagnostics.clone();
     let progress_callback = on_progress.clone();
     let filter_opts = filter.clone();
     let mut receiver = CompilerProgress::subscribe();
 
     let collect_handle = tokio::spawn(async move {
         let mut counts = DiagCounts::default();
-        let emit = |callback: &Option<CompileProgressCallback>,
-                    lines: &mut Vec<String>,
-                    out: Vec<String>| {
+        let stream = |callback: &Option<CompileProgressCallback>, out: Vec<String>| {
             if let Some(cb) = callback {
                 for line in &out {
                     cb(line.clone());
                 }
             }
-            lines.extend(out);
         };
         loop {
             match receiver.recv().await {
-                Ok(event) => {
-                    let mut lines = collected_clone.lock().unwrap();
-                    match event {
-                        CompilerProgressParams::Start { lines: ls }
-                        | CompilerProgressParams::SingleProjectStarted { lines: ls, .. } => {
-                            let out = if filter_opts.trim_banners {
-                                trim_banner_lines(ls)
-                            } else {
-                                ls
-                            };
-                            emit(&progress_callback, &mut lines, out);
-                        }
-                        CompilerProgressParams::Completed { lines: ls, .. }
-                        | CompilerProgressParams::SingleProjectCompleted { lines: ls, .. } => {
-                            // Drain pending per-project diagnostic summary first
-                            // so it appears immediately before the footer.
-                            if filter_opts.summarize_diagnostics {
-                                let summary = counts.drain_summary_lines();
-                                if !summary.is_empty() {
-                                    emit(&progress_callback, &mut lines, summary);
-                                }
-                            } else {
-                                counts.drain_summary_lines();
-                            }
-                            let out = if filter_opts.trim_banners {
-                                trim_banner_lines(ls)
-                            } else {
-                                ls
-                            };
-                            emit(&progress_callback, &mut lines, out);
-                        }
-                        CompilerProgressParams::Stdout { line }
-                        | CompilerProgressParams::Stderr { line } => {
-                            if let Some((kind, file)) = classify_diagnostic_line(&line) {
-                                let suppress = match kind {
-                                    DiagKind::Warn => !filter_opts.show_warnings,
-                                    DiagKind::Hint => !filter_opts.show_hints,
-                                    DiagKind::Error => false,
-                                };
-                                if suppress {
-                                    if filter_opts.summarize_diagnostics {
-                                        counts.add(&file, kind);
-                                    }
-                                    continue;
-                                }
-                            }
-                            emit(&progress_callback, &mut lines, vec![line]);
-                        }
+                Ok(event) => match event {
+                    CompilerProgressParams::Start { lines: ls }
+                    | CompilerProgressParams::SingleProjectStarted { lines: ls, .. } => {
+                        let out = if filter_opts.trim_banners {
+                            trim_banner_lines(ls)
+                        } else {
+                            ls
+                        };
+                        stream(&progress_callback, out);
                     }
-                }
+                    CompilerProgressParams::Completed { lines: ls, .. }
+                    | CompilerProgressParams::SingleProjectCompleted { lines: ls, .. } => {
+                        // Drain pending per-project diagnostic summary first
+                        // so it appears immediately before the footer.
+                        if filter_opts.summarize_diagnostics {
+                            let summary = counts.drain_summary_lines();
+                            if !summary.is_empty() {
+                                stream(&progress_callback, summary);
+                            }
+                        } else {
+                            counts.drain_summary_lines();
+                        }
+                        let out = if filter_opts.trim_banners {
+                            trim_banner_lines(ls)
+                        } else {
+                            ls
+                        };
+                        stream(&progress_callback, out);
+                    }
+                    CompilerProgressParams::Stdout { line }
+                    | CompilerProgressParams::Stderr { line } => {
+                        if let Some((kind, diag)) = parse_formatted_diagnostic(&line) {
+                            // The show_warnings/show_hints filters slim the
+                            // output for machine consumers, so they gate the
+                            // structured diagnostics and the streamed lines
+                            // uniformly: a suppressed severity appears in neither.
+                            let suppress = match kind {
+                                DiagKind::Warn => !filter_opts.show_warnings,
+                                DiagKind::Hint => !filter_opts.show_hints,
+                                DiagKind::Error => false,
+                            };
+                            if suppress {
+                                if filter_opts.summarize_diagnostics {
+                                    counts.add(&diag_file_basename(&diag.file), kind);
+                                }
+                                continue;
+                            }
+                            let mut d = diagnostics_clone.lock().unwrap();
+                            match kind {
+                                DiagKind::Error => d.errors.push(diag),
+                                DiagKind::Warn => d.warnings.push(diag),
+                                DiagKind::Hint => d.hints.push(diag),
+                            }
+                        }
+                        stream(&progress_callback, vec![line]);
+                    }
+                },
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
             }
@@ -1264,33 +1407,24 @@ async fn run_compile_collecting(
     collect_handle.abort();
     let _ = collect_handle.await;
 
-    let output_lines = match std::sync::Arc::try_unwrap(collected) {
+    let output_diagnostics = match std::sync::Arc::try_unwrap(diagnostics) {
         Ok(mutex) => mutex.into_inner().unwrap_or_default(),
         Err(arc) => arc.lock().unwrap().clone(),
     };
 
     match compile_result {
         Ok(result) => Ok(CompileOutput {
-            project_name,
+            project: project_name,
+            project_path: result.header.target,
+            compiler: result.header.compiler,
+            config: result.header.config,
+            platform: result.header.platform,
+            action: if result.header.rebuild { "rebuild" } else { "compile" }.to_string(),
             success: result.success,
-            cancelled: result.cancelled,
             code: result.code,
-            lines: output_lines,
+            diagnostics: output_diagnostics,
         }),
-        Err(e) => {
-            // Still return collected output on failure.
-            if on_progress.is_some() {
-                bail!("Compilation failed: {e}");
-            }
-            bail!(
-                "Compilation failed: {e}{}",
-                if output_lines.is_empty() {
-                    String::new()
-                } else {
-                    format!("\n\nCompiler output:\n{}", output_lines.join("\n"))
-                }
-            );
-        }
+        Err(e) => bail!("Compilation failed: {e}"),
     }
 }
 
@@ -1385,10 +1519,14 @@ pub async fn cmd_run(project_id: Option<usize>, args: Option<String>) -> Result<
             Some(p) => p,
             _ => bail!("Project with ID {target_id} not found."),
         };
-        let exe = match &project.exe {
-            Some(exe) => exe.clone(),
+        // A configured Host Application (Project > Options > Debugger in the
+        // Delphi IDE, or the DevKit "Set Host Application" override) wins over
+        // the project's own executable, matching the IDE's Run behaviour —
+        // it is what makes a `.dpk` package or DLL project runnable at all.
+        let exe = match project.effective_host_application().or_else(|| project.exe.clone()) {
+            Some(target) => target,
             _ => bail!(
-                "Project \"{}\" has no executable. Compile it first, or set its .exe path.",
+                "Project \"{}\" has no executable or Host Application. Compile it first, set its .exe path, or set a Host Application.",
                 project.name
             ),
         };

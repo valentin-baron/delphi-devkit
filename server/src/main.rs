@@ -64,7 +64,11 @@ impl DelphiLsp {
     async fn custom_document_format(
         &self,
         params: CustomDocumentFormat,
-    ) -> tower_lsp::jsonrpc::Result<TextEdit> {
+    ) -> tower_lsp::jsonrpc::Result<DocumentFormatEdit> {
+        // The formatter always runs over the whole document — it needs the full
+        // context to indent and lay out correctly. For a range request we then
+        // map the selection onto the formatted text (see `format::range`).
+        let original = params.content.clone();
         let formatter = Formatter::new(params.content)
             .map_err(|error| {
                 lsp_error!(self.client, "Failed to initialize formatter: {}", error);
@@ -73,18 +77,31 @@ impl DelphiLsp {
                     error
                 ))
             })?;
-        let new_text = formatter.execute().await.map_err(|error| {
+        let formatted = formatter.execute().await.map_err(|error| {
             lsp_error!(self.client, "Failed to format document: {}", error);
             jsonrpc::Error::invalid_params(format!(
                 "Failed to format document: {}",
                 error
             ))
         })?;
-        let range = params.range.unwrap_or(Range::new(Position::new(0,0), Position::new(u32::MAX, u32::MAX)));
-        return Ok(TextEdit {
-            range,
-            new_text,
-        });
+
+        // A range request maps the selection onto the formatted text; a
+        // whole-document request replaces everything.
+        if let Some(range) = params.range {
+            let edit =
+                ddk_core::format::range::map_range(&original, &formatted, range.start, range.end);
+            return Ok(DocumentFormatEdit {
+                start: edit.start,
+                end: edit.end,
+                new_text: edit.new_text,
+            });
+        }
+
+        Ok(DocumentFormatEdit {
+            start: 0,
+            end: original.encode_utf16().count(),
+            new_text: formatted,
+        })
     }
 
     /// Thin wrapper over `commands::cmd_delphilsp_config` so the VS Code

@@ -1,4 +1,4 @@
-use tower_lsp::lsp_types::{MessageType, Range, notification::Notification};
+use tower_lsp::lsp_types::{MessageType, notification::Notification};
 use serde::{Deserialize, Serialize};
 
 use crate::projects::*;
@@ -308,7 +308,29 @@ pub struct DelphiLspGenerateParams {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CustomDocumentFormat {
+    /// The full document text. Range formatting still needs the whole file so
+    /// the formatter has enough context; the selection is applied afterwards.
     pub content: String,
-    pub range: Option<Range>,
+    /// The selection to format, as UTF-16 offsets (VS Code `offsetAt`
+    /// semantics). `None` formats the whole document.
+    pub range: Option<OffsetRange>,
+}
+
+/// A half-open selection expressed in UTF-16 code units (LSP / VS Code offset
+/// semantics).
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct OffsetRange {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// A formatting edit returned to the client: replace `[start, end)` (UTF-16
+/// offsets into the original document) with `new_text`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentFormatEdit {
+    pub start: usize,
+    pub end: usize,
+    pub new_text: String,
 }
 

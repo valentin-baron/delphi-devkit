@@ -1,7 +1,6 @@
 use serde::{Serialize, Deserialize};
 use anyhow::Result;
 use std::path::PathBuf;
-use crate::lexorank::{LexoRank, HasLexoRank};
 use crate::projects::*;
 use crate::files::dproj::{find_dproj_file, get_main_source, get_exe_path, get_exe_path_for};
 use crate::utils::normalize_path;
@@ -21,7 +20,6 @@ pub const BARE_DEFAULT_PLATFORM: &str = "Win32";
 pub struct ProjectLink {
     pub id: usize,
     pub project_id: usize,
-    pub sort_rank: LexoRank,
 }
 
 impl ProjectLink {
@@ -49,15 +47,6 @@ impl ProjectLink {
     }
 }
 
-impl HasLexoRank for ProjectLink {
-    fn get_lexorank(&self) -> &LexoRank {
-        &self.sort_rank
-    }
-    fn set_lexorank(&mut self, lexorank: LexoRank) {
-        self.sort_rank = lexorank;
-    }
-}
-
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Project {
@@ -82,6 +71,17 @@ pub struct Project {
     /// Refreshed on [`Self::discover_paths`]; used as the fallback when
     /// `start_parameters` is unset. `None` for bare (dproj-less) projects.
     pub dproj_run_params: Option<String>,
+    /// `Debugger_HostApplication` read from the dproj's active property group
+    /// (the "Host application" set via Project > Options > Debugger in the
+    /// Delphi IDE). Common project macros are expanded and a relative path is
+    /// resolved against the project directory. Refreshed on
+    /// [`Self::discover_paths`]; `None` for bare (dproj-less) projects.
+    pub dproj_host_application: Option<String>,
+    /// DevKit-side Host Application override: the executable RunProgram
+    /// launches to host this project (e.g. the application loading a `.dpk`
+    /// package or a DLL). Takes precedence over
+    /// [`Self::dproj_host_application`].
+    pub host_application: Option<String>,
 }
 
 impl Default for Project {
@@ -99,6 +99,8 @@ impl Default for Project {
             active_platform: None,
             start_parameters: None,
             dproj_run_params: None,
+            dproj_host_application: None,
+            host_application: None,
         }
     }
 }
@@ -117,18 +119,35 @@ impl Project {
         (config, platform)
     }
 
-    pub fn discover_paths(&mut self) -> Result<()> {
+    /// The executable that hosts this project at run time, when one is
+    /// configured: the DevKit override wins over the dproj's own
+    /// `Debugger_HostApplication`. Blank values count as absent, and so does
+    /// a value still containing an unresolved `$(...)` macro — it is not a
+    /// launchable path, and must never shadow the project's own exe.
+    pub fn effective_host_application(&self) -> Option<String> {
+        let usable = |s: &String| !s.trim().is_empty() && !s.contains("$(");
+        self.host_application.clone()
+            .filter(usable)
+            .or_else(|| self.dproj_host_application.clone().filter(usable))
+    }
+
+    /// `ide_env` is the set of IDE environment-variable overrides of the
+    /// compiler configuration this project builds with — see
+    /// [`CompilerConfiguration::ide_environment_overrides`]; callers that
+    /// have no compiler context pass the fallback
+    /// [`crate::utils::ide_environment_overrides`].
+    pub fn discover_paths(&mut self, ide_env: &[(String, String)]) -> Result<()> {
         let config = self.active_configuration.clone();
         let platform = self.active_platform.clone();
-        self.discover_paths_inner(config.as_deref(), platform.as_deref())
+        self.discover_paths_inner(config.as_deref(), platform.as_deref(), ide_env)
     }
 
     /// Discover paths using an explicit config/platform override.
-    pub fn discover_paths_for(&mut self, config: &str, platform: &str) -> Result<()> {
-        self.discover_paths_inner(Some(config), Some(platform))
+    pub fn discover_paths_for(&mut self, config: &str, platform: &str, ide_env: &[(String, String)]) -> Result<()> {
+        self.discover_paths_inner(Some(config), Some(platform), ide_env)
     }
 
-    fn discover_paths_inner(&mut self, config: Option<&str>, platform: Option<&str>) -> Result<()> {
+    fn discover_paths_inner(&mut self, config: Option<&str>, platform: Option<&str>, ide_env: &[(String, String)]) -> Result<()> {
         if self.dproj.is_none() {
             // A sibling `.dproj` may exist next to the main source; adopt it if so.
             // Its absence is not an error: a bare `.dpr`/`.dpk` is a valid project.
@@ -146,14 +165,21 @@ impl Project {
             // No `.dproj`: resolve paths straight from the bare source. A `.dpr`
             // yields an executable (and matching `.ini`) alongside the source;
             // a `.dpk` produces a package with no standalone executable.
+            // Without a dproj there is nothing to source the dproj-derived
+            // fields from: clear them so values from a previously-present
+            // dproj cannot linger and affect run-target resolution.
             if let Some(dpr_path) = &self.dpr {
                 let exe = PathBuf::from(dpr_path).with_extension("exe");
                 self.ini = Some(exe.with_extension("ini").to_string_lossy().to_string());
                 self.exe = Some(exe.to_string_lossy().to_string());
+                self.dproj_run_params = None;
+                self.dproj_host_application = None;
                 return Ok(());
             } else if self.dpk.is_some() {
                 self.exe = None;
                 self.ini = None;
+                self.dproj_run_params = None;
+                self.dproj_host_application = None;
                 return Ok(());
             }
             anyhow::bail!("Cannot discover paths - no dproj, dpr or dpk available for project id: {}", self.id);
@@ -190,14 +216,19 @@ impl Project {
                     self.exe = None;
                     self.ini = None;
                 }
-                self.dproj_run_params = Self::discover_run_params(&dproj_path, config, platform);
+                (self.dproj_run_params, self.dproj_host_application) =
+                    Self::discover_debugger_settings(&dproj_path, config, platform, &self.directory, ide_env);
             },
             Some(ext) if ext == "dpk" => {
                 self.dpk = Some(main_source.to_string_lossy().to_string());
                 self.dpr = None;
                 self.exe = None;
                 self.ini = None;
-                self.dproj_run_params = None;
+                // A package has no standalone executable, but its Run
+                // Parameters and Host Application (Project > Options in the
+                // Delphi IDE) drive how RunProgram launches the hosting exe.
+                (self.dproj_run_params, self.dproj_host_application) =
+                    Self::discover_debugger_settings(&dproj_path, config, platform, &self.directory, ide_env);
             },
             _ => {
                 anyhow::bail!("Cannot discover paths - main source file is not a DPR or DPK for project id: {}", self.id);
@@ -207,13 +238,81 @@ impl Project {
         return Ok(());
     }
 
-    /// Reads `Debugger_RunParams` from the dproj's active property group for
-    /// the given config/platform override (or the dproj's own defaults when
-    /// both are `None`) — the same "Run Parameters" a developer sets via
-    /// Project > Options > Run in the Delphi IDE. Returns `None` on any parse
-    /// failure or when the value is absent/blank.
-    fn discover_run_params(dproj_path: &PathBuf, config: Option<&str>, platform: Option<&str>) -> Option<String> {
-        let dproj = dproj_rs::Dproj::from_file(dproj_path).ok()?;
+    /// Reads the debugger-related settings from the dproj's active property
+    /// group for the given config/platform override (or the dproj's own
+    /// defaults when both are `None`): `Debugger_RunParams` (Project >
+    /// Options > Run in the Delphi IDE) and `Debugger_HostApplication`
+    /// (Project > Options > Debugger). `$(NAME)` references are expanded by
+    /// dproj-rs the way the IDE-launched MSBuild would resolve them — see
+    /// [`Self::load_dproj_with_ide_environment`] — and a relative host path
+    /// is resolved against the project directory. Blank values count as
+    /// absent; both values are `None` on any parse failure.
+    fn discover_debugger_settings(
+        dproj_path: &PathBuf,
+        config: Option<&str>,
+        platform: Option<&str>,
+        project_directory: &str,
+        ide_env: &[(String, String)],
+    ) -> (Option<String>, Option<String>) {
+        let Some(dproj) = Self::load_dproj_with_ide_environment(dproj_path, project_directory, ide_env) else {
+            return (None, None);
+        };
+        let (cfg, plat) = Self::effective_cfg_plat(&dproj, config, platform);
+        let Ok(group) = dproj.active_property_group_for(&cfg, &plat) else {
+            return (None, None);
+        };
+        let run_params = group.debugger_options.run_params.clone().filter(|s| !s.trim().is_empty());
+        let host_application = group
+            .other
+            .get("Debugger_HostApplication")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|host| Self::absolutize_host_application(host, project_directory));
+        (run_params, host_application)
+    }
+
+    /// Parse a `.dproj` seeding the `$(NAME)` expansion map with everything
+    /// the IDE-launched MSBuild would see: the process environment first,
+    /// overridden by the Delphi IDE's own environment-variable overrides
+    /// (`ide_env` — they exist only inside the IDE's process, so they are
+    /// read back from the registry of the relevant compiler configuration),
+    /// plus the project-context properties (`ProjectDir`, `ProjectName`)
+    /// that dproj-rs cannot derive on its own. Names that resolve to nothing
+    /// expand to an empty string, matching MSBuild semantics.
+    fn load_dproj_with_ide_environment(
+        dproj_path: &PathBuf,
+        project_directory: &str,
+        ide_env: &[(String, String)],
+    ) -> Option<dproj_rs::Dproj> {
+        let mut env: std::collections::HashMap<String, String> = std::env::vars().collect();
+        for (name, value) in ide_env {
+            env.insert(name.clone(), value.clone());
+        }
+        let project_name = dproj_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        env.insert("ProjectDir".to_string(), project_directory.to_string());
+        env.insert("ProjectName".to_string(), project_name);
+        dproj_rs::DprojBuilder::new().env(env).from_file(dproj_path).ok()
+    }
+
+    /// Resolve a discovered host-application path against the project
+    /// directory when relative, then normalise it.
+    fn absolutize_host_application(host: &str, project_directory: &str) -> String {
+        let path = PathBuf::from(host);
+        let absolute = if path.is_relative() {
+            PathBuf::from(project_directory).join(path)
+        } else {
+            path
+        };
+        normalize_path(&absolute).to_string_lossy().to_string()
+    }
+
+    /// Resolve the effective (configuration, platform) from explicit overrides
+    /// falling back to the dproj's own defaults — shared by the dproj property
+    /// discovery helpers.
+    fn effective_cfg_plat(dproj: &dproj_rs::Dproj, config: Option<&str>, platform: Option<&str>) -> (String, String) {
         let cfg = config
             .map(|s| s.to_string())
             .or_else(|| dproj.active_configuration().ok())
@@ -222,12 +321,7 @@ impl Project {
             .map(|s| s.to_string())
             .or_else(|| dproj.active_platform().ok())
             .unwrap_or_else(|| "Win32".to_string());
-        dproj
-            .active_property_group_for(&cfg, &plat)
-            .ok()?
-            .debugger_options
-            .run_params
-            .filter(|s| !s.trim().is_empty())
+        (cfg, plat)
     }
 
     pub fn get_project_file(&self) -> Result<PathBuf> {
@@ -252,3 +346,4 @@ impl Project {
         anyhow::bail!("Cannot get project file - no dproj, dpr or dpk available for project id: {}", self.id);
     }
 }
+

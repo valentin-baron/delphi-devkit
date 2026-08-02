@@ -99,6 +99,26 @@ enum Commands {
         /// warnings/hints that were not shown verbatim.
         #[arg(long)]
         summarize_diagnostics: bool,
+
+        /// Encoding used to decode compiler output, e.g. "utf-8",
+        /// "windows-1252", "oem". Defaults to "oem", which auto-detects the
+        /// active console output codepage (what `chcp` sets). Overrides the
+        /// DDK_COMPILER_ENCODING environment variable.
+        #[arg(long, short = 'e')]
+        encoding: Option<String>,
+
+        /// Exit with a non-zero process code when the compile fails (mirrors
+        /// the JSON `code`). Off by default so existing callers that only parse
+        /// JSON keep working.
+        #[arg(long)]
+        fail_on_error: bool,
+
+        /// Extra arguments passed verbatim to MSBuild, after `--`
+        /// (e.g. `ddk compile be -- /p:DCC_Define=FOO /m`). Appended after the
+        /// built-in Config/Platform args, so a `/p:` override here wins. Ignored
+        /// for a bare .dpr/.dpk TARGET, which is compiled with dcc, not MSBuild.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        msbuild_args: Vec<String>,
     },
 
     /// Run a project's built executable directly. Runs the active project by
@@ -298,7 +318,19 @@ async fn main() -> Result<()> {
             show_warnings,
             show_hints,
             summarize_diagnostics,
+            encoding,
+            fail_on_error,
+            msbuild_args,
         } => {
+            // Resolve compiler-output encoding: --encoding wins, then the
+            // DDK_COMPILER_ENCODING env var, else the "oem" default (which
+            // auto-detects the console output codepage at decode time).
+            if let Some(enc) = encoding
+                .or_else(|| std::env::var("DDK_COMPILER_ENCODING").ok())
+                .filter(|e| !e.trim().is_empty())
+            {
+                ddk_core::encoding::set_encoding(&enc);
+            }
             let filter = CompileFilterOptions {
                 trim_banners: true,
                 show_warnings,
@@ -314,16 +346,23 @@ async fn main() -> Result<()> {
                 None => (None, project),
             };
             use commands::CompileOrAmbiguity;
+            // Captured for --fail-on-error: (success, code).
+            let mut outcome: Option<(bool, i32)> = None;
             if cli.json {
                 let result = match file_path {
                     Some(p) => {
-                        commands::cmd_compile_file(p, compiler, config, platform, rebuild, filter)
-                            .await?
+                        commands::cmd_compile_file(
+                            p, compiler, config, platform, rebuild, filter, msbuild_args,
+                        )
+                        .await?
                     }
-                    _ => commands::cmd_compile_ref(rebuild, project_ref, filter).await?,
+                    _ => {
+                        commands::cmd_compile_ref(rebuild, project_ref, filter, msbuild_args).await?
+                    }
                 };
                 match result {
                     CompileOrAmbiguity::Output(o) => {
+                        outcome = Some((o.success, o.code));
                         println!("{}", serde_json::to_string_pretty(&o)?)
                     }
                     CompileOrAmbiguity::Ambiguity(a) => {
@@ -341,24 +380,37 @@ async fn main() -> Result<()> {
                 let result = match file_path {
                     Some(p) => {
                         commands::cmd_compile_file_with_progress(
-                            p, compiler, config, platform, rebuild, filter, Some(on_progress),
+                            p, compiler, config, platform, rebuild, filter, msbuild_args,
+                            Some(on_progress),
                         )
                         .await?
                     }
                     _ => {
                         commands::cmd_compile_ref_with_progress(
-                            rebuild, project_ref, filter, Some(on_progress),
+                            rebuild, project_ref, filter, msbuild_args, Some(on_progress),
                         )
                         .await?
                     }
                 };
                 match result {
                     CompileOrAmbiguity::Output(o) => {
-                        if o.lines.is_empty() {
-                            print!("{o}");
-                        }
+                        // Output already streamed live via on_progress; just
+                        // capture the outcome for --fail-on-error.
+                        outcome = Some((o.success, o.code));
                     }
                     CompileOrAmbiguity::Ambiguity(a) => print!("{a}"),
+                }
+            }
+            // Opt-in: propagate a failed compile to the process exit code.
+            // Default (off) keeps the historical exit 0.
+            if fail_on_error {
+                if let Some((success, code)) = outcome {
+                    if !success {
+                        let _ = io::stdout().flush();
+                        // Mirror the compiler exit code (fall back to 1 if it
+                        // was 0/-1 despite the failure).
+                        std::process::exit(if code > 0 { code } else { 1 });
+                    }
                 }
             }
         }
