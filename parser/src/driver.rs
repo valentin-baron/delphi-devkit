@@ -592,7 +592,7 @@ impl ProjectSession {
     /// params/locals. Either way the returned `location` is the DECLARATION's own
     /// span, and the target `kind` is [`TargetKind::Local`].
     fn local_at(&self, meta: &UnitMeta, position: u32) -> Option<QueryTarget> {
-        if !meta.impl_scopes_reliable {
+        if !meta.impl_scopes_reliable() {
             return None;
         }
         // ALL enclosing routines whose body covers `position`, ordered
@@ -601,7 +601,7 @@ impl ProjectSession {
         // outer routine's same-named one, and (Bug 2) an OUTER routine's local is
         // still found before the query falls through to an interface symbol.
         let mut covering_routines: Vec<&crate::ast::ImplRoutine> = meta
-            .impl_scopes
+            .impl_scopes()
             .iter()
             .filter(|routine| {
                 let span = routine.body_span;
@@ -848,11 +848,11 @@ impl ProjectSession {
     ) -> Option<crate::query::HoverInfo> {
         // Re-locate the exact declaration the target matched (same tightest-cover
         // + key logic as `local_at`), so the hover reads its kind + type key.
-        if !meta.impl_scopes_reliable {
+        if !meta.impl_scopes_reliable() {
             return None;
         }
         let routine = meta
-            .impl_scopes
+            .impl_scopes()
             .iter()
             .filter(|routine| {
                 let span = routine.body_span;
@@ -3103,8 +3103,8 @@ mod tests {
         let unit_key = session.context.intern_key("U");
 
         let meta = session.meta_of(unit_key).unwrap();
-        assert!(meta.impl_scopes_reliable, "sanity: reliable pass");
-        let routine = &meta.impl_scopes[0];
+        assert!(meta.impl_scopes_reliable(), "sanity: reliable pass");
+        let routine = &meta.impl_scopes()[0];
         let local_decl_span = routine.locals[0].name.location;
         let param_decl_span = routine.params[0].name.location;
 
@@ -3150,11 +3150,11 @@ mod tests {
         session.parse_source_file(directory.join("U.pas")).unwrap();
         let unit_key = session.context.intern_key("U");
         let meta = session.meta_of(unit_key).unwrap();
-        assert!(meta.impl_scopes_reliable);
+        assert!(meta.impl_scopes_reliable());
 
         let local_key = session.context.intern_key("Local");
         let interface_local = meta.interface().find(local_key).unwrap().location;
-        let body_local_decl = meta.impl_scopes[0].locals[0].name.location;
+        let body_local_decl = meta.impl_scopes()[0].locals[0].name.location;
         assert_ne!(interface_local, body_local_decl, "distinct sites");
 
         // In-body use of `Local` → the body-local declaration (shadowing wins).
@@ -3207,8 +3207,8 @@ mod tests {
         session.parse_source_file(directory.join("U.pas")).unwrap();
         let unit_key = session.context.intern_key("U");
         let meta = session.meta_of(unit_key).unwrap();
-        assert!(meta.impl_scopes_reliable, "sanity: reliable pass");
-        let local_decl_span = meta.impl_scopes[0].locals[0].name.location;
+        assert!(meta.impl_scopes_reliable(), "sanity: reliable pass");
+        let local_decl_span = meta.impl_scopes()[0].locals[0].name.location;
 
         // Cursor on the `.Value` in `SomeObj.Value` — the MEMBER — must NOT
         // resolve to the local (never a wrong local attribution).
@@ -3270,7 +3270,7 @@ mod tests {
         session.parse_source_file(directory.join("U.pas")).unwrap();
         let unit_key = session.context.intern_key("U");
         let meta = session.meta_of(unit_key).unwrap();
-        assert!(meta.impl_scopes_reliable, "sanity: reliable pass");
+        assert!(meta.impl_scopes_reliable(), "sanity: reliable pass");
 
         let helper_key = session.context.intern_key("Helper");
         let interface_helper = meta.interface().find(helper_key).unwrap().location;
@@ -3278,7 +3278,7 @@ mod tests {
         // Locate Outer's `Helper` local and Inner's `Shadowed` local across the
         // two recorded routines (order-independent).
         let outer_helper_decl = meta
-            .impl_scopes
+            .impl_scopes()
             .iter()
             .flat_map(|routine| routine.locals.iter())
             .find(|declaration| declaration.name.key == helper_key)
@@ -3313,7 +3313,7 @@ mod tests {
         // routine (smallest body span) that owns a `Shadowed` local.
         let shadowed_key = session.context.intern_key("Shadowed");
         let mut shadowed_owners: Vec<&crate::ast::ImplRoutine> = meta
-            .impl_scopes
+            .impl_scopes()
             .iter()
             .filter(|routine| {
                 routine.locals.iter().any(|declaration| declaration.name.key == shadowed_key)
@@ -3359,7 +3359,7 @@ mod tests {
         let unit_key = session.context.intern_key("U");
         let meta = session.meta_of(unit_key).unwrap();
         assert!(
-            !meta.impl_scopes_reliable,
+            !meta.impl_scopes_reliable(),
             "sanity: the asm body degraded the pass"
         );
 

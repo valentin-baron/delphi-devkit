@@ -91,8 +91,7 @@ pub fn build_unit_meta(
     outcome_includes: &[FileId],
     dependencies: Vec<crate::unit_cache::Dependency>,
     usages: Vec<crate::unit_cache::Usage>,
-    impl_scopes: Vec<crate::ast::ImplRoutine>,
-    impl_scopes_reliable: bool,
+    implementation_body: crate::ast_impl::ImplementationBody,
     cycle_tainted: bool,
     recovered: bool,
 ) -> UnitMeta {
@@ -121,7 +120,7 @@ pub fn build_unit_meta(
     .with_dfm(dfm)
     .with_recovered(recovered)
     .with_source_len(source_len)
-    .with_impl_scopes(impl_scopes, impl_scopes_reliable)
+    .with_implementation_body(implementation_body)
 }
 
 /// Parse a materialized file; when it is a unit, build + cache its [`UnitMeta`].
@@ -151,8 +150,7 @@ pub fn parse_and_cache(
     let includes = outcome.seen_includes.clone();
     let dependencies = outcome.dependencies.clone();
     let usages = outcome.usages.clone();
-    let impl_scopes = outcome.impl_scopes.clone();
-    let impl_scopes_reliable = outcome.impl_scopes_reliable;
+    let implementation_body = outcome.implementation_body.clone();
     let cycle_tainted = outcome.cycle_tainted;
     let recovered = outcome.recovered;
 
@@ -172,8 +170,7 @@ pub fn parse_and_cache(
                 &includes,
                 dependencies,
                 usages,
-                impl_scopes,
-                impl_scopes_reliable,
+                implementation_body,
                 cycle_tainted,
                 recovered,
             ));

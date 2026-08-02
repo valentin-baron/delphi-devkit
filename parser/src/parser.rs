@@ -6966,7 +6966,11 @@ mod tests {
             }
         }
 
-        let arena = SourceArena::new();
+        // Parse through the PROCESS-GLOBAL arena so a built UnitMeta's FileIds
+        // serialize (serialize_meta writes FileIds as paths via the global arena);
+        // a local arena's FileIds are foreign and would fail serialization, making
+        // the compressed-size measurement silently zero.
+        let arena = crate::globals::arena();
         let (mut reliable, mut degraded, mut parse_failed) = (0usize, 0usize, 0usize);
         let mut total_routines = 0usize;
         let mut total_scopes = 0usize;
@@ -6977,6 +6981,15 @@ mod tests {
         // `class`/section keyword) and lost coverage. Rough but revealing.
         let mut zero_scope_but_has_routines = 0usize;
         let mut undercaptured_examples = Vec::new();
+        // S3 MEMORY MEASUREMENT: over every unit, sum the weigher's estimate two
+        // ways — (a) the full UnitMeta INCLUDING the implementation body, and (b) a
+        // hypothetical INTERFACE-ONLY figure (body excluded, the cost a cross-unit
+        // interface load would pay). Also sum the real compressed on-disk segment
+        // size (body-included). Interpreted after the loop.
+        let mut total_estimated_with_body: u64 = 0;
+        let mut total_estimated_interface_only: u64 = 0;
+        let mut total_serialized_compressed: u64 = 0;
+        let mut units_measured: u64 = 0;
         for path in &files {
             let Ok(file) = arena.load(path) else { continue };
             let source_text = arena.loaded_content(file).to_string();
@@ -6992,8 +7005,8 @@ mod tests {
                 .iter()
                 .map(|keyword| impl_lower.matches(keyword).count())
                 .sum::<usize>();
-            match parse_file_full(&arena, context.clone(), file, None) {
-                Ok(outcome) => {
+            match parse_file_full(arena, context.clone(), file, None) {
+                Ok(mut outcome) => {
                     // Drive the full S2 body on EVERY unit (reliable or not) so the
                     // scope/statement counters reflect the whole corpus, and the
                     // body walk itself is exercised for panics on real code.
@@ -7005,6 +7018,41 @@ mod tests {
                         "derived impl_scopes_reliable must equal body.reliable for {}",
                         path.display()
                     );
+
+                    // S3 MEMORY MEASUREMENT: build the real UnitMeta and weigh it.
+                    // (a) full weight (body included) = estimated_bytes(). (b) the
+                    // interface-only figure (the cost a cross-unit interface load
+                    // pays) = full minus the body's structural charge, which the
+                    // weigher adds as node_count * BODY_BYTES_PER_NODE. Only for
+                    // real units (a Unit AST); non-unit sources produce no meta.
+                    let source_len =
+                        arena.loaded_content(file).len().min(u32::MAX as usize) as u32;
+                    if let Some(crate::ast::Source::Unit(unit)) = outcome.source.take() {
+                        let body = outcome.implementation_body.clone();
+                        let body_charge = (body.node_count()
+                            * crate::unit_meta::UnitMeta::BODY_BYTES_PER_NODE)
+                            as u64;
+                        let with_body = crate::unit_meta::UnitMeta::new(
+                            unit,
+                            outcome.cycle_tainted,
+                            path.to_path_buf(),
+                            0,
+                            Vec::new(),
+                            outcome.dependencies.clone(),
+                            outcome.usages.clone(),
+                        )
+                        .with_source_len(source_len)
+                        .with_implementation_body(body);
+                        let full = with_body.estimated_bytes() as u64;
+                        total_estimated_with_body += full;
+                        total_estimated_interface_only += full.saturating_sub(body_charge);
+                        // Real compressed on-disk segment size (body included).
+                        if let Ok(segment) = crate::unit_cache::serialize_meta(&with_body) {
+                            total_serialized_compressed += segment.len() as u64;
+                        }
+                        units_measured += 1;
+                    }
+
                     if outcome.impl_scopes_reliable {
                         reliable += 1;
                         total_routines += outcome.impl_scopes.len();
@@ -7043,6 +7091,27 @@ mod tests {
         for example in &undercaptured_examples {
             println!("  undercaptured: {example}");
         }
+
+        // S3 MEMORY REPORT.
+        let megabyte = 1024.0 * 1024.0;
+        let with_body_mb = total_estimated_with_body as f64 / megabyte;
+        let interface_only_mb = total_estimated_interface_only as f64 / megabyte;
+        let body_only = total_estimated_with_body.saturating_sub(total_estimated_interface_only);
+        let avg_body_bytes = if units_measured > 0 {
+            body_only / units_measured
+        } else {
+            0
+        };
+        let ratio = if total_estimated_interface_only > 0 {
+            total_estimated_with_body as f64 / total_estimated_interface_only as f64
+        } else {
+            0.0
+        };
+        println!(
+            "S3 memory over {units_measured} units: weighed estimate WITH body = {with_body_mb:.2} MB; INTERFACE-ONLY (body excluded) = {interface_only_mb:.2} MB; body adds {:.2} MB total; avg body cost = {avg_body_bytes} bytes/unit; with-body/interface-only weight ratio = {ratio:.2}x; total compressed on-disk (body included) = {:.2} MB",
+            body_only as f64 / megabyte,
+            total_serialized_compressed as f64 / megabyte,
+        );
     }
 
     /// Machine-specific stress test: parse EVERY .pas under src\core with

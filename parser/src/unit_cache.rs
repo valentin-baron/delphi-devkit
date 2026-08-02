@@ -23,7 +23,7 @@ use crate::meta::CodeLocation;
 use crate::parser::ParseError;
 use crate::unit_meta::UnitMeta;
 
-const CACHE_FORMAT_VERSION: u32 = 14;
+const CACHE_FORMAT_VERSION: u32 = 15;
 /// Default RAM cap for the in-memory AST cache. Lowered from 512MiB to 256MiB
 /// for an EDITOR workload (Task 16 D): the disk-backed cache means an evicted
 /// unit reloads cheaply from its per-unit file instead of re-parsing, so a
@@ -648,6 +648,14 @@ fn decode_segment(segment: &[u8]) -> Option<UnitMeta> {
     bincode::deserialize(&raw).ok()
 }
 
+/// Test-only wrapper over the private [`decode_segment`] so cross-module tests
+/// (e.g. the S3 body round-trip in `unit_meta`) can exercise the real
+/// `serialize_meta` → `[magic|version]` decode path.
+#[cfg(test)]
+pub fn decode_segment_for_test(segment: &[u8]) -> Option<UnitMeta> {
+    decode_segment(segment)
+}
+
 /// Deserialize one meta segment (transparent serde re-registers FileIds /
 /// re-interns Spurs) and hash-validate it against current file contents. Panic
 /// free: a corrupt segment or unregisterable path is a clean `None` (never a
@@ -1032,8 +1040,8 @@ mod tests {
 
     #[test]
     fn old_version_snapshot_is_cleanly_rejected() {
-        // A snapshot written by a PRIOR format version (here v12, one behind the
-        // current v13) must be refused with a clean version-mismatch error — not
+        // A snapshot written by a PRIOR format version (here v14, one behind the
+        // current v15) must be refused with a clean version-mismatch error — not
         // a panic, not a partial/garbage load. Bincode is not self-describing,
         // so an old snapshot's unit bytes may not even match the current
         // `UnitMeta` layout; the version guard must reject BEFORE any unit
@@ -1046,9 +1054,9 @@ mod tests {
         // segment of bytes that would NOT decode under the current `UnitMeta`
         // layout. The version guard must reject before any segment is touched,
         // so these bytes are never even reached.
-        assert_eq!(CACHE_FORMAT_VERSION, 14, "update this test on a format bump");
+        assert_eq!(CACHE_FORMAT_VERSION, 15, "update this test on a format bump");
         let stale = SavedCacheDisk {
-            version: 13,
+            version: 14,
             units: vec![vec![0xDE, 0xAD, 0xBE, 0xEF]],
         };
         std::fs::write(&snapshot, bincode::serialize(&stale).unwrap()).unwrap();
@@ -1058,8 +1066,8 @@ mod tests {
         let error = result.expect_err("an old-version snapshot must be rejected");
         // the message names both the found and expected versions
         assert!(
-            error.message.contains("13") && error.message.contains("14"),
-            "version-mismatch message must name found (13) and expected (14): {}",
+            error.message.contains("14") && error.message.contains("15"),
+            "version-mismatch message must name found (14) and expected (15): {}",
             error.message
         );
     }

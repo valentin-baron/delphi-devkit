@@ -276,6 +276,225 @@ impl Default for ImplementationBody {
     }
 }
 
+impl ImplementationBody {
+    /// Rebuild the flat [`crate::ast::ImplRoutine`] table (params/locals per
+    /// routine body, plus the whole-body span) DERIVED from this scope tree — the
+    /// single-source-of-truth replacement for the separately-stored `impl_scopes`
+    /// vector. Emits ONE `ImplRoutine` per routine-defining scope
+    /// ([`ScopeKind::Routine`], [`ScopeKind::Method`], [`ScopeKind::Nested`]),
+    /// exactly the scopes the parser recorded into the old flat table; anonymous
+    /// methods and `with`-blocks carry no `ImplRoutine` (they never did). Byte-
+    /// identical to what `record_impl_routine_from_declarations` produced: params
+    /// are the leading [`LocalKind::Param`] declarations, locals are the
+    /// declaration-part `var`/`const`/`type`/`label` entries (inline vars, which
+    /// the flat table never held, are excluded). Same-unit local resolution
+    /// ([`crate::driver`] `local_at`/hover) walks the result unchanged.
+    pub fn flatten_impl_routines(&self) -> Vec<crate::ast::ImplRoutine> {
+        let mut routines = Vec::new();
+        for routine in &self.routines {
+            emit_routine_scope(&routine.scope, routine.name, routine.owner_type_key, &mut routines);
+        }
+        routines
+    }
+
+    /// Structural node count over the whole body — a cheap, allocation-free walk
+    /// the moka weigher charges per node (statements + expressions + scopes +
+    /// declarations). Never touches the derived flat table (weigher runs under
+    /// moka's insert lock, ledger #29).
+    pub fn node_count(&self) -> usize {
+        let mut nodes = 0usize;
+        for routine in &self.routines {
+            nodes += 1; // the RoutineImplementation header
+            count_scope_nodes(&routine.scope, &mut nodes);
+        }
+        if let Some(initialization) = &self.initialization {
+            count_statements_nodes(initialization, &mut nodes);
+        }
+        if let Some(finalization) = &self.finalization {
+            count_statements_nodes(finalization, &mut nodes);
+        }
+        nodes
+    }
+}
+
+/// Emit one routine-defining scope's `ImplRoutine`, then descend into every
+/// nested routine (a `ChildScope`, and closures' nested routines) so the flat
+/// table matches the parser's recording shape. Anonymous methods and `with`
+/// scopes carry no entry (they never did). `enclosing_name` supplies the `name`
+/// field for nested `ChildScope` entries — a `Scope` stores no header name, and
+/// the flat-table consumer keys on `body_span`, never on a nested entry's
+/// `name`, so threading the enclosing routine's (already-interned) name keeps the
+/// field well-formed without inventing a wrong lookup key.
+fn emit_routine_scope(
+    scope: &Scope,
+    enclosing_name: QualifiedName,
+    owner_type_key: Option<Identifier>,
+    out: &mut Vec<crate::ast::ImplRoutine>,
+) {
+    use crate::ast::{ImplRoutine, LocalDeclaration};
+    if matches!(scope.kind, ScopeKind::Routine | ScopeKind::Method | ScopeKind::Nested) {
+        let mut params = Vec::new();
+        let mut locals = Vec::new();
+        for symbol in &scope.declarations {
+            let declaration = LocalDeclaration {
+                name: symbol.name,
+                decl_kind: symbol.kind,
+                type_key: symbol.type_key,
+            };
+            match symbol.kind {
+                LocalKind::Param => params.push(declaration),
+                // Inline vars were never part of the flat table (the S2 builder
+                // appends them to the scope's declarations); exclude them so the
+                // derived table is byte-identical to the parser's recording.
+                LocalKind::InlineVar => {}
+                _ => locals.push(declaration),
+            }
+        }
+        out.push(ImplRoutine {
+            name: enclosing_name,
+            owner_type_key,
+            body_span: scope.span,
+            params,
+            locals,
+        });
+    }
+    collect_nested_routines(&scope.statements, enclosing_name, out);
+}
+
+/// Find every nested routine scope reachable from a statement list and emit its
+/// `ImplRoutine` (via [`emit_routine_scope`]).
+fn collect_nested_routines(
+    statements: &[Statement],
+    enclosing_name: QualifiedName,
+    out: &mut Vec<crate::ast::ImplRoutine>,
+) {
+    for statement in statements {
+        match statement {
+            Statement::ChildScope(scope) => {
+                emit_routine_scope(scope, enclosing_name, scope.self_type_key, out)
+            }
+            Statement::Group(inner) => collect_nested_routines(inner, enclosing_name, out),
+            Statement::With { items, body } => {
+                for item in items {
+                    collect_nested_routines_in_expression(item, enclosing_name, out);
+                }
+                collect_nested_routines(body, enclosing_name, out);
+            }
+            Statement::Expression(expression) => {
+                collect_nested_routines_in_expression(expression, enclosing_name, out)
+            }
+            Statement::Assignment { target, value } => {
+                collect_nested_routines_in_expression(target, enclosing_name, out);
+                collect_nested_routines_in_expression(value, enclosing_name, out);
+            }
+            Statement::LocalVar(_, Some(expression)) => {
+                collect_nested_routines_in_expression(expression, enclosing_name, out)
+            }
+            Statement::LocalVar(_, None) | Statement::Opaque(_) => {}
+        }
+    }
+}
+
+/// Descend into an expression for anonymous-method bodies, whose nested routines
+/// (but not the anonymous scope itself) belong in the flat table.
+fn collect_nested_routines_in_expression(
+    expression: &Expression,
+    enclosing_name: QualifiedName,
+    out: &mut Vec<crate::ast::ImplRoutine>,
+) {
+    match expression {
+        Expression::AnonymousMethod(scope) => {
+            collect_nested_routines(&scope.statements, enclosing_name, out)
+        }
+        Expression::Member { receiver, .. } => {
+            collect_nested_routines_in_expression(receiver, enclosing_name, out)
+        }
+        Expression::Call { callee, arguments, .. } => {
+            collect_nested_routines_in_expression(callee, enclosing_name, out);
+            for argument in arguments {
+                collect_nested_routines_in_expression(argument, enclosing_name, out);
+            }
+        }
+        Expression::Index { base, indices } => {
+            collect_nested_routines_in_expression(base, enclosing_name, out);
+            for index in indices {
+                collect_nested_routines_in_expression(index, enclosing_name, out);
+            }
+        }
+        Expression::Cast { operand, .. } => {
+            collect_nested_routines_in_expression(operand, enclosing_name, out)
+        }
+        Expression::Unary { operand, .. } => {
+            collect_nested_routines_in_expression(operand, enclosing_name, out)
+        }
+        Expression::Binary { left, right, .. } => {
+            collect_nested_routines_in_expression(left, enclosing_name, out);
+            collect_nested_routines_in_expression(right, enclosing_name, out);
+        }
+        Expression::Parenthesized(inner) => {
+            collect_nested_routines_in_expression(inner, enclosing_name, out)
+        }
+        _ => {}
+    }
+}
+
+fn count_scope_nodes(scope: &Scope, nodes: &mut usize) {
+    *nodes += 1 + scope.declarations.len();
+    count_statements_nodes(&scope.statements, nodes);
+}
+
+fn count_statements_nodes(statements: &[Statement], nodes: &mut usize) {
+    for statement in statements {
+        *nodes += 1;
+        match statement {
+            Statement::Expression(expression) => count_expression_nodes(expression, nodes),
+            Statement::Assignment { target, value } => {
+                count_expression_nodes(target, nodes);
+                count_expression_nodes(value, nodes);
+            }
+            Statement::LocalVar(_, Some(expression)) => count_expression_nodes(expression, nodes),
+            Statement::LocalVar(_, None) => {}
+            Statement::With { items, body } => {
+                for item in items {
+                    count_expression_nodes(item, nodes);
+                }
+                count_statements_nodes(body, nodes);
+            }
+            Statement::ChildScope(scope) => count_scope_nodes(scope, nodes),
+            Statement::Group(inner) => count_statements_nodes(inner, nodes),
+            Statement::Opaque(_) => {}
+        }
+    }
+}
+
+fn count_expression_nodes(expression: &Expression, nodes: &mut usize) {
+    *nodes += 1;
+    match expression {
+        Expression::Member { receiver, .. } => count_expression_nodes(receiver, nodes),
+        Expression::Call { callee, arguments, .. } => {
+            count_expression_nodes(callee, nodes);
+            for argument in arguments {
+                count_expression_nodes(argument, nodes);
+            }
+        }
+        Expression::Index { base, indices } => {
+            count_expression_nodes(base, nodes);
+            for index in indices {
+                count_expression_nodes(index, nodes);
+            }
+        }
+        Expression::Cast { operand, .. } => count_expression_nodes(operand, nodes),
+        Expression::Unary { operand, .. } => count_expression_nodes(operand, nodes),
+        Expression::Binary { left, right, .. } => {
+            count_expression_nodes(left, nodes);
+            count_expression_nodes(right, nodes);
+        }
+        Expression::Parenthesized(inner) => count_expression_nodes(inner, nodes),
+        Expression::AnonymousMethod(scope) => count_scope_nodes(scope, nodes),
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
