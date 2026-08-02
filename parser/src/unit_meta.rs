@@ -377,6 +377,11 @@ pub fn build_interface(unit: &Unit) -> UnitInterface {
                 .as_ref()
                 .map(type_can_inherit)
                 .unwrap_or(false),
+            ancestors: declaration
+                .type_expression
+                .as_ref()
+                .map(ancestor_keys)
+                .unwrap_or_default(),
         })
         .collect();
     UnitInterface {
@@ -413,6 +418,24 @@ fn type_can_inherit(type_expression: &TypeExpression) -> bool {
             | TypeExpression::ForwardInterface
             | TypeExpression::ForwardDispInterface
     )
+}
+
+/// The FOLDED type keys of a class/interface type's declared ancestors, in
+/// source order — the derived `InterfaceSymbol::ancestors` field. Each
+/// `Ancestor.name` is a `QualifiedName` whose `.key` is the folded key of its
+/// LAST segment (`System.Classes.TComponent` → `TComponent`'s key), which is
+/// exactly what the name-keyed interface index resolves against. Every other
+/// shape (record/enum/alias/…) carries no ancestor list → empty.
+fn ancestor_keys(type_expression: &TypeExpression) -> Vec<Identifier> {
+    match type_expression {
+        TypeExpression::Class(class_type) => {
+            class_type.ancestors.iter().map(|ancestor| ancestor.name.key).collect()
+        }
+        TypeExpression::Interface(interface_type) => {
+            interface_type.ancestors.iter().map(|ancestor| ancestor.name.key).collect()
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Attribute name lookup keys, source order.

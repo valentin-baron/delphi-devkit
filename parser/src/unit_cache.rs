@@ -149,6 +149,16 @@ pub struct InterfaceSymbol {
     /// the member could be inherited from an ancestor we do not flatten here
     /// (ledger #19).
     pub has_ancestors: bool,
+    /// For a class/interface type: the FOLDED type KEYS of its declared
+    /// ancestors (`class(TBase, IIntf)` → `[TBase, IIntf]`), in source order.
+    /// Empty for every other shape. A DERIVED index field extracted from the
+    /// AST's `ClassType.ancestors` / `InterfaceType.ancestors`; it drives the
+    /// query-time inheritance-flattened member surface (completion / go-to /
+    /// hover on an inherited member). Only the LAST segment of a dotted ancestor
+    /// name is retained via its folded `key` — the interface index is
+    /// name-keyed, so the simple type key is what a cross-unit
+    /// `interface().find` consults.
+    pub ancestors: Vec<Identifier>,
 }
 
 impl InterfaceSymbol {

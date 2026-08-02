@@ -761,29 +761,20 @@ impl ProjectSession {
         owner_key: Identifier,
         member_key: Identifier,
     ) -> Vec<CodeLocation> {
-        // owner in this unit
-        if let Some(owner) = meta.interface().find(owner_key) {
-            if let Some(member) = owner.find_member(member_key) {
-                return vec![member.location];
-            }
-            // owner exists here but the member is not a DIRECT member — it may
-            // be inherited from a base we do not flatten. Unknown, not wrong →
-            // empty (never a bogus location).
-            return Vec::new();
-        }
-        // owner in an imported unit
-        let loader = self.make_loader();
-        for import in imports_reversed(meta) {
-            if let crate::parse_state::LoadOutcome::Loaded(imported) = loader.interface_of(import) {
-                if let Some(owner) = imported.interface().find(owner_key) {
-                    if let Some(member) = owner.find_member(member_key) {
-                        return vec![member.location];
-                    }
-                    return Vec::new();
-                }
-            }
-        }
-        Vec::new()
+        // Resolve the owner and walk its INHERITANCE-FLATTENED surface (own
+        // members first, then each ancestor's, own→imports). The flattened entry
+        // whose key matches carries the member's true declaration location —
+        // which may be the base's declaration for an inherited member.
+        //
+        // NEVER-WRONG (#19/#35): if the member is on no resolved type in the
+        // hierarchy (owner unresolved, or member inherited from a base that is
+        // DCU-only / in a missing unit), the flattened surface simply omits it
+        // → empty. Absent, never a bogus location.
+        self.flattened_members(meta, owner_key)
+            .iter()
+            .find(|(_, member)| member.key == member_key)
+            .map(|(_, member)| vec![member.location])
+            .unwrap_or_default()
     }
 
     /// The declared facts of the symbol under `position` in `unit_key`'s source,
@@ -901,22 +892,19 @@ impl ProjectSession {
         member_key: Identifier,
         occurrence: CodeLocation,
     ) -> Option<crate::query::HoverInfo> {
-        if let Some(owner) = meta.interface().find(owner_key) {
-            return owner
-                .find_member(member_key)
-                .map(|member| member_hover(member, owner.name, occurrence));
-        }
-        let loader = self.make_loader();
-        for import in imports_reversed(meta) {
-            if let crate::parse_state::LoadOutcome::Loaded(imported) = loader.interface_of(import) {
-                if let Some(owner) = imported.interface().find(owner_key) {
-                    return owner
-                        .find_member(member_key)
-                        .map(|member| member_hover(member, owner.name, occurrence));
-                }
-            }
-        }
-        None
+        // Walk the owner's INHERITANCE-FLATTENED surface (own→imports, each
+        // ancestor likewise) and read the matching member's facts; the owner
+        // display name carried in the entry is the type that actually declares
+        // it (the base for an inherited member), so the hover renders
+        // `TBase.Member`.
+        //
+        // NEVER-WRONG (#19/#35): a member on no resolved type in the hierarchy
+        // (owner unresolved, or base DCU-only / in a missing unit) is simply
+        // absent from the flattened surface → None, never fabricated facts.
+        self.flattened_members(meta, owner_key)
+            .iter()
+            .find(|(_, member)| member.key == member_key)
+            .map(|(owner_display, member)| member_hover(member, *owner_display, occurrence))
     }
 
     /// Every recorded occurrence of `symbol_key` across all cached units (the
@@ -1403,6 +1391,66 @@ impl ProjectSession {
                 }
             }
         }
+
+        // (d) the receiver is a body LOCAL or PARAMETER of the enclosing routine
+        // whose declared type is a simple key (`var F: TForm; F.` → `TForm`).
+        // Same-unit only, resolved from the routine's `impl_scopes` via the same
+        // tightest-cover machinery as `local_at`. NEVER-WRONG: only a genuine
+        // scope local at THIS position with a simple `type_key` types the
+        // receiver; anything else falls through to today's `None` (top-level).
+        // The dot gate above already held, so this only ever runs for a real
+        // `Local.` member access. `receiver.location.span.start` is the receiver
+        // occurrence's own position (a body USAGE of the local), which locates
+        // its enclosing routine; `receiver_key` is the local's folded key.
+        if let Some(type_key) =
+            self.local_receiver_type_key(meta, receiver.location.span.start, receiver_key)
+        {
+            return Some(type_key);
+        }
+        None
+    }
+
+    /// The simple declared `type_key` of the body local/parameter named
+    /// `receiver_key` in the routine enclosing byte `receiver_position`,
+    /// resolved from the enclosing routine's `impl_scopes` (tightest-cover →
+    /// nested shadows outer, exactly like [`Self::local_at`]'s key-match step).
+    /// `None` when the impl-scope pass is unreliable, no covering routine
+    /// declares such a local, or the local's type is anonymous/complex (no
+    /// simple key). Same-unit only — never a cross-unit load. Used to type a
+    /// `Local.member` receiver.
+    fn local_receiver_type_key(
+        &self,
+        meta: &UnitMeta,
+        receiver_position: u32,
+        receiver_key: Identifier,
+    ) -> Option<Identifier> {
+        if !meta.impl_scopes_reliable() {
+            return None;
+        }
+        // All routines whose body covers the receiver occurrence, tightest→
+        // widest, so an inner routine's local shadows an outer's same-named one.
+        let mut covering_routines: Vec<&crate::ast::ImplRoutine> = meta
+            .impl_scopes()
+            .iter()
+            .filter(|routine| {
+                let span = routine.body_span;
+                span.start <= receiver_position && receiver_position < span.end
+            })
+            .collect();
+        covering_routines.sort_by_key(|routine| routine.body_span.len());
+
+        for routine in &covering_routines {
+            if let Some(declaration) = routine
+                .params
+                .iter()
+                .chain(routine.locals.iter())
+                .find(|declaration| declaration.name.key == receiver_key)
+            {
+                // Only a SIMPLE declared type keys a receiver; an anonymous/
+                // complex/absent type has no key → fall through (top-level).
+                return declaration.type_key;
+            }
+        }
         None
     }
 
@@ -1433,25 +1481,110 @@ impl ProjectSession {
         matches!(content[start..end].trim_end().chars().next_back(), Some('.'))
     }
 
-    /// The members of `type_key`, resolved own-first then imports. Empty if the
-    /// type is unresolved. Correct visibility surfaced (never a wrong member).
-    fn member_completions(&self, meta: &UnitMeta, type_key: Identifier) -> Vec<Completion> {
-        if let Some(symbol) = meta.interface().find(type_key) {
-            return symbol
-                .members
-                .iter()
-                .map(member_completion)
-                .collect();
-        }
+    /// The INHERITANCE-FLATTENED member surface of `type_key`: its own members
+    /// first, then each ancestor's (transitively), de-duplicated by folded key
+    /// so an override/shadow keeps the MOST-DERIVED declaration. Each entry is
+    /// `(owner_display_name, member)` — the owner is the DISPLAY name
+    /// (`symbol.name`, as written) of the type whose declaration the member
+    /// actually came from (the starting type or an ancestor), so a hover can
+    /// render `TBase.Method` and a definition lands on the right declaration.
+    ///
+    /// RESOLUTION (own → imports, exactly as the flat path + the `Declared`
+    /// walk): a type key is resolved by consulting this unit's interface first,
+    /// then each import in reverse uses order via `loader.interface_of`. An
+    /// ancestor lives in whatever unit exports it; the same own→imports scan
+    /// finds it. The walk runs LAZILY at QUERY time only (completion / go-to /
+    /// hover) — never during parse or in the weigher.
+    ///
+    /// NEVER-WRONG (#19/#35): an ancestor key that resolves to NO type (a
+    /// DCU-only base, a missing unit) simply STOPS that branch — the members
+    /// already collected stay, no member is fabricated and no wrong location is
+    /// produced. A member found is correct; a member merely absent is correct
+    /// too.
+    ///
+    /// CYCLE-SAFE + BOUNDED: a `visited` set of type keys means a malformed
+    /// cyclic hierarchy (`A = class(B)` / `B = class(A)`) is walked once, never
+    /// looped; a hard depth bound (`MAX_ANCESTOR_DEPTH`) is a second belt so a
+    /// pathological chain can never run away.
+    fn flattened_members(
+        &self,
+        meta: &UnitMeta,
+        type_key: Identifier,
+    ) -> Vec<(Identifier, crate::unit_cache::MemberSymbol)> {
+        /// Belt-and-suspenders bound on the ancestor chain length. `visited`
+        /// already makes the walk terminate; this caps a pathological (but
+        /// acyclic) deep chain so a query stays cheap.
+        const MAX_ANCESTOR_DEPTH: usize = 64;
+
         let loader = self.make_loader();
-        for import in imports_reversed(meta) {
-            if let crate::parse_state::LoadOutcome::Loaded(imported) = loader.interface_of(import) {
-                if let Some(symbol) = imported.interface().find(type_key) {
-                    return symbol.members.iter().map(member_completion).collect();
+        // Resolve a type key to its `InterfaceSymbol`, own interface first then
+        // imports (reverse uses order) — the SAME order as the flat path and
+        // the `Declared` walk. Returns an owned clone so the borrow of a loaded
+        // `Arc<UnitMeta>` (dropped at the end of the closure) does not escape.
+        let resolve_type = |type_key: Identifier| -> Option<crate::unit_cache::InterfaceSymbol> {
+            if let Some(symbol) = meta.interface().find(type_key) {
+                return Some(symbol.clone());
+            }
+            for import in imports_reversed(meta) {
+                if let crate::parse_state::LoadOutcome::Loaded(imported) =
+                    loader.interface_of(import)
+                {
+                    if let Some(symbol) = imported.interface().find(type_key) {
+                        return Some(symbol.clone());
+                    }
+                }
+            }
+            None
+        };
+
+        let mut flattened: Vec<(Identifier, crate::unit_cache::MemberSymbol)> = Vec::new();
+        let mut member_seen: std::collections::HashSet<Identifier> = std::collections::HashSet::new();
+        let mut type_seen: std::collections::HashSet<Identifier> = std::collections::HashSet::new();
+        // BFS-ish frontier of (type_key, depth): own type at depth 0, then its
+        // ancestors, then theirs. Source order within a level is preserved and
+        // an ancestor is enqueued once (its first, most-derived reach).
+        let mut frontier: std::collections::VecDeque<(Identifier, usize)> =
+            std::collections::VecDeque::new();
+        frontier.push_back((type_key, 0));
+        type_seen.insert(type_key);
+
+        while let Some((current_key, depth)) = frontier.pop_front() {
+            if depth > MAX_ANCESTOR_DEPTH {
+                continue;
+            }
+            let Some(symbol) = resolve_type(current_key) else {
+                // Unresolvable ancestor (DCU-only base, missing unit): stop this
+                // branch with what already resolved — never a wrong member.
+                continue;
+            };
+            for member in &symbol.members {
+                // De-dup by folded key: the MOST-DERIVED declaration wins because
+                // the starting type is visited before its ancestors (an override
+                // shadows the base's same-named member).
+                if member_seen.insert(member.key) {
+                    flattened.push((symbol.name, member.clone()));
+                }
+            }
+            for &ancestor_key in &symbol.ancestors {
+                // `visited` guards cycles AND diamond re-visits: an ancestor
+                // reached twice is walked once (its most-derived reach).
+                if type_seen.insert(ancestor_key) {
+                    frontier.push_back((ancestor_key, depth + 1));
                 }
             }
         }
-        Vec::new()
+        flattened
+    }
+
+    /// The INHERITANCE-FLATTENED members of `type_key` as completions, resolved
+    /// own-first then imports (with each ancestor likewise). Empty if the type
+    /// is unresolved. Correct visibility surfaced (never a wrong member); an
+    /// inherited member is listed once, an override keeps the most-derived.
+    fn member_completions(&self, meta: &UnitMeta, type_key: Identifier) -> Vec<Completion> {
+        self.flattened_members(meta, type_key)
+            .iter()
+            .map(|(_, member)| member_completion(member))
+            .collect()
     }
 
     /// Visible top-level symbols: builtins + own interface symbols declared
@@ -4868,6 +5001,352 @@ mod tests {
         // Nothing parsed → the unit is not cached → no tokens (never a panic).
         let key = session.context.intern_key("NOPE");
         assert!(session.semantic_tokens(key).is_empty());
+    }
+
+    // ─── Member resolution: local receiver + inheritance flattening ──────────
+
+    /// Byte offset ONE PAST the first `.` that follows the LAST occurrence of
+    /// `receiver` in `file`'s source — the member-access cursor position for a
+    /// `receiver.` access. Panics if the receiver or its trailing dot is absent.
+    fn position_after_receiver_dot(
+        session: &ProjectSession,
+        file: FileId,
+        receiver: &str,
+    ) -> u32 {
+        let content = session.arena.content(file).unwrap();
+        let receiver_start = content.rfind(receiver).expect("receiver text present");
+        let after_receiver = receiver_start + receiver.len();
+        let dot_relative = content[after_receiver..]
+            .find('.')
+            .expect("a '.' follows the receiver");
+        (after_receiver + dot_relative + 1) as u32
+    }
+
+    #[test]
+    fn local_receiver_typed_from_declared_type_completes_members() {
+        // Part 1 headline: `var F: TForm; begin F.| end;` — the receiver is a
+        // body LOCAL whose declared type is a same-unit type with members. The
+        // member cursor after `F.` must complete TForm's members (not top-level).
+        let directory = temp_directory("member_local_receiver");
+        std::fs::write(
+            directory.join("Forms.pas"),
+            "unit Forms;\ninterface\n\
+             type TForm = class\n  procedure Show;\n  Caption: Integer;\nend;\n\
+             const FormTag = 7;\n\
+             implementation\n\
+             procedure Run;\nvar F: TForm;\nbegin\n  F.\nend;\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("Forms.pas")).unwrap();
+        let key = session.context.intern_key("FORMS");
+        let meta = session.meta_of(key).unwrap();
+
+        let file = meta.usages.first().expect("some usage recorded").location.file;
+        let position = position_after_receiver_dot(&session, file, "F.");
+
+        // member_receiver_at types the local F to the TForm key.
+        assert_eq!(
+            session.member_receiver_at(&meta, position),
+            Some(session.context.intern_key("TForm")),
+            "local receiver F must type to TForm"
+        );
+
+        // completions at the cursor are TForm's members, not top-level.
+        let completions = session.completions(key, position);
+        let member_keys: std::collections::HashSet<_> =
+            completions.iter().map(|c| c.key).collect();
+        assert!(member_keys.contains(&session.context.intern_key("Show")), "method Show");
+        assert!(member_keys.contains(&session.context.intern_key("Caption")), "field Caption");
+        assert!(
+            !member_keys.contains(&session.context.intern_key("FormTag")),
+            "top-level const must not leak into member list"
+        );
+
+        // NEGATIVE dot gate: a bare `F` position (before the dot) → top-level.
+        let content = session.arena.content(file).unwrap();
+        let f_start = content.rfind("F.").unwrap();
+        let bare_f_end = (f_start + 1) as u32; // right after `F`, before the `.`
+        assert_eq!(
+            session.member_receiver_at(&meta, bare_f_end),
+            None,
+            "no dot after the receiver → top-level, never member mode"
+        );
+    }
+
+    #[test]
+    fn inherited_members_flatten_same_unit() {
+        // Part 3: `TChild = class(TBase)`; TBase has BaseMethod. A `child.` member
+        // query completes BaseMethod (inherited) AND definition lands on TBase's
+        // declaration. Override de-dup: TChild overrides Foo → listed once.
+        let directory = temp_directory("member_inherit_same_unit");
+        std::fs::write(
+            directory.join("Hier.pas"),
+            "unit Hier;\ninterface\n\
+             type\n  TBase = class\n    procedure BaseMethod;\n    procedure Foo;\n  end;\n\
+             \n  TChild = class(TBase)\n    procedure ChildMethod;\n    procedure Foo;\n  end;\n\
+             implementation\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("Hier.pas")).unwrap();
+        let key = session.context.intern_key("HIER");
+        let meta = session.meta_of(key).unwrap();
+        let child_key = session.context.intern_key("TChild");
+
+        let completions = session.member_completions(&meta, child_key);
+        let member_keys: Vec<_> = completions.iter().map(|c| c.key).collect();
+        assert!(
+            member_keys.contains(&session.context.intern_key("BaseMethod")),
+            "inherited BaseMethod present: {member_keys:?}"
+        );
+        assert!(
+            member_keys.contains(&session.context.intern_key("ChildMethod")),
+            "own ChildMethod present"
+        );
+        // Override de-dup: Foo listed exactly once (the child's).
+        let foo_count = member_keys
+            .iter()
+            .filter(|k| **k == session.context.intern_key("Foo"))
+            .count();
+        assert_eq!(foo_count, 1, "overridden Foo listed once, not per level");
+
+        // definition of the inherited BaseMethod (via member_definition) lands on
+        // TBase's declaration. TBase's BaseMethod declaration span:
+        let base = meta.interface().find(session.context.intern_key("TBase")).unwrap();
+        let base_method_location = base
+            .find_member(session.context.intern_key("BaseMethod"))
+            .unwrap()
+            .location;
+        let definition = session.member_definition(
+            &meta,
+            child_key,
+            session.context.intern_key("BaseMethod"),
+        );
+        assert_eq!(
+            definition,
+            vec![base_method_location],
+            "go-to-definition on inherited BaseMethod lands in TBase"
+        );
+
+        // The overridden Foo resolves to the CHILD's declaration (most-derived).
+        let child = meta.interface().find(child_key).unwrap();
+        let child_foo_location = child
+            .find_member(session.context.intern_key("Foo"))
+            .unwrap()
+            .location;
+        let foo_def =
+            session.member_definition(&meta, child_key, session.context.intern_key("Foo"));
+        assert_eq!(foo_def, vec![child_foo_location], "override Foo → child's decl");
+    }
+
+    #[test]
+    fn inherited_members_flatten_cross_unit() {
+        // Part 3 cross-unit: the base lives in an imported unit. The child's
+        // member surface flattens the imported base's members, and go-to lands in
+        // the base unit.
+        let directory = temp_directory("member_inherit_cross_unit");
+        std::fs::write(
+            directory.join("Base.pas"),
+            "unit Base;\ninterface\n\
+             type TBase = class\n  procedure BaseMethod;\nend;\n\
+             implementation\nend.",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("Child.pas"),
+            "unit Child;\ninterface\nuses Base;\n\
+             type TChild = class(TBase)\n  procedure ChildMethod;\nend;\n\
+             implementation\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("Child.pas")).unwrap();
+        let key = session.context.intern_key("CHILD");
+        let meta = session.meta_of(key).unwrap();
+        let child_key = session.context.intern_key("TChild");
+
+        let completions = session.member_completions(&meta, child_key);
+        let member_keys: std::collections::HashSet<_> =
+            completions.iter().map(|c| c.key).collect();
+        assert!(
+            member_keys.contains(&session.context.intern_key("BaseMethod")),
+            "cross-unit inherited BaseMethod present: {member_keys:?}"
+        );
+        assert!(
+            member_keys.contains(&session.context.intern_key("ChildMethod")),
+            "own ChildMethod present"
+        );
+
+        // go-to-definition on the inherited BaseMethod lands in Base.pas.
+        let base_key = session.context.intern_key("BASE");
+        let base_meta = session.meta_of(base_key).unwrap();
+        let base_method_location = base_meta
+            .interface()
+            .find(session.context.intern_key("TBase"))
+            .unwrap()
+            .find_member(session.context.intern_key("BaseMethod"))
+            .unwrap()
+            .location;
+        let definition = session.member_definition(
+            &meta,
+            child_key,
+            session.context.intern_key("BaseMethod"),
+        );
+        assert_eq!(
+            definition,
+            vec![base_method_location],
+            "cross-unit go-to lands in the base unit"
+        );
+
+        // hover on the inherited member reports its facts with TBase as owner.
+        let hover = session
+            .member_hover(
+                &meta,
+                child_key,
+                session.context.intern_key("BaseMethod"),
+                base_method_location,
+            )
+            .expect("inherited member hover resolves");
+        // owner_type carries the DISPLAY name (as written) of the declaring base.
+        let base_display_name = base_meta
+            .interface()
+            .find(session.context.intern_key("TBase"))
+            .unwrap()
+            .name;
+        assert_eq!(
+            hover.owner_type,
+            Some(base_display_name),
+            "inherited hover owner is the declaring base TBase"
+        );
+    }
+
+    #[test]
+    fn unresolvable_ancestor_degrades_to_absent_not_wrong() {
+        // Never-wrong: TChild's ancestor unit is not on disk (DCU-only base). The
+        // child's OWN members still complete; the missing base's members are
+        // simply absent — no panic, no wrong location.
+        let directory = temp_directory("member_inherit_unresolvable");
+        std::fs::write(
+            directory.join("Lonely.pas"),
+            "unit Lonely;\ninterface\n\
+             type TChild = class(TGhostBase)\n  procedure OwnMethod;\nend;\n\
+             implementation\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("Lonely.pas")).unwrap();
+        let key = session.context.intern_key("LONELY");
+        let meta = session.meta_of(key).unwrap();
+        let child_key = session.context.intern_key("TChild");
+
+        let completions = session.member_completions(&meta, child_key);
+        let member_keys: std::collections::HashSet<_> =
+            completions.iter().map(|c| c.key).collect();
+        assert!(
+            member_keys.contains(&session.context.intern_key("OwnMethod")),
+            "own member still completes with an unresolvable base"
+        );
+        // definition of a member that would live in the missing base → absent.
+        let definition = session.member_definition(
+            &meta,
+            child_key,
+            session.context.intern_key("GhostMethod"),
+        );
+        assert!(definition.is_empty(), "missing base member → no location, never wrong");
+    }
+
+    #[test]
+    fn cyclic_hierarchy_is_bounded_no_infinite_loop() {
+        // Never-wrong + bounded: a malformed cyclic hierarchy A=class(B),
+        // B=class(A). The flattened walk terminates (visited set), collecting each
+        // type's own members once, without looping.
+        let directory = temp_directory("member_inherit_cyclic");
+        std::fs::write(
+            directory.join("Cyc.pas"),
+            "unit Cyc;\ninterface\n\
+             type\n  TA = class(TB)\n    procedure AMethod;\n  end;\n\
+             \n  TB = class(TA)\n    procedure BMethod;\n  end;\n\
+             implementation\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("Cyc.pas")).unwrap();
+        let key = session.context.intern_key("CYC");
+        let meta = session.meta_of(key).unwrap();
+
+        // Terminates (no hang) and collects both types' members once.
+        let completions = session.member_completions(&meta, session.context.intern_key("TA"));
+        let member_keys: std::collections::HashSet<_> =
+            completions.iter().map(|c| c.key).collect();
+        assert!(member_keys.contains(&session.context.intern_key("AMethod")), "TA own member");
+        assert!(
+            member_keys.contains(&session.context.intern_key("BMethod")),
+            "TB member reached across the cycle exactly once"
+        );
+    }
+
+    #[test]
+    fn combined_local_receiver_inherited_member() {
+        // Combined headline: `var C: TChild; begin C.BaseMethod| end;` — the local
+        // receiver types to TChild, whose flattened surface includes the inherited
+        // BaseMethod, and go-to-definition on it lands in the base.
+        let directory = temp_directory("member_combined");
+        std::fs::write(
+            directory.join("Combined.pas"),
+            "unit Combined;\ninterface\n\
+             type\n  TBase = class\n    procedure BaseMethod;\n  end;\n\
+             \n  TChild = class(TBase)\n    procedure ChildMethod;\n  end;\n\
+             implementation\n\
+             procedure Use;\nvar C: TChild;\nbegin\n  C.\nend;\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("Combined.pas")).unwrap();
+        let key = session.context.intern_key("COMBINED");
+        let meta = session.meta_of(key).unwrap();
+
+        let file = meta.usages.first().unwrap().location.file;
+        let position = position_after_receiver_dot(&session, file, "C.");
+
+        // completion at `C.` includes the inherited BaseMethod.
+        let completions = session.completions(key, position);
+        let member_keys: std::collections::HashSet<_> =
+            completions.iter().map(|c| c.key).collect();
+        assert!(
+            member_keys.contains(&session.context.intern_key("BaseMethod")),
+            "inherited BaseMethod completes on a local TChild receiver: {member_keys:?}"
+        );
+        assert!(
+            member_keys.contains(&session.context.intern_key("ChildMethod")),
+            "own ChildMethod present too"
+        );
+
+        // go-to-definition on the inherited BaseMethod (via the flattened surface)
+        // lands on TBase's declaration.
+        let base_method_location = meta
+            .interface()
+            .find(session.context.intern_key("TBase"))
+            .unwrap()
+            .find_member(session.context.intern_key("BaseMethod"))
+            .unwrap()
+            .location;
+        let definition = session.member_definition(
+            &meta,
+            session.context.intern_key("TChild"),
+            session.context.intern_key("BaseMethod"),
+        );
+        assert_eq!(
+            definition,
+            vec![base_method_location],
+            "go-to on inherited BaseMethod lands in TBase"
+        );
     }
 }
 
