@@ -1914,7 +1914,7 @@ fn span_covers(location: CodeLocation, position: u32) -> bool {
 fn local_completion_kind(kind: crate::ast::LocalKind) -> CompletionKind {
     use crate::ast::LocalKind;
     match kind {
-        LocalKind::Var | LocalKind::Param | LocalKind::Label => {
+        LocalKind::Var | LocalKind::InlineVar | LocalKind::Param | LocalKind::Label => {
             CompletionKind::Symbol(SymbolKind::Var)
         }
         LocalKind::Const => CompletionKind::Symbol(SymbolKind::Const),

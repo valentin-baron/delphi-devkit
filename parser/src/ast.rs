@@ -389,6 +389,11 @@ pub enum LocalKind {
     Type,
     Param,
     Label,
+    /// A Delphi 10.3+ inline variable (`var X := expr;` in statement position).
+    /// Distinguished from a declaration-part `Var` because it is introduced
+    /// mid-body and its scope extends from the declaration to the end of the
+    /// enclosing block, not the whole routine.
+    InlineVar,
 }
 
 /// One local variable, constant, type, label or parameter declared inside a

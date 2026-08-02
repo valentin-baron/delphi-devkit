@@ -19,8 +19,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ast::QualifiedName;
-use crate::meta::CodeLocation;
+use crate::ast::{LocalKind, QualifiedName, RoutineKind};
+use crate::context::Identifier;
+use crate::meta::{CodeLocation, Span};
 
 /// A prefix / postfix unary operator over a single operand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,12 +119,11 @@ pub enum Expression {
         right: Box<Expression>,
     },
     /// An anonymous-method opener in expression position — `procedure … end`,
-    /// `function … end` or `reference to …`. The whole opener…`end` region is
-    /// captured as one opaque span (begin/end balanced).
-    //
-    // S2: replace with AnonymousMethod(Box<Scope>) once the Scope type exists;
-    // the closure body then becomes a real child scope instead of an opaque span.
-    AnonymousMethodOpaque(CodeLocation),
+    /// `function … end` or `reference to …`. The closure body is a real child
+    /// [`Scope`] of kind [`ScopeKind::Anonymous`]: its params, inline vars and
+    /// statements belong to it, so a cursor inside the closure resolves against
+    /// the closure's own symbols rather than the enclosing routine's.
+    AnonymousMethod(Box<Scope>),
     /// `[a, b, c]` — a set or array-constructor literal. The bracket group span
     /// is captured; identifier occurrences INSIDE are still recorded (so the
     /// reference index stays complete) even though the elements are not retained
@@ -134,6 +134,146 @@ pub enum Expression {
     /// `(inner)` — an explicitly parenthesized sub-expression, retained so a
     /// later walk can distinguish grouping from precedence.
     Parenthesized(Box<Expression>),
+}
+
+// ─── Statement / scope layer (Stage S2) ──────────────────────────────────────
+//
+// The scope tree is the real model of the implementation section: every lexical
+// scope (free routine, method, nested routine, anonymous method, `with`-block)
+// is a [`Scope`] carrying its own local symbols and a shallow statement list.
+// Statements are shallow on purpose — we model scope structure and expression
+// occurrences, NOT control-flow semantics: a control-flow construct's condition
+// and bound expressions are pulled into the list as plain [`Statement::Expression`]s
+// and its branch bodies recurse as [`Statement::Group`]s, but the parser never
+// tags which control-flow form produced them.
+//
+// Every leaf is a span or a declaration key (the "AST carries no strings /
+// expressions are spans" invariant continues to hold). All types derive
+// `Serialize + Deserialize + Clone + Debug`.
+
+/// One body-local declaration — a parameter, a declaration-part `var`/`const`/
+/// `type`/`label`, or an inline `var`/`const` introduced mid-body. `name` gives
+/// both the folded lookup key and the exact source span of the declaring
+/// occurrence (`QualifiedName` carries `key` + `location`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalSymbol {
+    /// The declared name — its folded lookup key and its own declaration span.
+    pub name: QualifiedName,
+    pub kind: LocalKind,
+    /// The declared type as a SIMPLE reference key (`Local: TThing` → `TThing`),
+    /// else `None` for an anonymous/complex/absent type. Captured only when
+    /// trivial; a later stage refines it.
+    pub type_key: Option<Identifier>,
+}
+
+/// The kind of a lexical [`Scope`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScopeKind {
+    /// A free routine body (`procedure Foo; … begin … end`).
+    Routine,
+    /// A routine nested in another routine's declaration part.
+    Nested,
+    /// An anonymous method / closure body.
+    Anonymous,
+    /// A method body (`procedure TFoo.Bar`): `self_type_key` is `Some(TFoo)`, so
+    /// bare member names / `Self` resolve against the owner type.
+    Method,
+    /// A `with E do …` block — its receivers' types open a member scope.
+    With,
+}
+
+/// One lexical scope: its kind, whole-extent span, the type its `Self` binds to
+/// (for methods), its local declarations and its shallow statement list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Scope {
+    pub kind: ScopeKind,
+    /// The whole scope extent — a body position is enclosed when its offset falls
+    /// inside this span. For nested scopes the tightest-covering span wins.
+    pub span: Span,
+    /// `Some(TFoo)` inside a method body (bare members / `Self` resolve against
+    /// it); `None` for a free routine / closure / nested routine / with-block.
+    pub self_type_key: Option<Identifier>,
+    /// Params + declaration-part `var`/`const`/`type`/`label` + inline vars.
+    pub declarations: Vec<LocalSymbol>,
+    pub statements: StatementList,
+}
+
+/// A shallow list of statements (see the module note above).
+pub type StatementList = Vec<Statement>;
+
+/// One shallow statement. Control-flow forms are NOT modelled as typed nodes;
+/// their condition/selector/bound expressions become [`Statement::Expression`]s
+/// and their sub-statement bodies recurse as [`Statement::Group`]s, so every
+/// identifier occurrence and nested scope is still captured.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Statement {
+    /// A bare expression / call statement.
+    Expression(Expression),
+    /// `target := value`.
+    Assignment {
+        target: Expression,
+        value: Expression,
+    },
+    /// An inline `var X [: T] [:= expr];` / `const X = expr;` (Delphi 10.3+). The
+    /// symbol is ALSO appended to the enclosing scope's `declarations` so it
+    /// resolves; this node keeps its optional initializer expression.
+    LocalVar(LocalSymbol, Option<Expression>),
+    /// `with E1, E2 do body` — `items` are the receiver expressions (their types
+    /// open a member scope later); `body` is the following statement(s).
+    With {
+        items: Vec<Expression>,
+        body: StatementList,
+    },
+    /// A nested routine / anonymous-method scope reachable in the tree.
+    ChildScope(Box<Scope>),
+    /// A `begin`/`case`/`try`/branch body flattened: condition/selector
+    /// expressions are pulled in as `Expression` statements and branch bodies
+    /// recurse. We do NOT tag which control-flow form it was.
+    Group(StatementList),
+    /// A region we chose not to model, still scanned for identifier occurrences
+    /// so references stay complete.
+    Opaque(CodeLocation),
+}
+
+/// One implementation-section routine definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutineImplementation {
+    /// The header name occurrence (`procedure TThing.Run` → the `Run` occurrence).
+    pub name: QualifiedName,
+    /// `Some(TThing)` for a qualified `procedure TThing.Run`; `None` for a free
+    /// routine.
+    pub owner_type_key: Option<Identifier>,
+    /// procedure / function / constructor / destructor / operator.
+    pub kind: RoutineKind,
+    /// The routine's own scope (kind `Method` when `owner_type_key.is_some()`,
+    /// else `Routine`).
+    pub scope: Scope,
+}
+
+/// The whole implementation section as a scope tree plus the unit's
+/// initialization / finalization statement lists.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImplementationBody {
+    /// Top-level impl routines, in source order.
+    pub routines: Vec<RoutineImplementation>,
+    /// `initialization … end.` block (or the unit's `begin … end.` init block).
+    pub initialization: Option<StatementList>,
+    /// `finalization … end.` block.
+    pub finalization: Option<StatementList>,
+    /// Whole-section clean-parse flag: `true` only when nothing degraded. The
+    /// it.15 query gate reads this (mirrors the derived `impl_scopes_reliable`).
+    pub reliable: bool,
+}
+
+impl Default for ImplementationBody {
+    fn default() -> Self {
+        Self {
+            routines: Vec::new(),
+            initialization: None,
+            finalization: None,
+            reliable: true,
+        }
+    }
 }
 
 #[cfg(test)]

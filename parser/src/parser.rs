@@ -150,8 +150,14 @@ pub struct ParseOutcome {
     /// same-unit local resolution. Only trusted when `impl_scopes_reliable`.
     pub impl_scopes: Vec<crate::ast::ImplRoutine>,
     /// True only when the impl-section structure pass completed without recovery
-    /// (see [`crate::unit_meta::UnitMeta::impl_scopes_reliable`]).
+    /// (see [`crate::unit_meta::UnitMeta::impl_scopes_reliable`]). DERIVED from
+    /// [`Self::implementation_body`]`.reliable`.
     pub impl_scopes_reliable: bool,
+    /// The full implementation-section scope tree (Stage S2). `impl_scopes` and
+    /// `impl_scopes_reliable` are DERIVED from this; downstream queries that only
+    /// need the flat routine table keep using them unchanged. Not yet serialized
+    /// / put on `UnitMeta` — that is S3.
+    pub implementation_body: crate::ast_impl::ImplementationBody,
     pub diagnostics: Vec<crate::token_cursor::Diagnostic>,
     /// An interface uses-cycle was hit (invalid Delphi, F2047) — result is
     /// best-effort and must not be persisted as trustworthy.
@@ -205,6 +211,7 @@ pub fn parse_file_full(
         usages: state.take_usages(),
         impl_scopes: state.take_impl_scopes(),
         impl_scopes_reliable: state.impl_scopes_reliable(),
+        implementation_body: state.take_implementation_body(),
         diagnostics,
         cycle_tainted: state.is_cycle_tainted(),
         recovered,
@@ -310,7 +317,8 @@ impl UnitParser<'_> {
         let interface_uses = self.optional_uses()?;
         let interface_declarations = self.parse_interface_declarations()?;
         let implementation_uses = self.optional_uses()?;
-        self.collect_implementation_usages()?;
+        let body = self.parse_implementation_body()?;
+        self.cursor.state_mut().set_implementation_body(body);
 
         Ok(Unit {
             name,
@@ -360,27 +368,60 @@ impl UnitParser<'_> {
     /// The Stage-1 scope branch ignores `impl_scopes` entirely when the flag is
     /// false, so a partially-built (and possibly mis-attributed) table is never
     /// consulted. This gating is the key correctness mechanism.
-    fn collect_implementation_usages(&mut self) -> Result<(), ParseError> {
+    ///
+    /// STAGE S2: this now builds a full [`ImplementationBody`] — a scope tree of
+    /// [`RoutineImplementation`]s (each with a real [`Scope`], typed locals and a
+    /// shallow statement list built on top of the S1 expression parser) plus the
+    /// unit's `initialization`/`finalization` statement lists. The flat
+    /// `impl_scopes` table + `impl_scopes_reliable` gate are DERIVED from it:
+    /// every routine (top-level, nested, method) is also recorded via
+    /// [`Self::record_impl_routine`] as it is parsed (preserving nested-routine
+    /// names/params/locals for the flat table), and the section-wide reliability
+    /// flag is `body.reliable`, so the two views never disagree.
+    ///
+    /// The reliability triggers are unchanged from the earlier flat scan: an
+    /// `asm` body, an inline structured local type, an unbalanced `end`, or any
+    /// unexpected token where a header/declaration was required degrades LOCALLY
+    /// (that routine's body drops to `Opaque`, `reliable` flips false) and the
+    /// remainder flat-scans for usages — never a wrong `body_span` / binding.
+    fn parse_implementation_body(
+        &mut self,
+    ) -> Result<crate::ast_impl::ImplementationBody, ParseError> {
+        use crate::ast_impl::ImplementationBody;
+        let mut routines = Vec::new();
+        let mut initialization: Option<crate::ast_impl::StatementList> = None;
+        let mut finalization: Option<crate::ast_impl::StatementList> = None;
+
         // Structure-aware phase: keep recognizing routine definitions (and the
         // section keywords that may sit between them) until we either reach EOF
-        // cleanly or hit a construct we do not model. On the latter we degrade.
+        // cleanly or hit a construct we do not model. On the latter we degrade
+        // (flat-scan the rest for usages) and return `reliable = false`.
         loop {
             let Some(peeked) = self.cursor.peek()? else {
-                // Clean EOF: the whole impl section was tracked. `reliable` stays
-                // true (its default).
-                return Ok(());
+                // Clean EOF: the whole impl section was tracked. Reliability is
+                // whatever the routine parses left it — a routine may have
+                // degraded locally without a hard stop, so read the live flag.
+                let reliable = self.cursor.state().impl_scopes_reliable();
+                return Ok(ImplementationBody {
+                    routines,
+                    initialization,
+                    finalization,
+                    reliable,
+                });
             };
             match peeked.token {
                 Token::Procedure
                 | Token::Function
                 | Token::Constructor
                 | Token::Destructor
-                | Token::Operator => {
-                    if !self.scan_impl_routine()? {
+                | Token::Operator => match self.parse_routine_implementation(false)? {
+                    Some(routine) => routines.push(routine),
+                    None => {
                         // Recovery inside the routine: degrade to a flat scan.
-                        return self.flush_impl_usages();
+                        self.flush_impl_usages()?;
+                        return Ok(self.degraded_body(routines, initialization, finalization));
                     }
-                }
+                },
                 // A leading `class` modifier on a class method
                 // (`class function TFoo.Bar`, `class procedure`, `class
                 // constructor`, `class destructor`, `class operator`). PEEK the
@@ -399,24 +440,31 @@ impl UnitParser<'_> {
                             | Some(Token::Operator)
                     ) {
                         // Consume the `class` keyword (it is a keyword — emit no
-                        // usage) so `scan_impl_routine` sees the routine keyword.
-                        // The routine's body span still anchors at the routine
+                        // usage) so `parse_routine_implementation` sees the routine
+                        // keyword. The body span still anchors at the routine
                         // keyword, which is fine.
                         self.cursor.advance()?;
-                        if !self.scan_impl_routine()? {
-                            return self.flush_impl_usages();
+                        match self.parse_routine_implementation(true)? {
+                            Some(routine) => routines.push(routine),
+                            None => {
+                                self.flush_impl_usages()?;
+                                return Ok(self.degraded_body(
+                                    routines,
+                                    initialization,
+                                    finalization,
+                                ));
+                            }
                         }
                     } else {
-                        return self.flush_impl_usages();
+                        self.flush_impl_usages()?;
+                        return Ok(self.degraded_body(routines, initialization, finalization));
                     }
                 }
                 // An impl-level declaration section (`var`/`const`/`type`/
                 // `threadvar`/`resourcestring`/`label`) sitting before or between
                 // routines. Do NOT bail to EOF — skip the section (emitting usages
                 // for its identifiers) and CONTINUE so the routines that follow it
-                // are still captured. `scan_impl_toplevel_section` balances any
-                // structured type bodies it steps through and degrades (flipping
-                // the reliability flag) on anything it cannot confidently track.
+                // are still captured. These sections contribute no scope.
                 Token::Var
                 | Token::Const
                 | Token::Type
@@ -425,18 +473,93 @@ impl UnitParser<'_> {
                 | Token::Label => {
                     let section = self.cursor.advance()?.expect("peeked").token;
                     if !self.scan_impl_toplevel_section(section)? {
-                        // Something unmodeled in the section: degrade to a flat
-                        // scan (the flag is already cleared).
-                        return self.flush_impl_usages();
+                        self.flush_impl_usages()?;
+                        return Ok(self.degraded_body(routines, initialization, finalization));
                     }
                 }
-                // The terminating `initialization`/`finalization`/`begin` (unit
-                // init block)/`end.`: these regions define no routine bodies, so
-                // we flat-scan the remainder for usages while keeping the
-                // already-captured routines and the reliable flag intact.
-                _ => return self.flush_impl_usages(),
+                // `initialization` … `finalization` … `end.`: shallow statement
+                // lists. A top-level `begin` is the unit's init block — also
+                // captured as `initialization`. These regions define no routine
+                // bodies, so reaching them does NOT by itself degrade reliability.
+                Token::Initialization => {
+                    self.cursor.advance()?; // 'initialization'
+                    initialization = Some(self.parse_section_statement_list()?);
+                }
+                Token::Finalization => {
+                    self.cursor.advance()?; // 'finalization'
+                    finalization = Some(self.parse_section_statement_list()?);
+                }
+                Token::Begin => {
+                    // Unit init block `begin … end.`. Parse as `initialization`.
+                    self.cursor.advance()?; // 'begin'
+                    let statements = self.parse_statement_list_until_end()?;
+                    initialization = Some(statements);
+                    // A trailing `.` (or `;`) after the unit's terminating `end`
+                    // is consumed by the driver's remainder flat-scan below.
+                    self.flush_impl_usages()?;
+                    let reliable = self.cursor.state().impl_scopes_reliable();
+                    return Ok(ImplementationBody {
+                        routines,
+                        initialization,
+                        finalization,
+                        reliable,
+                    });
+                }
+                // `end.` finishing the unit, or any other terminator: flat-scan
+                // the remainder for usages, keep the already-captured structure
+                // and the live reliability flag.
+                _ => {
+                    self.flush_impl_usages()?;
+                    let reliable = self.cursor.state().impl_scopes_reliable();
+                    return Ok(ImplementationBody {
+                        routines,
+                        initialization,
+                        finalization,
+                        reliable,
+                    });
+                }
             }
         }
+    }
+
+    /// Build a `reliable = false` [`ImplementationBody`] after a hard degrade in
+    /// the top-level loop (the reliability flag is already cleared in state).
+    fn degraded_body(
+        &self,
+        routines: Vec<crate::ast_impl::RoutineImplementation>,
+        initialization: Option<crate::ast_impl::StatementList>,
+        finalization: Option<crate::ast_impl::StatementList>,
+    ) -> crate::ast_impl::ImplementationBody {
+        crate::ast_impl::ImplementationBody {
+            routines,
+            initialization,
+            finalization,
+            reliable: false,
+        }
+    }
+
+    /// Parse an `initialization`/`finalization` section body: a shallow statement
+    /// list up to the section-closing `end`/`finalization`/EOF. Statement-level
+    /// modelling only (never a wrong span); usages always emitted.
+    fn parse_section_statement_list(
+        &mut self,
+    ) -> Result<crate::ast_impl::StatementList, ParseError> {
+        let mut statements = Vec::new();
+        loop {
+            match self.peek_token()? {
+                // `end` closes an `initialization` block (the `.` follows) and a
+                // `finalization` block; `finalization` also closes an
+                // `initialization` section. Leave the terminator for the driver /
+                // remainder flat-scan (it is a keyword — no usage lost).
+                None | Some(Token::End) | Some(Token::Finalization) => break,
+                _ => {
+                    if !self.parse_statement_into(&mut statements)? {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(statements)
     }
 
     /// Flat usage scan from the current position to EOF (the fallback path):
@@ -452,30 +575,56 @@ impl UnitParser<'_> {
         Ok(())
     }
 
-    /// Parse ONE implementation routine definition, recording its structure into
-    /// `impl_scopes`. Returns `Ok(true)` when the routine was tracked cleanly and
-    /// `Ok(false)` when recovery was needed (the state's reliability flag is then
-    /// already cleared) — the caller degrades to a flat scan on `false`.
+    /// Parse ONE implementation routine definition into a
+    /// [`RoutineImplementation`] (with a real [`Scope`] carrying its params,
+    /// declaration-part locals, nested routines and shallow statement list) AND
+    /// record the flattened [`crate::ast::ImplRoutine`] for the derived
+    /// `impl_scopes` table. Returns `Some(routine)` on a clean parse and `None`
+    /// when recovery was needed (the reliability flag is then already cleared);
+    /// the caller degrades to a flat scan on `None`.
     ///
-    /// Every identifier token stepped over still becomes a `Usage`. Nested
-    /// routines (declared in this routine's declaration part) recurse and get
-    /// their own `impl_scopes` entry; their body spans overlap this one's, which
-    /// is fine — a query picks the tightest cover.
-    fn scan_impl_routine(&mut self) -> Result<bool, ParseError> {
+    /// `class_prefixed` records that a leading `class` modifier was already
+    /// consumed (for a class method). `nested` is `false` for a top-level
+    /// routine, `true` when recursing into a routine declared in another
+    /// routine's declaration part — a nested routine gets [`ScopeKind::Nested`]
+    /// and is appended to its parent as a [`Statement::ChildScope`], and it is
+    /// still recorded in the flat table (its body span overlaps the parent's).
+    ///
+    /// Every identifier token stepped over still becomes a `Usage`.
+    fn parse_routine_implementation(
+        &mut self,
+        class_prefixed: bool,
+    ) -> Result<Option<crate::ast_impl::RoutineImplementation>, ParseError> {
+        let _ = class_prefixed; // the `class` keyword was already consumed
+        match self.parse_routine_scope(false)? {
+            Some((routine, _)) => Ok(Some(routine)),
+            None => Ok(None),
+        }
+    }
+
+    /// Shared routine-body parser used for both top-level routines and nested
+    /// routines. Returns the built [`RoutineImplementation`] plus its `Scope`
+    /// (the caller wraps a nested routine's scope in a `ChildScope`). Records the
+    /// flat `ImplRoutine` as a side effect (parity with the old scan). `None` on
+    /// degrade (reliability flag already cleared).
+    fn parse_routine_scope(
+        &mut self,
+        nested: bool,
+    ) -> Result<Option<(crate::ast_impl::RoutineImplementation, crate::ast_impl::Scope)>, ParseError>
+    {
+        use crate::ast_impl::{RoutineImplementation, ScopeKind, Statement};
         // Header keyword (`procedure`/…): its start anchors the whole body span.
         let Some(keyword) = self.cursor.advance()? else {
-            return Ok(true);
+            return Ok(None);
         };
-        let file = keyword.location.file;
         let header_start = keyword.location.span.start;
+        let kind = Self::routine_kind_of(keyword.token);
 
         // [Owner.]Name — a possibly-dotted routine name. The LAST part is the
-        // routine name; a leading part (if any) is the owner type. Every part is
-        // emitted as a usage (parity with the old flat scan).
+        // routine name; a leading part (if any) is the owner type.
         let Some(first) = self.impl_take_name_part()? else {
-            // Not a name after the keyword — unmodeled. Degrade.
             self.cursor.state_mut().mark_impl_scopes_unreliable();
-            return Ok(false);
+            return Ok(None);
         };
         let mut owner_type_key: Option<Identifier> = None;
         let mut name = first;
@@ -484,111 +633,235 @@ impl UnitParser<'_> {
             owner_type_key = Some(name.key);
             let Some(next) = self.impl_take_name_part()? else {
                 self.cursor.state_mut().mark_impl_scopes_unreliable();
-                return Ok(false);
+                return Ok(None);
             };
             name = next;
         }
 
         // Optional generic parameters on the method name (`procedure Foo<T>`).
-        // Their `<...>` names are captured as usages by the generic parser; a
-        // failure there degrades.
-        if self.peek_token()? == Some(Token::Lt) {
-            match self.parse_generic_parameters() {
-                Ok(_) => {}
-                Err(_) => {
-                    self.cursor.state_mut().mark_impl_scopes_unreliable();
-                    return Ok(false);
-                }
-            }
+        if self.peek_token()? == Some(Token::Lt)
+            && self.parse_generic_parameters().is_err()
+        {
+            self.cursor.state_mut().mark_impl_scopes_unreliable();
+            return Ok(None);
         }
 
-        // Optional parameter list `( ... )`. Parse each param name + simple type
-        // key ourselves (so a param NAME is still emitted as a usage and captured
-        // as a `LocalDeclaration`), degrading on any shape we do not model.
-        let mut params = Vec::new();
+        // Optional parameter list `( ... )` → `LocalKind::Param` symbols.
+        let mut declarations: Vec<crate::ast::LocalDeclaration> = Vec::new();
         if self.peek_token()? == Some(Token::LParen) {
             self.cursor.advance()?; // '('
-            if !self.scan_impl_parameters(&mut params)? {
-                return Ok(false);
+            if !self.scan_impl_parameters(&mut declarations)? {
+                return Ok(None);
             }
         }
+        let param_count = declarations.len();
 
-        // Optional `: ReturnType` — a type reference; emit its identifier usages
-        // but do not otherwise model it. A method-resolution `= Name` or a
-        // trailing directive list follows up to the `;`.
-        // Skip everything up to the header-terminating `;` at paren depth 0,
-        // emitting usages. This absorbs the return type, calling conventions and
-        // other directives without needing to model each.
+        // Header tail (`: ReturnType`, method-resolution `= Name`, directives) up
+        // to and including the terminating `;`, emitting usages.
         if !self.skip_impl_header_tail()? {
-            return Ok(false);
+            return Ok(None);
         }
 
-        // A forward/external/… routine has NO body: `procedure Foo; forward;`.
-        // After the header `;`, if the next token is another routine keyword, a
-        // section keyword, or EOF, this routine has no local body — record it
-        // with an empty body region (its own header span) and return. We detect
-        // the body by requiring a `var`/`const`/`type`/`label`/`begin`/`asm`.
-        let mut locals = Vec::new();
+        // Declaration part + body. Nested routines become `ChildScope` statements
+        // at the FRONT of this scope's statement list (so they are reachable and
+        // resolvable); their flat entries are recorded by the recursion.
+        let mut child_scopes: Vec<Statement> = Vec::new();
         loop {
             match self.peek_token()? {
                 Some(Token::Var) | Some(Token::Const) | Some(Token::Type)
                 | Some(Token::Label) | Some(Token::ThreadVar) => {
                     let section = self.cursor.advance()?.expect("peeked").token;
-                    if !self.scan_impl_declaration_section(section, &mut locals)? {
-                        return Ok(false);
+                    if !self.scan_impl_declaration_section(section, &mut declarations)? {
+                        return Ok(None);
                     }
                 }
                 // A NESTED routine declared before this one's body.
                 Some(Token::Procedure) | Some(Token::Function)
                 | Some(Token::Constructor) | Some(Token::Destructor)
                 | Some(Token::Operator) => {
-                    if !self.scan_impl_routine()? {
-                        return Ok(false);
+                    match self.parse_routine_scope(true)? {
+                        Some((_, nested_scope)) => {
+                            child_scopes.push(Statement::ChildScope(Box::new(nested_scope)));
+                        }
+                        None => return Ok(None),
+                    }
+                }
+                // A leading `class` modifier on a nested class method is unusual;
+                // treat like the top-level driver (consume `class` when a routine
+                // keyword follows).
+                Some(Token::Class) => {
+                    let second = self.cursor.peek_second()?.map(|lexeme| lexeme.token);
+                    if matches!(
+                        second,
+                        Some(Token::Procedure) | Some(Token::Function)
+                            | Some(Token::Constructor) | Some(Token::Destructor)
+                            | Some(Token::Operator)
+                    ) {
+                        self.cursor.advance()?; // 'class'
+                        match self.parse_routine_scope(true)? {
+                            Some((_, nested_scope)) => {
+                                child_scopes.push(Statement::ChildScope(Box::new(nested_scope)));
+                            }
+                            None => return Ok(None),
+                        }
+                    } else {
+                        self.cursor.state_mut().mark_impl_scopes_unreliable();
+                        return Ok(None);
                     }
                 }
                 Some(Token::Begin) => break,
                 Some(Token::Asm) => {
-                    // We do not model assembler bodies (their `end` pairing and
-                    // lexis differ). Degrade rather than risk a wrong span.
+                    // Assembler body: we do not model its `end` pairing / lexis.
+                    // Degrade (never a wrong span) and hand back None → the caller
+                    // flat-scans the remainder so usages don't regress.
                     self.cursor.state_mut().mark_impl_scopes_unreliable();
-                    return Ok(false);
+                    return Ok(None);
                 }
                 // No body: a forward/external/interface-only routine header. Its
-                // structure carries no locals; record it spanning just the header
-                // so a cursor in the (nonexistent) body never mis-binds.
+                // scope carries no statements; span just the header.
                 _ => {
-                    let body_span = Span::new(header_start as usize, name.location.span.end as usize);
-                    self.record_impl_routine(name, owner_type_key, body_span, params, locals);
-                    return Ok(true);
+                    let body_span = Span::new(
+                        header_start as usize,
+                        name.location.span.end as usize,
+                    );
+                    self.record_impl_routine_from_declarations(
+                        name, owner_type_key, body_span, &declarations, param_count,
+                    );
+                    let scope = self.build_scope(
+                        if nested { ScopeKind::Nested }
+                        else if owner_type_key.is_some() { ScopeKind::Method }
+                        else { ScopeKind::Routine },
+                        body_span,
+                        owner_type_key,
+                        &declarations,
+                        child_scopes,
+                    );
+                    return Ok(Some((
+                        RoutineImplementation { name, owner_type_key, kind, scope: scope.clone() },
+                        scope,
+                    )));
                 }
             }
         }
 
-        // Body: `begin … end`. Consume `begin`, then balance nested block openers
-        // to the matching `end`, emitting usages throughout.
-        let Some(body_end) = self.scan_impl_body()? else {
-            return Ok(false);
+        // Body: `begin … end`. Parse a shallow statement list, tracking begin/end
+        // depth exactly. `child_scopes` (nested routines) lead the statement list.
+        self.cursor.advance()?; // 'begin'
+        let mut statements = child_scopes;
+        let body_end = match self.parse_statement_list_capturing_end()? {
+            Some((body_statements, end_offset)) => {
+                statements.extend(body_statements);
+                end_offset
+            }
+            None => return Ok(None),
         };
         let body_span = Span::new(header_start as usize, body_end as usize);
-        let _ = file; // spans stay within the routine's own file
-        self.record_impl_routine(name, owner_type_key, body_span, params, locals);
-        // Consume the routine-terminating `;` after `end` so the caller's next
-        // peek lands on the following routine / section / `end.`, not this `;`.
+        self.record_impl_routine_from_declarations(
+            name, owner_type_key, body_span, &declarations, param_count,
+        );
+        // Consume the routine-terminating `;` after `end`.
         if self.peek_token()? == Some(Token::Semicolon) {
             self.cursor.advance()?;
         }
-        Ok(true)
+        let scope_kind = if nested {
+            ScopeKind::Nested
+        } else if owner_type_key.is_some() {
+            ScopeKind::Method
+        } else {
+            ScopeKind::Routine
+        };
+        let scope = self.build_scope(
+            scope_kind,
+            body_span,
+            owner_type_key,
+            &declarations,
+            statements,
+        );
+        Ok(Some((
+            RoutineImplementation { name, owner_type_key, kind, scope: scope.clone() },
+            scope,
+        )))
     }
 
-    /// Record one fully-tracked routine into the parse state's `impl_scopes`.
-    fn record_impl_routine(
+    /// The [`RoutineKind`] a routine-header keyword introduces.
+    fn routine_kind_of(token: Token) -> RoutineKind {
+        match token {
+            Token::Function => RoutineKind::Function,
+            Token::Constructor => RoutineKind::Constructor,
+            Token::Destructor => RoutineKind::Destructor,
+            Token::Operator => RoutineKind::Operator,
+            _ => RoutineKind::Procedure,
+        }
+    }
+
+    /// Build a [`Scope`] from split declarations + a statement list. `self_type_key`
+    /// is the owner type for a method scope (bare members / `Self` resolve to it).
+    fn build_scope(
+        &self,
+        kind: crate::ast_impl::ScopeKind,
+        span: Span,
+        owner_type_key: Option<Identifier>,
+        declarations: &[crate::ast::LocalDeclaration],
+        statements: crate::ast_impl::StatementList,
+    ) -> crate::ast_impl::Scope {
+        use crate::ast_impl::{Scope, ScopeKind};
+        let self_type_key = if kind == ScopeKind::Method { owner_type_key } else { None };
+        let mut symbols: Vec<crate::ast_impl::LocalSymbol> =
+            declarations.iter().map(Self::local_symbol_of).collect();
+        // Inline `var`/`const` introduced in statement position also belong to
+        // this scope's declarations (so a cursor after the inline decl resolves).
+        Self::collect_inline_var_symbols(&statements, &mut symbols);
+        Scope {
+            kind,
+            span,
+            self_type_key,
+            declarations: symbols,
+            statements,
+        }
+    }
+
+    /// Append every top-level inline-`var`/`const` [`LocalSymbol`] found in a
+    /// statement list to `out` (a `LocalVar` inside a nested `Group` still counts
+    /// as this scope's symbol — Delphi inline vars scope to the enclosing routine,
+    /// not the block, for resolution purposes here). Does NOT descend into child
+    /// scopes (they own their own inline vars).
+    fn collect_inline_var_symbols(
+        statements: &[crate::ast_impl::Statement],
+        out: &mut Vec<crate::ast_impl::LocalSymbol>,
+    ) {
+        use crate::ast_impl::Statement;
+        for statement in statements {
+            match statement {
+                Statement::LocalVar(symbol, _) => out.push(symbol.clone()),
+                Statement::Group(inner) => Self::collect_inline_var_symbols(inner, out),
+                Statement::With { body, .. } => Self::collect_inline_var_symbols(body, out),
+                _ => {}
+            }
+        }
+    }
+
+    /// Convert a flat [`crate::ast::LocalDeclaration`] to a [`crate::ast_impl::LocalSymbol`].
+    fn local_symbol_of(declaration: &crate::ast::LocalDeclaration) -> crate::ast_impl::LocalSymbol {
+        crate::ast_impl::LocalSymbol {
+            name: declaration.name,
+            kind: declaration.decl_kind,
+            type_key: declaration.type_key,
+        }
+    }
+
+    /// Record one routine into the flat `impl_scopes` table, splitting the shared
+    /// `declarations` vec into params (`param_count` leading `Param` entries) and
+    /// the rest. Keeps the derived table byte-identical to the earlier scan.
+    fn record_impl_routine_from_declarations(
         &mut self,
         name: QualifiedName,
         owner_type_key: Option<Identifier>,
         body_span: Span,
-        params: Vec<crate::ast::LocalDeclaration>,
-        locals: Vec<crate::ast::LocalDeclaration>,
+        declarations: &[crate::ast::LocalDeclaration],
+        param_count: usize,
     ) {
+        let params = declarations[..param_count].to_vec();
+        let locals = declarations[param_count..].to_vec();
         self.cursor
             .state_mut()
             .record_impl_routine(crate::ast::ImplRoutine {
@@ -1264,54 +1537,616 @@ impl UnitParser<'_> {
         }
     }
 
-    /// Consume `begin`, then balance nested block openers to the MATCHING `end`,
-    /// emitting a usage for every identifier stepped over. Returns the byte
-    /// offset just past the terminating `end` (the body-span end), or `None`
-    /// (after marking unreliable) if the body contains a construct we cannot
-    /// balance (`asm`) or hits EOF before closing.
-    ///
-    /// Block openers that require a matching `end`: `begin`, `case`, `try`,
-    /// `record`/`object`/`class`/`interface`/`dispinterface` (inline anonymous
-    /// types are not modeled → degrade), plus `end`-terminated `class`/`record`
-    /// helper blocks. We degrade on any inline structured-type / `asm` opener
-    /// rather than risk mispairing.
-    fn scan_impl_body(&mut self) -> Result<Option<u32>, ParseError> {
-        // Consume `begin`.
-        self.cursor.advance()?;
-        let mut depth = 1usize;
+    // ─── Statement-list parser (Stage S2) ─────────────────────────────────────
+    //
+    // SHALLOW: models scope + expressions, NOT control-flow semantics. The `end`
+    // pairing is authoritative — every group opener (`begin`/`case`/`try`) is
+    // balanced to its matching `end` by a recursion that consumes exactly one
+    // `end`, so `body_span` is never wrong. On any desync a region resyncs to the
+    // next `;`/`end` at the current depth as a `Statement::Opaque` (still emitting
+    // usages) and, when begin/end balance could be at risk, reliability flips.
+    // Every branch consumes ≥1 token → no infinite loop.
+
+    /// Parse the statement list of a routine body (`begin` already consumed) up to
+    /// and CONSUMING the matching `end`. Returns the statements plus the byte
+    /// offset just past that `end` (the body-span end). `None` (reliability
+    /// cleared) if the body hits a construct we cannot balance (`asm`) or EOF.
+    fn parse_statement_list_capturing_end(
+        &mut self,
+    ) -> Result<Option<(crate::ast_impl::StatementList, u32)>, ParseError> {
+        let mut statements = Vec::new();
         loop {
-            let Some(lexeme) = self.cursor.advance()? else {
-                self.degrade();
-                return Ok(None);
-            };
-            match lexeme.token {
-                Token::Begin | Token::Case | Token::Try => depth += 1,
-                Token::End => {
-                    depth -= 1;
-                    if depth == 0 {
-                        // Body-span end = just past this `end` (its `;` follows).
-                        return Ok(Some(lexeme.location.span.end));
-                    }
+            match self.peek_token()? {
+                Some(Token::End) => {
+                    let end = self.cursor.advance()?.expect("peeked 'end'");
+                    return Ok(Some((statements, end.location.span.end)));
                 }
-                // Constructs whose `end` pairing our simple counter cannot model
-                // reliably inside a statement body: an inline `asm … end`, or an
-                // anonymous method / inline record — degrade to be safe.
-                Token::Asm
-                | Token::Record
-                | Token::Class
-                | Token::Object
-                | Token::Interface
-                | Token::DispInterface => {
-                    self.degrade();
+                // An `asm` body region we cannot balance: degrade. Reaching an
+                // `asm` here (as opposed to at the routine's top) is exotic; be
+                // safe rather than risk a wrong `end` pairing.
+                Some(Token::Asm) => {
+                    self.cursor.state_mut().mark_impl_scopes_unreliable();
                     return Ok(None);
                 }
-                other => {
-                    if other.can_be_identifier() {
+                // EOF before the matching `end`: unbalanced body → degrade.
+                None => {
+                    self.cursor.state_mut().mark_impl_scopes_unreliable();
+                    return Ok(None);
+                }
+                _ => {
+                    if !self.parse_statement_into(&mut statements)? {
+                        // A desync that could not be resolved without risking the
+                        // `end` balance: degrade.
+                        self.cursor.state_mut().mark_impl_scopes_unreliable();
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Parse a top-level statement list up to (and consuming) the matching `end`
+    /// for the unit's `begin … end.` init block. Same balance guarantee as
+    /// [`Self::parse_statement_list_capturing_end`] but tolerant of a missing
+    /// `end` at EOF (returns what it has rather than degrading the whole unit —
+    /// an init block never carried an `impl_scopes` entry to protect).
+    fn parse_statement_list_until_end(
+        &mut self,
+    ) -> Result<crate::ast_impl::StatementList, ParseError> {
+        let mut statements = Vec::new();
+        loop {
+            match self.peek_token()? {
+                None => break,
+                Some(Token::End) => {
+                    self.cursor.advance()?; // consume terminating 'end'
+                    break;
+                }
+                _ => {
+                    if !self.parse_statement_into(&mut statements)? {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(statements)
+    }
+
+    /// Parse ONE statement, appending it (and any inline-var symbol) to `out`.
+    /// Returns `Ok(false)` when the leading token is not a statement start we can
+    /// handle without risking the `end` balance (the caller decides whether that
+    /// degrades). Always consumes ≥1 token on a `true` return except at a pure
+    /// separator, so the enclosing loop cannot spin.
+    fn parse_statement_into(
+        &mut self,
+        out: &mut crate::ast_impl::StatementList,
+    ) -> Result<bool, ParseError> {
+        use crate::ast_impl::Statement;
+        let Some(token) = self.peek_token()? else {
+            return Ok(false);
+        };
+        match token {
+            // A bare `;` — empty statement. Consume it.
+            Token::Semicolon => {
+                self.cursor.advance()?;
+                Ok(true)
+            }
+            // Group openers → a balanced `Statement::Group` (recurse to `end`).
+            Token::Begin | Token::Case | Token::Try => {
+                self.cursor.advance()?; // opener
+                match self.parse_group_body()? {
+                    Some(group) => {
+                        out.push(Statement::Group(group));
+                        // Consume a trailing `;` separator if present.
+                        if self.peek_token()? == Some(Token::Semicolon) {
+                            self.cursor.advance()?;
+                        }
+                        Ok(true)
+                    }
+                    None => Ok(false),
+                }
+            }
+            // An `asm … end` block in statement position: cannot balance safely.
+            Token::Asm => Ok(false),
+            // Inline `var X [: T] [:= e];` / `const X = e;` (Delphi 10.3+).
+            Token::Var | Token::Const => self.parse_inline_var_or_const(out),
+            // `with E1, E2 do S`.
+            Token::With => self.parse_with_statement(out),
+            // Control-flow keywords: descend, pulling condition/bound EXPRESSIONS
+            // in as `Expression` statements and recursing sub-bodies as `Group`s.
+            Token::If | Token::While | Token::For | Token::Repeat | Token::On
+            | Token::Raise | Token::Goto => self.parse_control_flow_statement(out),
+            // Structural separators/closers that are NOT statement starts here —
+            // hand control back to the list loop (which finishes on `end` etc.).
+            Token::End | Token::Until | Token::Finally | Token::Except
+            | Token::Else | Token::Then | Token::Do | Token::Of
+            | Token::To | Token::DownTo => Ok(false),
+            // Anything that can begin an expression → expression / assignment.
+            token if Self::can_start_expression(token) => {
+                self.parse_expression_or_assignment(out)
+            }
+            // A token we cannot place: emit an `Opaque` over it (still a usage if
+            // identifier-like) and continue. Guarantees ≥1 token progress.
+            _ => {
+                let lexeme = self.cursor.advance()?.expect("peeked");
+                if lexeme.token.can_be_identifier() {
+                    self.emit_impl_usage(lexeme);
+                }
+                out.push(Statement::Opaque(lexeme.location));
+                Ok(true)
+            }
+        }
+    }
+
+    /// Parse the body of a `begin`/`case`/`try` group (its opener already
+    /// consumed) up to and CONSUMING the matching `end`. Intermediate section
+    /// separators of a `try`/`case` (`finally`/`except`/`else`/`of`/`on`) are
+    /// stepped over so their sub-statements land in the same flat group. Returns
+    /// `None` (never consuming a stray `end`) only on `asm`/EOF — the caller then
+    /// degrades. Balance guarantee: consumes exactly the matching `end`.
+    fn parse_group_body(&mut self) -> Result<Option<crate::ast_impl::StatementList>, ParseError> {
+        use crate::ast_impl::Statement;
+        let mut statements = Vec::new();
+        loop {
+            match self.peek_token()? {
+                Some(Token::End) => {
+                    self.cursor.advance()?; // matching 'end'
+                    return Ok(Some(statements));
+                }
+                // `try` / `case` section separators: consume and keep collecting.
+                Some(Token::Finally) | Some(Token::Except) | Some(Token::Of) => {
+                    self.cursor.advance()?;
+                }
+                // `case … of` selector labels and `try…except` `on E: T do` clauses
+                // are handled by the control-flow / expression paths; a bare `else`
+                // separator inside the group is consumed here.
+                Some(Token::Else) => {
+                    self.cursor.advance()?;
+                }
+                Some(Token::Asm) => return Ok(None),
+                None => return Ok(None),
+                _ => {
+                    if !self.parse_statement_into(&mut statements)? {
+                        // The leading token was not a statement start (e.g. an
+                        // `on`/label handled elsewhere). Consume one token as an
+                        // Opaque to guarantee progress, then continue — the group
+                        // still balances on its `end`.
+                        let Some(lexeme) = self.cursor.advance()? else {
+                            return Ok(None);
+                        };
+                        if lexeme.token.can_be_identifier() {
+                            self.emit_impl_usage(lexeme);
+                        }
+                        statements.push(Statement::Opaque(lexeme.location));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Parse an expression statement or an assignment (`E` / `E := E2`). The
+    /// leading token is known to start an expression.
+    fn parse_expression_or_assignment(
+        &mut self,
+        out: &mut crate::ast_impl::StatementList,
+    ) -> Result<bool, ParseError> {
+        use crate::ast_impl::Statement;
+        let target = self.parse_expression()?;
+        if self.peek_token()? == Some(Token::Assign) {
+            self.cursor.advance()?; // ':='
+            let value = self.parse_expression()?;
+            out.push(Statement::Assignment { target, value });
+        } else {
+            out.push(Statement::Expression(target));
+        }
+        // Consume a trailing `;` separator if present.
+        if self.peek_token()? == Some(Token::Semicolon) {
+            self.cursor.advance()?;
+        }
+        Ok(true)
+    }
+
+    /// Parse an inline `var X [, Y] [: T] [:= e];` or `const X = e;` (Delphi
+    /// 10.3+) in statement position, appending a `LocalVar` statement AND adding
+    /// the `LocalSymbol` to the enclosing scope's declarations (via `out`; the
+    /// caller collects declarations from `LocalVar` statements at scope-build
+    /// time). Each declared name becomes its own `LocalVar` statement.
+    fn parse_inline_var_or_const(
+        &mut self,
+        out: &mut crate::ast_impl::StatementList,
+    ) -> Result<bool, ParseError> {
+        use crate::ast::LocalKind;
+        use crate::ast_impl::{LocalSymbol, Statement};
+        let keyword = self.cursor.advance()?.expect("peeked 'var'/'const'").token;
+        let kind = if keyword == Token::Const { LocalKind::Const } else { LocalKind::InlineVar };
+        // Comma-separated names sharing the type / initializer.
+        let mut names = Vec::new();
+        loop {
+            let Some(part) = self.take_name_occurrence()? else {
+                // Not an inline var after all — resync to `;` as Opaque.
+                return self.resync_statement_as_opaque(out);
+            };
+            names.push(part);
+            if self.peek_token()? == Some(Token::Comma) {
+                self.cursor.advance()?;
+                continue;
+            }
+            break;
+        }
+        // Optional `: Type`.
+        let mut type_key = None;
+        if self.peek_token()? == Some(Token::Colon) {
+            self.cursor.advance()?;
+            type_key = self.parse_simple_type_key()?;
+        }
+        // Optional initializer `:= e` (var) or `= e` (const).
+        let mut initializer = None;
+        match self.peek_token()? {
+            Some(Token::Assign) | Some(Token::Eq) => {
+                self.cursor.advance()?;
+                initializer = Some(self.parse_expression()?);
+            }
+            _ => {}
+        }
+        // Emit one LocalVar per name (the last carries the initializer; earlier
+        // names in a shared group share the type but not a duplicate expression).
+        let last_index = names.len().saturating_sub(1);
+        for (index, name) in names.into_iter().enumerate() {
+            let symbol = LocalSymbol { name, kind, type_key };
+            let value = if index == last_index { initializer.take() } else { None };
+            out.push(Statement::LocalVar(symbol, value));
+        }
+        if self.peek_token()? == Some(Token::Semicolon) {
+            self.cursor.advance()?;
+        }
+        Ok(true)
+    }
+
+    /// Parse `with E1, E2 do <statement>` → `Statement::With { items, body }`.
+    fn parse_with_statement(
+        &mut self,
+        out: &mut crate::ast_impl::StatementList,
+    ) -> Result<bool, ParseError> {
+        use crate::ast_impl::Statement;
+        self.cursor.advance()?; // 'with'
+        let mut items = Vec::new();
+        loop {
+            // On a half-typed `with do …` / `with a, do …` the next item head is
+            // a terminator (`do`, `end`, …) that cannot start an expression, so
+            // `parse_expression` degrades WITHOUT consuming it. Only a `,`
+            // continues the loop; every comma consumes a token, and any other
+            // next token (including that unconsumed terminator) breaks — so the
+            // loop always terminates and the terminator is left for the `do`
+            // handling below / the enclosing body loop.
+            items.push(self.parse_expression()?);
+            if self.peek_token()? == Some(Token::Comma) {
+                self.cursor.advance()?;
+                continue;
+            }
+            break;
+        }
+        if self.peek_token()? == Some(Token::Do) {
+            self.cursor.advance()?; // 'do'
+        }
+        let mut body = Vec::new();
+        // The body is a single statement (possibly a begin/end group).
+        if self.peek_token()? == Some(Token::Begin) {
+            self.cursor.advance()?; // 'begin'
+            if let Some(group) = self.parse_group_body()? {
+                body = group;
+            }
+        } else {
+            self.parse_statement_into(&mut body)?;
+        }
+        out.push(Statement::With { items, body });
+        if self.peek_token()? == Some(Token::Semicolon) {
+            self.cursor.advance()?;
+        }
+        Ok(true)
+    }
+
+    /// Descend a control-flow statement (`if`/`while`/`for`/`repeat`/`on`/`raise`/
+    /// `goto`) WITHOUT modelling it as a typed node: its condition/bound
+    /// expressions are pulled in as `Expression` statements and its sub-statement
+    /// bodies recurse as `Group`s, so every identifier occurrence and nested scope
+    /// is still captured. Balance guarantee: any `begin`/`case`/`try` it opens is
+    /// consumed to its matching `end` by `parse_group_body`.
+    fn parse_control_flow_statement(
+        &mut self,
+        out: &mut crate::ast_impl::StatementList,
+    ) -> Result<bool, ParseError> {
+        use crate::ast_impl::Statement;
+        let keyword = self.cursor.advance()?.expect("peeked control-flow keyword").token;
+        match keyword {
+            // `if C then S1 [else S2]` — pull `C`, recurse the branch statements.
+            Token::If => {
+                let condition = self.parse_expression()?;
+                out.push(Statement::Expression(condition));
+                if self.peek_token()? == Some(Token::Then) {
+                    self.cursor.advance()?;
+                }
+                self.parse_branch_statement(out)?;
+                if self.peek_token()? == Some(Token::Else) {
+                    self.cursor.advance()?;
+                    self.parse_branch_statement(out)?;
+                }
+                Ok(true)
+            }
+            // `while C do S`.
+            Token::While => {
+                let condition = self.parse_expression()?;
+                out.push(Statement::Expression(condition));
+                if self.peek_token()? == Some(Token::Do) {
+                    self.cursor.advance()?;
+                }
+                self.parse_branch_statement(out)?;
+                Ok(true)
+            }
+            // `for X := A to B do S` / `for X in E do S`.
+            Token::For => {
+                // The loop variable + bounds are all expressions/assignment-like;
+                // pull them in via the expression path up to `do`.
+                self.parse_for_head(out)?;
+                if self.peek_token()? == Some(Token::Do) {
+                    self.cursor.advance()?;
+                }
+                self.parse_branch_statement(out)?;
+                Ok(true)
+            }
+            // `repeat S* until C`.
+            Token::Repeat => {
+                loop {
+                    match self.peek_token()? {
+                        Some(Token::Until) => {
+                            self.cursor.advance()?;
+                            let condition = self.parse_expression()?;
+                            out.push(Statement::Expression(condition));
+                            break;
+                        }
+                        None | Some(Token::End) => break,
+                        _ => {
+                            if !self.parse_statement_into(out)? {
+                                // consume one token to progress
+                                let Some(lexeme) = self.cursor.advance()? else { break };
+                                if lexeme.token.can_be_identifier() {
+                                    self.emit_impl_usage(lexeme);
+                                }
+                                out.push(Statement::Opaque(lexeme.location));
+                            }
+                        }
+                    }
+                }
+                if self.peek_token()? == Some(Token::Semicolon) {
+                    self.cursor.advance()?;
+                }
+                Ok(true)
+            }
+            // `on E: T do S` (exception handler) — pull the type usage, recurse.
+            Token::On => {
+                // `E: T` — names; capture as expression occurrences to `do`.
+                loop {
+                    match self.peek_token()? {
+                        Some(Token::Do) | None | Some(Token::Semicolon)
+                        | Some(Token::End) => break,
+                        _ => {
+                            let lexeme = self.cursor.advance()?.expect("peeked");
+                            if lexeme.token.can_be_identifier() {
+                                self.emit_impl_usage(lexeme);
+                            }
+                        }
+                    }
+                }
+                if self.peek_token()? == Some(Token::Do) {
+                    self.cursor.advance()?;
+                }
+                self.parse_branch_statement(out)?;
+                Ok(true)
+            }
+            // `raise [E [at Addr]]` / `goto Label` — pull the trailing expression.
+            Token::Raise | Token::Goto => {
+                if matches!(self.peek_token()?, Some(token) if Self::can_start_expression(token)) {
+                    let expression = self.parse_expression()?;
+                    out.push(Statement::Expression(expression));
+                }
+                if self.peek_token()? == Some(Token::Semicolon) {
+                    self.cursor.advance()?;
+                }
+                Ok(true)
+            }
+            _ => Ok(true),
+        }
+    }
+
+    /// Parse the head of a `for` loop up to (not consuming) `do`: an optional
+    /// inline `var`/`const` control variable (`for var i := …`, Delphi 10.3+),
+    /// the control variable, `:=`/`in`, and bound expressions — all pulled in as
+    /// `Expression`/`LocalVar` statements so occurrences and the inline symbol are
+    /// captured. Robust: any leftover head tokens before `do` are pulled in as
+    /// expressions, so the loop body is always reached in sync.
+    fn parse_for_head(
+        &mut self,
+        out: &mut crate::ast_impl::StatementList,
+    ) -> Result<(), ParseError> {
+        use crate::ast::LocalKind;
+        use crate::ast_impl::{LocalSymbol, Statement};
+        // Optional inline `var`/`const` control variable.
+        let inline_kind = match self.peek_token()? {
+            Some(Token::Var) => Some(LocalKind::InlineVar),
+            Some(Token::Const) => Some(LocalKind::Const),
+            _ => None,
+        };
+        if let Some(kind) = inline_kind {
+            self.cursor.advance()?; // 'var'/'const'
+            if let Some(name) = self.take_name_occurrence()? {
+                // Optional `: T`.
+                let mut type_key = None;
+                if self.peek_token()? == Some(Token::Colon) {
+                    self.cursor.advance()?;
+                    if let Some(part) = self.take_name_occurrence()? {
+                        type_key = Some(part.key);
+                    }
+                }
+                out.push(Statement::LocalVar(LocalSymbol { name, kind, type_key }, None));
+            }
+        } else if matches!(self.peek_token()?, Some(token) if Self::can_start_expression(token)) {
+            let variable = self.parse_expression()?;
+            out.push(Statement::Expression(variable));
+        }
+        // `:= A to/downto B` or `in E`.
+        match self.peek_token()? {
+            Some(Token::Assign) | Some(Token::Eq) => {
+                self.cursor.advance()?;
+                let start = self.parse_expression()?;
+                out.push(Statement::Expression(start));
+                if matches!(self.peek_token()?, Some(Token::To) | Some(Token::DownTo)) {
+                    self.cursor.advance()?;
+                    let end = self.parse_expression()?;
+                    out.push(Statement::Expression(end));
+                }
+            }
+            Some(Token::In) => {
+                self.cursor.advance()?;
+                let sequence = self.parse_expression()?;
+                out.push(Statement::Expression(sequence));
+            }
+            _ => {}
+        }
+        // Defensive: pull any remaining head tokens (unusual bound forms) in as
+        // expressions until `do`/EOF/`;`/`end`, so the body is reached in sync.
+        while !matches!(
+            self.peek_token()?,
+            Some(Token::Do) | Some(Token::Semicolon) | Some(Token::End) | None
+        ) {
+            // Zero-progress guard: `parse_expression` now degrades WITHOUT
+            // consuming a token that cannot start an expression. The `if` guard
+            // already routes non-expression-starters to the `else` (which always
+            // advances one token), but record the position and break on no
+            // progress anyway so a future edit cannot turn this into a spin.
+            let before = self.cursor.last_location();
+            if matches!(self.peek_token()?, Some(token) if Self::can_start_expression(token)) {
+                let extra = self.parse_expression()?;
+                out.push(Statement::Expression(extra));
+            } else {
+                let lexeme = self.cursor.advance()?.expect("peeked");
+                if lexeme.token.can_be_identifier() {
+                    self.emit_impl_usage(lexeme);
+                }
+            }
+            if self.cursor.last_location() == before {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Parse a control-flow branch's sub-statement: a `begin`/`case`/`try` group
+    /// (recursed to `end` → `Group`) or a single statement.
+    fn parse_branch_statement(
+        &mut self,
+        out: &mut crate::ast_impl::StatementList,
+    ) -> Result<(), ParseError> {
+        use crate::ast_impl::Statement;
+        match self.peek_token()? {
+            Some(Token::Begin) | Some(Token::Case) | Some(Token::Try) => {
+                self.cursor.advance()?; // opener
+                if let Some(group) = self.parse_group_body()? {
+                    out.push(Statement::Group(group));
+                }
+                if self.peek_token()? == Some(Token::Semicolon) {
+                    self.cursor.advance()?;
+                }
+            }
+            _ => {
+                self.parse_statement_into(out)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Resync the current statement to the next `;`/`end` at depth 0, capturing
+    /// the skipped region as one `Opaque` (usages still emitted). Consumes ≥1
+    /// token. The `;` is consumed; the `end` is left for the list loop.
+    fn resync_statement_as_opaque(
+        &mut self,
+        out: &mut crate::ast_impl::StatementList,
+    ) -> Result<bool, ParseError> {
+        use crate::ast_impl::Statement;
+        let start = self.cursor.last_location();
+        let mut last = start;
+        let mut consumed = false;
+        loop {
+            match self.peek_token()? {
+                Some(Token::Semicolon) => {
+                    last = self.cursor.advance()?.expect("peeked ';'").location;
+                    consumed = true;
+                    break;
+                }
+                None | Some(Token::End) | Some(Token::Begin) | Some(Token::Else) => break,
+                _ => {
+                    let lexeme = self.cursor.advance()?.expect("peeked");
+                    last = lexeme.location;
+                    consumed = true;
+                    if lexeme.token.can_be_identifier() {
                         self.emit_impl_usage(lexeme);
                     }
                 }
             }
         }
+        if !consumed {
+            // Nothing to skip (already at `end`/`begin`): make no Opaque, let the
+            // caller's loop finish. Return true so we don't falsely degrade.
+            return Ok(true);
+        }
+        out.push(Statement::Opaque(Self::span_between(
+            start.file,
+            start.span.start,
+            last,
+        )));
+        Ok(true)
+    }
+
+    /// Read a SIMPLE type reference (a plain possibly-dotted name) at the current
+    /// position for an inline-var type annotation, returning its last-part key.
+    /// A non-simple type (generic, array, …) is stepped over emitting usages,
+    /// returning `None`. Stops before `:=`/`=`/`;`.
+    fn parse_simple_type_key(&mut self) -> Result<Option<Identifier>, ParseError> {
+        let mut type_key = None;
+        if matches!(self.peek_token()?, Some(token) if token.can_be_identifier()) {
+            type_key = self.take_name_occurrence()?.map(|part| part.key);
+            while self.peek_token()? == Some(Token::Dot) {
+                self.cursor.advance()?;
+                type_key = self.take_name_occurrence()?.map(|part| part.key);
+            }
+        }
+        // Any tail (generics, array bounds) before the initializer/`;`: step over
+        // it emitting usages, and report no simple key.
+        let mut is_simple = true;
+        loop {
+            match self.peek_token()? {
+                Some(Token::Assign) | Some(Token::Eq) | Some(Token::Semicolon)
+                | None | Some(Token::RParen) => break,
+                _ => {
+                    is_simple = false;
+                    let lexeme = self.cursor.advance()?.expect("peeked");
+                    if lexeme.token.can_be_identifier() {
+                        self.emit_impl_usage(lexeme);
+                    }
+                }
+            }
+        }
+        Ok(if is_simple { type_key } else { None })
+    }
+
+    /// Can `token` begin an expression (a primary / prefix operator / anonymous
+    /// method opener)? Used to dispatch a statement to the expression path.
+    fn can_start_expression(token: Token) -> bool {
+        use Token::*;
+        token.can_be_identifier()
+            || matches!(
+                token,
+                IntLiteral | FloatLiteral | StringLiteral | CharLiteral | Nil | True | False
+                    | LParen | LBracket | Inherited | At_ | Not | Minus | Plus | Caret
+                    | Procedure | Function | Reference | String | File | Set
+            )
     }
 
     /// Skip an expression / value up to (not consuming) one of `stops` at bracket
@@ -4493,13 +5328,28 @@ impl UnitParser<'_> {
             return Ok(Expression::Literal(self.cursor.last_location()));
         };
         match lexeme.token {
-            // Opaque literal leaves.
-            Token::IntLiteral
-            | Token::FloatLiteral
-            | Token::StringLiteral
-            | Token::CharLiteral
-            | Token::Nil
-            | Token::True
+            // A Delphi string constant is a run of ADJACENT string / character
+            // literals (`'.'#32#32'.'`, `'line'#13#10`) with NO operator between
+            // them — coalesce the whole run into one `Literal` so the expression
+            // parser does not stop after the first piece (which would strand the
+            // rest and desync the enclosing statement).
+            Token::StringLiteral | Token::CharLiteral => {
+                let first = self.cursor.advance()?.expect("peeked literal");
+                let mut end = first.location;
+                while matches!(
+                    self.peek_token()?,
+                    Some(Token::StringLiteral) | Some(Token::CharLiteral)
+                ) {
+                    end = self.cursor.advance()?.expect("peeked literal").location;
+                }
+                Ok(Expression::Literal(Self::span_between(
+                    first.location.file,
+                    first.location.span.start,
+                    end,
+                )))
+            }
+            // Opaque numeric / keyword literal leaves.
+            Token::IntLiteral | Token::FloatLiteral | Token::Nil | Token::True
             | Token::False => {
                 self.cursor.advance()?;
                 Ok(Expression::Literal(lexeme.location))
@@ -4529,13 +5379,37 @@ impl UnitParser<'_> {
                 self.parse_anonymous_method_opaque()
             }
             // A bare (single-part) name — the postfix loop stitches on `.member`.
-            token if token.can_be_identifier() => {
+            // `string`/`file`/`set` are reserved words that also serve as
+            // type-cast targets in expression position (`string(aValue)`), so
+            // they open an identifier-shaped primary here too.
+            token if token.can_be_identifier()
+                || matches!(token, Token::String | Token::File | Token::Set) =>
+            {
                 self.cursor.advance()?;
                 let name = self.name_from_lexeme(lexeme);
                 Ok(Expression::Identifier(name))
             }
-            // Unexpected token where a primary is required: degrade to an opaque
-            // literal over the offending span. Consume exactly one token to
+            // Unexpected token where a primary is required.
+            //
+            // NEVER-WRONG GATE: if the offending token cannot start an
+            // expression at all (a structural terminator / block keyword like
+            // `end`, `;`, `until`, `then`, `do`, `of`, `else`, `)`/`]`, EOF-ish)
+            // we must NOT consume it. Consuming a routine's terminating `end`
+            // here would let the enclosing body loop parse past it into the next
+            // routine, silently extending one routine's scope span over another
+            // (a wrong answer, unflagged). Instead degrade to an empty-span
+            // literal WITHOUT advancing and leave the token for the enclosing
+            // statement / body loop to see and close on. Callers that loop over
+            // expressions guard against the resulting zero-token sub-parse.
+            token if !Self::can_start_expression(token) => {
+                let start = lexeme.location.span.start;
+                Ok(Expression::Literal(CodeLocation {
+                    file: lexeme.location.file,
+                    span: Span { start, end: start },
+                }))
+            }
+            // A token that CAN start an expression but wasn't matched above
+            // (should not normally happen). Consume exactly one token to
             // guarantee forward progress (never loop forever).
             _ => {
                 self.cursor.advance()?;
@@ -4645,8 +5519,14 @@ impl UnitParser<'_> {
                     let close = self.cursor.advance()?.expect("peeked ')'");
                     return Ok((arguments, Self::span_between(file, start, close.location)));
                 }
-                // Malformed argument list: stop at the last position, degrade
-                // locally. The last consumed token anchors the group span.
+                // Malformed / half-typed argument list: stop at the last
+                // position, degrade locally. Any token that is NOT `,`/`)` (a
+                // terminator like `end`/`;` that `parse_expression` now leaves
+                // unconsumed) exits here — the terminator is left for the
+                // enclosing statement / body loop, so the routine's `end` is
+                // still seen. This branch always returns, so no zero-progress
+                // spin is possible even when the argument sub-parse consumed
+                // nothing.
                 _ => {
                     return Ok((
                         arguments,
@@ -4712,80 +5592,140 @@ impl UnitParser<'_> {
         )))
     }
 
-    /// Capture an anonymous-method opener (`procedure`/`function`, optionally
-    /// preceded by `reference to`) through its matching `end` as one opaque span,
-    /// balancing `begin`/`case`/`try`/…`end` nesting. Identifier occurrences
-    /// inside are still emitted so the reference index stays complete.
-    //
-    // S2: replace with a real child `Scope` parse.
+    /// Parse an anonymous-method opener (`procedure`/`function`, optionally
+    /// preceded by `reference to`) into a real child [`Scope`] of kind
+    /// [`ScopeKind::Anonymous`]: its params, declaration-part locals and inline
+    /// vars belong to IT, and its body is a shallow statement list. Identifier
+    /// occurrences inside are still emitted so the reference index stays complete.
+    ///
+    /// Balance guarantee: the body is parsed by
+    /// [`Self::parse_statement_list_capturing_end`], which consumes exactly the
+    /// matching `end`; on `asm`/EOF it degrades (reliability flips) and the scope
+    /// carries an `Opaque` statement rather than a wrong span.
     fn parse_anonymous_method_opaque(&mut self) -> Result<Expression, ParseError> {
+        use crate::ast_impl::{Scope, ScopeKind, Statement};
         let opener = self.cursor.advance()?.expect("peeked opener");
-        let file = opener.location.file;
         let start = opener.location.span.start;
-        let mut end_location = opener.location;
-        // `reference to procedure/function …`
+        // `reference to procedure/function …`: a bare `reference to <TypeName>`
+        // (a type reference, not a literal closure) has NO body — fall back to a
+        // best-effort empty scope so we never mis-swallow the following tokens.
         if opener.token == Token::Reference {
             if self.peek_token()? == Some(Token::To) {
-                end_location = self.cursor.advance()?.expect("peeked 'to'").location;
+                self.cursor.advance()?; // 'to'
             }
-            if matches!(
+            if !matches!(
                 self.peek_token()?,
                 Some(Token::Procedure) | Some(Token::Function)
             ) {
-                end_location = self.cursor.advance()?.expect("peeked keyword").location;
+                // `reference to TSomeProc` — a type name; capture it as a usage,
+                // no closure body.
+                let mut end = self.cursor.last_location();
+                if let Some(part) = self.take_name_occurrence()? {
+                    end = part.location;
+                }
+                let span = Self::span_between(opener.location.file, start, end);
+                return Ok(Expression::AnonymousMethod(Box::new(Scope {
+                    kind: ScopeKind::Anonymous,
+                    span: span.span,
+                    self_type_key: None,
+                    declarations: Vec::new(),
+                    statements: Vec::new(),
+                })));
+            }
+            self.cursor.advance()?; // 'procedure'/'function'
+        }
+
+        // Optional parameter list `( ... )` → params.
+        let mut declarations: Vec<crate::ast::LocalDeclaration> = Vec::new();
+        if self.peek_token()? == Some(Token::LParen) {
+            self.cursor.advance()?; // '('
+            if !self.scan_impl_parameters(&mut declarations)? {
+                // Degrade locally: the reliability flag is set; emit an empty
+                // anonymous scope spanning what we consumed.
+                let span = Self::span_between(
+                    opener.location.file,
+                    start,
+                    self.cursor.last_location(),
+                );
+                return Ok(Expression::AnonymousMethod(Box::new(Scope {
+                    kind: ScopeKind::Anonymous,
+                    span: span.span,
+                    self_type_key: None,
+                    declarations: declarations.iter().map(Self::local_symbol_of).collect(),
+                    statements: Vec::new(),
+                })));
             }
         }
-        // Scan to the matching `end`, tracking block-opener depth. The header
-        // (params/return type) precedes the first block opener; the routine's own
-        // `begin` (or `asm`) is the first block. We require a block to open before
-        // an `end` matches, so a bare `function(...): T` header without a body
-        // (rare, malformed in expression position) degrades cleanly at the next
-        // structural boundary rather than mis-swallowing.
-        let mut depth: usize = 0;
-        let mut saw_block = false;
+
+        // Optional `: ReturnType` and directives up to `begin`/`asm`/decl part.
+        // Skip to the body opener, emitting usages, without crossing a `begin`.
+        let mut child_scopes: Vec<Statement> = Vec::new();
         loop {
-            let Some(lexeme) = self.cursor.peek()? else {
-                break; // EOF: degrade to span so far
-            };
-            match lexeme.token {
-                Token::Begin
-                | Token::Case
-                | Token::Try
-                | Token::Asm
-                | Token::Record
-                | Token::Class
-                | Token::Object
-                | Token::Interface => {
-                    depth += 1;
-                    saw_block = true;
-                    end_location = self.cursor.advance()?.expect("peeked").location;
-                }
-                Token::End => {
-                    end_location = self.cursor.advance()?.expect("peeked").location;
-                    if saw_block {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    } else {
-                        // an `end` before any block opener — malformed; stop here
+            match self.peek_token()? {
+                Some(Token::Begin) => break,
+                Some(Token::Var) | Some(Token::Const) | Some(Token::Type)
+                | Some(Token::Label) | Some(Token::ThreadVar) => {
+                    let section = self.cursor.advance()?.expect("peeked").token;
+                    if !self.scan_impl_declaration_section(section, &mut declarations)? {
                         break;
                     }
                 }
-                other => {
-                    let advanced = self.cursor.advance()?.expect("peeked");
-                    end_location = advanced.location;
-                    if other.can_be_identifier() {
-                        self.emit_impl_usage(advanced);
+                Some(Token::Procedure) | Some(Token::Function) => {
+                    // A nested routine inside the closure's decl part.
+                    match self.parse_routine_scope(true)? {
+                        Some((_, nested_scope)) => {
+                            child_scopes.push(Statement::ChildScope(Box::new(nested_scope)));
+                        }
+                        None => break,
+                    }
+                }
+                Some(Token::Asm) | None => {
+                    // No `begin` body (asm closure or truncated): degrade locally.
+                    self.cursor.state_mut().mark_impl_scopes_unreliable();
+                    let span = Self::span_between(
+                        opener.location.file,
+                        start,
+                        self.cursor.last_location(),
+                    );
+                    return Ok(Expression::AnonymousMethod(Box::new(Scope {
+                        kind: ScopeKind::Anonymous,
+                        span: span.span,
+                        self_type_key: None,
+                        declarations: declarations.iter().map(Self::local_symbol_of).collect(),
+                        statements: child_scopes,
+                    })));
+                }
+                _ => {
+                    // Return type / directive tokens: step over emitting usages.
+                    let lexeme = self.cursor.advance()?.expect("peeked");
+                    if lexeme.token.can_be_identifier() {
+                        self.emit_impl_usage(lexeme);
                     }
                 }
             }
         }
-        Ok(Expression::AnonymousMethodOpaque(Self::span_between(
-            file,
-            start,
-            end_location,
-        )))
+
+        // Body: `begin … end`.
+        self.cursor.advance()?; // 'begin'
+        let mut statements = child_scopes;
+        let end_offset = match self.parse_statement_list_capturing_end()? {
+            Some((body, end_offset)) => {
+                statements.extend(body);
+                end_offset
+            }
+            None => {
+                // Degrade: emit the scope with what we have; span to last seen.
+                self.cursor.last_location().span.end
+            }
+        };
+        let span = Span::new(start as usize, end_offset as usize);
+        Ok(Expression::AnonymousMethod(Box::new(Scope {
+            kind: ScopeKind::Anonymous,
+            span,
+            self_type_key: None,
+            declarations: declarations.iter().map(Self::local_symbol_of).collect(),
+            statements,
+        })))
     }
 
     /// A `CodeLocation` spanning from byte `start` (in `file`) through the end of
@@ -5951,9 +6891,86 @@ mod tests {
         collect_pas(std::path::Path::new(r"C:\Delphi\VSS\Intern\Components\BECOMP"), &mut files);
         assert!(!files.is_empty(), "no sources found");
 
+        // Recursively count scopes (every routine + nested + anonymous + method +
+        // with) and statements+expressions captured in an ImplementationBody, so
+        // the probe reports S2 coverage, not just the flat routine count.
+        use crate::ast_impl::{Expression, ImplementationBody, Scope, Statement};
+        fn count_expression(expression: &Expression, scopes: &mut usize, nodes: &mut usize) {
+            *nodes += 1;
+            match expression {
+                Expression::Member { receiver, .. } => count_expression(receiver, scopes, nodes),
+                Expression::Call { callee, arguments, .. } => {
+                    count_expression(callee, scopes, nodes);
+                    for argument in arguments {
+                        count_expression(argument, scopes, nodes);
+                    }
+                }
+                Expression::Index { base, indices } => {
+                    count_expression(base, scopes, nodes);
+                    for index in indices {
+                        count_expression(index, scopes, nodes);
+                    }
+                }
+                Expression::Cast { operand, .. } => count_expression(operand, scopes, nodes),
+                Expression::Unary { operand, .. } => count_expression(operand, scopes, nodes),
+                Expression::Binary { left, right, .. } => {
+                    count_expression(left, scopes, nodes);
+                    count_expression(right, scopes, nodes);
+                }
+                Expression::Parenthesized(inner) => count_expression(inner, scopes, nodes),
+                Expression::AnonymousMethod(scope) => count_scope(scope, scopes, nodes),
+                _ => {}
+            }
+        }
+        fn count_statements(statements: &[Statement], scopes: &mut usize, nodes: &mut usize) {
+            for statement in statements {
+                *nodes += 1;
+                match statement {
+                    Statement::Expression(expression) => {
+                        count_expression(expression, scopes, nodes)
+                    }
+                    Statement::Assignment { target, value } => {
+                        count_expression(target, scopes, nodes);
+                        count_expression(value, scopes, nodes);
+                    }
+                    Statement::LocalVar(_, Some(expression)) => {
+                        count_expression(expression, scopes, nodes)
+                    }
+                    Statement::LocalVar(_, None) => {}
+                    Statement::With { items, body } => {
+                        *scopes += 1; // a with-block opens a member scope
+                        for item in items {
+                            count_expression(item, scopes, nodes);
+                        }
+                        count_statements(body, scopes, nodes);
+                    }
+                    Statement::ChildScope(scope) => count_scope(scope, scopes, nodes),
+                    Statement::Group(inner) => count_statements(inner, scopes, nodes),
+                    Statement::Opaque(_) => {}
+                }
+            }
+        }
+        fn count_scope(scope: &Scope, scopes: &mut usize, nodes: &mut usize) {
+            *scopes += 1;
+            count_statements(&scope.statements, scopes, nodes);
+        }
+        fn count_body(body: &ImplementationBody, scopes: &mut usize, nodes: &mut usize) {
+            for routine in &body.routines {
+                count_scope(&routine.scope, scopes, nodes);
+            }
+            if let Some(init) = &body.initialization {
+                count_statements(init, scopes, nodes);
+            }
+            if let Some(fin) = &body.finalization {
+                count_statements(fin, scopes, nodes);
+            }
+        }
+
         let arena = SourceArena::new();
         let (mut reliable, mut degraded, mut parse_failed) = (0usize, 0usize, 0usize);
         let mut total_routines = 0usize;
+        let mut total_scopes = 0usize;
+        let mut total_nodes = 0usize;
         // COVERAGE proxy: count units that DEFINE routines in the impl section
         // (contain a `procedure`/`function`/… body) but captured FEWER scopes than
         // the source has routine headers — i.e. the scanner bailed early (leading
@@ -5977,6 +6994,17 @@ mod tests {
                 .sum::<usize>();
             match parse_file_full(&arena, context.clone(), file, None) {
                 Ok(outcome) => {
+                    // Drive the full S2 body on EVERY unit (reliable or not) so the
+                    // scope/statement counters reflect the whole corpus, and the
+                    // body walk itself is exercised for panics on real code.
+                    count_body(&outcome.implementation_body, &mut total_scopes, &mut total_nodes);
+                    // The derived flag must always agree with the body flag.
+                    assert_eq!(
+                        outcome.impl_scopes_reliable,
+                        outcome.implementation_body.reliable,
+                        "derived impl_scopes_reliable must equal body.reliable for {}",
+                        path.display()
+                    );
                     if outcome.impl_scopes_reliable {
                         reliable += 1;
                         total_routines += outcome.impl_scopes.len();
@@ -5991,6 +7019,9 @@ mod tests {
                         }
                     } else {
                         degraded += 1;
+                        if std::env::var("PROBE_DEGRADED").is_ok() {
+                            println!("  degraded: {}", path.display());
+                        }
                     }
                 }
                 Err(_) => parse_failed += 1,
@@ -5998,13 +7029,15 @@ mod tests {
         }
         let considered = reliable + degraded;
         println!(
-            "scope reliability over {} units: {} reliable ({:.1}%), {} degraded, {} parse-failed; {} routines captured; {} units captured 0 scopes despite having routine headers",
+            "scope reliability over {} units: {} reliable ({:.1}%), {} degraded, {} parse-failed; {} routines captured; {} total scopes (routines+nested+anon+methods+withs); {} statements+expressions captured; {} units captured 0 scopes despite having routine headers",
             files.len(),
             reliable,
             100.0 * reliable as f64 / considered.max(1) as f64,
             degraded,
             parse_failed,
             total_routines,
+            total_scopes,
+            total_nodes,
             zero_scope_but_has_routines,
         );
         for example in &undercaptured_examples {
@@ -6867,6 +7900,131 @@ mod tests {
         assert!(outcome.usages.iter().any(|u| u.symbol == key("NOP")));
     }
 
+    // ─── Never-wrong under HALF-TYPED input (adversarial S2 review) ────────
+    //
+    // `parse_primary_expression` must NOT consume a structural terminator token
+    // (`end`, `;`, `until`, `then`, `do`, `of`, `else`, `)`/`]`, …) in its
+    // fallback: doing so lets an unguarded `parse_expression` in a statement /
+    // control-flow parser eat the routine's terminating `end`, so the body loop
+    // parses on INTO the next routine and silently extends the first routine's
+    // `body_span` over the second — a wrong answer, unflagged. These tests drive
+    // the impl-body parser with editor-realistic half-typed input and assert the
+    // first routine's scope NEVER covers any offset inside the following routine.
+
+    /// The headline case from the review: `procedure A; begin X := end;` — the
+    /// RHS of `X :=` is missing (the user is mid-typing). A's body loop must see
+    /// A's own `end` and close there; A's `body_span` must NOT extend over the
+    /// following `procedure B`. Either A closes correctly, or the whole pass is
+    /// degraded — but a reliable A whose span covers B is FORBIDDEN.
+    #[test]
+    fn impl_scope_half_typed_assignment_rhs_does_not_swallow_next_routine() {
+        let source = "unit U;\ninterface\nimplementation\n\
+             procedure A;\nbegin\n  X := end;\n\
+             procedure B;\nvar L: Integer;\nbegin\n  L := 1;\nend;\nend.";
+        let outcome = parse_outcome(source);
+
+        // The KEY never-wrong assertion: if scopes are trusted, NO routine's
+        // body span may cover an offset inside B. B's header offset and B's `L`
+        // usage offset must never fall inside A's span.
+        let b_header = source.find("procedure B").unwrap() as u32;
+        let l_usage = source.rfind("L := 1").unwrap() as u32;
+        if outcome.impl_scopes_reliable {
+            if let Some(a) = outcome.impl_scopes.iter().find(|r| r.name.key == key("A")) {
+                assert!(
+                    !(a.body_span.start <= b_header && b_header < a.body_span.end),
+                    "A's body_span must NOT cover B's header (would resolve B's cursor to A's locals)"
+                );
+                assert!(
+                    !(a.body_span.start <= l_usage && l_usage < a.body_span.end),
+                    "A's body_span must NOT cover B's `L` usage"
+                );
+            }
+            // And B, if captured, owns its own `L` — the never-wrong end-to-end:
+            // the smallest routine covering `L` is B, not A.
+            let covering_l: Vec<_> = outcome
+                .impl_scopes
+                .iter()
+                .filter(|r| r.body_span.start <= l_usage && l_usage < r.body_span.end)
+                .collect();
+            for routine in &covering_l {
+                assert_ne!(
+                    routine.name.key,
+                    key("A"),
+                    "no routine covering B's `L` may be A"
+                );
+            }
+        }
+    }
+
+    /// Half-typed control-flow heads (`if then end`, `while do end`,
+    /// `for i := to do end`, `with do end`) inside a body followed by ANOTHER
+    /// routine: the missing condition/bound/selector expressions must not eat the
+    /// body's `end`, so the following routine `B` is still captured and no scope
+    /// covers it wrongly. Also proves NO HANG (the infinite-loop audit holds).
+    #[test]
+    fn impl_scope_half_typed_control_flow_does_not_swallow_next_routine() {
+        // Each head exercises an empty condition / bound / selector, plus a
+        // half-typed assignment RHS inside a branch (`X :=` before `end`). The
+        // never-wrong contract is upheld either by A closing at its own `end`
+        // OR by the pass degrading (`impl_scopes_reliable == false`) — both are
+        // asserted-correct here (a reliable A covering B is FORBIDDEN). This test
+        // also proves NO HANG: with the infinite-loop audit done, every case
+        // completes; without it, the harness would time out.
+        for head in [
+            "if then end",
+            "while do end",
+            "for i := to do end",
+            "with do end",
+            "if C then X :=",
+            "while C do X :=",
+        ] {
+            let source = format!(
+                "unit U;\ninterface\nimplementation\n\
+                 procedure A;\nbegin\n  {head};\nend;\n\
+                 procedure B;\nvar L: Integer;\nbegin\n  L := 1;\nend;\nend."
+            );
+            let outcome = parse_outcome(&source);
+            let b_header = source.find("procedure B").unwrap() as u32;
+            let l_usage = source.rfind("L := 1").unwrap() as u32;
+            if outcome.impl_scopes_reliable {
+                if let Some(a) = outcome.impl_scopes.iter().find(|r| r.name.key == key("A")) {
+                    assert!(
+                        !(a.body_span.start <= b_header && b_header < a.body_span.end),
+                        "[{head}] A's body_span must NOT cover B's header"
+                    );
+                    assert!(
+                        !(a.body_span.start <= l_usage && l_usage < a.body_span.end),
+                        "[{head}] A's body_span must NOT cover B's `L` usage"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A WELL-FORMED control-flow body still parses with no regression: the
+    /// if/else branch expressions are captured and the single routine closes at
+    /// its own `end`, staying reliable.
+    #[test]
+    fn impl_scope_wellformed_if_else_body_still_parses() {
+        let source = "unit U;\ninterface\nimplementation\n\
+             procedure A;\nvar C: Boolean; X: Integer;\nbegin\n  if C then X := 1 else X := 2;\nend;\nend.";
+        let outcome = parse_outcome(source);
+        assert!(
+            outcome.impl_scopes_reliable,
+            "a well-formed if/else body must stay reliable (no regression)"
+        );
+        assert_eq!(outcome.impl_scopes.len(), 1, "one routine");
+        let routine = &outcome.impl_scopes[0];
+        assert_eq!(routine.name.key, key("A"));
+        // The branch expressions were captured: `C`, `X` usages are present.
+        let usage_keys: Vec<_> = outcome.usages.iter().map(|u| u.symbol).collect();
+        assert!(usage_keys.contains(&key("C")), "condition usage C captured");
+        assert!(usage_keys.contains(&key("X")), "branch target usage X captured");
+        // Body span ends at A's own `end`, not past it.
+        let body = &source[routine.body_span.start as usize..routine.body_span.end as usize];
+        assert!(body.trim_end().ends_with("end"), "body ends at A's own end: {body:?}");
+    }
+
     /// A local `type` opening a structured (`record`) type also degrades — our
     /// body/`end` balancer does not model the type's own `end`.
     #[test]
@@ -6993,5 +8151,286 @@ mod tests {
             !outcome.impl_scopes_reliable,
             "an asm body after a skipped section must still degrade"
         );
+    }
+
+    // ─── Stage S2: implementation-section scope tree (ImplementationBody) ──────
+
+    use crate::ast_impl::{Expression, Scope, ScopeKind, Statement};
+
+    /// Count all scopes reachable from a statement list (child scopes + anon
+    /// method scopes + with-blocks), recursively.
+    fn count_child_scopes(statements: &[Statement]) -> usize {
+        fn walk_expression(expression: &Expression, total: &mut usize) {
+            match expression {
+                Expression::AnonymousMethod(scope) => {
+                    *total += 1;
+                    for statement in &scope.statements {
+                        walk_statement(statement, total);
+                    }
+                }
+                Expression::Member { receiver, .. } => walk_expression(receiver, total),
+                Expression::Call { callee, arguments, .. } => {
+                    walk_expression(callee, total);
+                    arguments.iter().for_each(|a| walk_expression(a, total));
+                }
+                Expression::Index { base, indices } => {
+                    walk_expression(base, total);
+                    indices.iter().for_each(|i| walk_expression(i, total));
+                }
+                Expression::Unary { operand, .. } => walk_expression(operand, total),
+                Expression::Binary { left, right, .. } => {
+                    walk_expression(left, total);
+                    walk_expression(right, total);
+                }
+                Expression::Parenthesized(inner) => walk_expression(inner, total),
+                _ => {}
+            }
+        }
+        fn walk_statement(statement: &Statement, total: &mut usize) {
+            match statement {
+                Statement::ChildScope(_) => *total += 1,
+                Statement::With { body, .. } => {
+                    *total += 1;
+                    body.iter().for_each(|s| walk_statement(s, total));
+                }
+                Statement::Group(inner) => inner.iter().for_each(|s| walk_statement(s, total)),
+                Statement::Expression(expression) => walk_expression(expression, total),
+                Statement::Assignment { target, value } => {
+                    walk_expression(target, total);
+                    walk_expression(value, total);
+                }
+                Statement::LocalVar(_, Some(expression)) => walk_expression(expression, total),
+                _ => {}
+            }
+        }
+        let mut total = 0;
+        statements.iter().for_each(|s| walk_statement(s, &mut total));
+        total
+    }
+
+    /// S2: a FREE routine yields a `Routine` scope (no `self_type_key`), with its
+    /// statements captured.
+    #[test]
+    fn s2_free_routine_scope() {
+        let source = "unit U;\ninterface\nimplementation\n\
+             procedure Run;\nbegin\n  DoThing(1);\nend;\nend.";
+        let outcome = parse_outcome(source);
+        assert!(outcome.impl_scopes_reliable);
+        let body = &outcome.implementation_body;
+        assert!(body.reliable);
+        assert_eq!(body.routines.len(), 1);
+        let routine = &body.routines[0];
+        assert_eq!(routine.name.key, key("Run"));
+        assert_eq!(routine.kind, crate::ast::RoutineKind::Procedure);
+        assert!(routine.owner_type_key.is_none());
+        assert_eq!(routine.scope.kind, ScopeKind::Routine);
+        assert!(routine.scope.self_type_key.is_none());
+        assert!(!routine.scope.statements.is_empty(), "the call statement is captured");
+    }
+
+    /// S2: a METHOD yields a `Method` scope whose `self_type_key` is the owner.
+    #[test]
+    fn s2_method_scope_has_self_type() {
+        let source = "unit U;\ninterface\nimplementation\n\
+             procedure TThing.Run;\nvar L: Integer;\nbegin\n  L := 1;\nend;\nend.";
+        let outcome = parse_outcome(source);
+        let routine = &outcome.implementation_body.routines[0];
+        assert_eq!(routine.owner_type_key, Some(key("TThing")));
+        assert_eq!(routine.scope.kind, ScopeKind::Method);
+        assert_eq!(routine.scope.self_type_key, Some(key("TThing")));
+        // typed local captured on the scope declarations
+        assert!(routine.scope.declarations.iter().any(|d| d.name.key == key("L")
+            && d.type_key == Some(key("Integer"))));
+    }
+
+    /// S2: typed PARAMS become `Param` declarations with their simple type key.
+    #[test]
+    fn s2_typed_params_on_scope() {
+        let source = "unit U;\ninterface\nimplementation\n\
+             function Add(const A: Integer; B: Integer): Integer;\nbegin\n  Result := A + B;\nend;\nend.";
+        let outcome = parse_outcome(source);
+        let routine = &outcome.implementation_body.routines[0];
+        assert_eq!(routine.kind, crate::ast::RoutineKind::Function);
+        let params: Vec<_> = routine
+            .scope
+            .declarations
+            .iter()
+            .filter(|d| d.kind == crate::ast::LocalKind::Param)
+            .collect();
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].name.key, key("A"));
+        assert_eq!(params[0].type_key, Some(key("Integer")));
+        assert_eq!(params[1].name.key, key("B"));
+    }
+
+    /// S2: a NESTED routine is a `ChildScope` statement in the parent AND a
+    /// separate flat entry.
+    #[test]
+    fn s2_nested_routine_is_child_scope() {
+        let source = "unit U;\ninterface\nimplementation\n\
+             procedure Outer;\n\
+             procedure Inner;\n  begin\n  end;\n\
+             begin\n  Inner;\nend;\nend.";
+        let outcome = parse_outcome(source);
+        assert!(outcome.impl_scopes_reliable);
+        let routine = &outcome.implementation_body.routines[0];
+        assert_eq!(routine.name.key, key("Outer"));
+        // the nested routine is a ChildScope of kind Nested at the front
+        let has_nested = routine.scope.statements.iter().any(|s| {
+            matches!(s, Statement::ChildScope(scope) if scope.kind == ScopeKind::Nested)
+        });
+        assert!(has_nested, "nested routine is a ChildScope");
+        // flat derivation still has both entries
+        assert_eq!(outcome.impl_scopes.len(), 2);
+    }
+
+    /// S2: an ANONYMOUS METHOD in an expression becomes an `Anonymous` child
+    /// scope; its own inline var/param belongs to IT.
+    #[test]
+    fn s2_anonymous_method_scope() {
+        let source = "unit U;\ninterface\nimplementation\n\
+             procedure Host;\nbegin\n  Run(procedure(X: Integer) begin DoIt(X); end);\nend;\nend.";
+        let outcome = parse_outcome(source);
+        assert!(outcome.impl_scopes_reliable, "a modelled closure stays reliable");
+        let routine = &outcome.implementation_body.routines[0];
+        let anon_scopes = count_child_scopes(&routine.scope.statements);
+        assert!(anon_scopes >= 1, "the closure opens a child scope");
+    }
+
+    /// S2: a `with E do S` becomes a `With` statement whose receiver is captured.
+    #[test]
+    fn s2_with_block_statement() {
+        let source = "unit U;\ninterface\nimplementation\n\
+             procedure P;\nbegin\n  with Foo do\n    Bar := 1;\nend;\nend.";
+        let outcome = parse_outcome(source);
+        assert!(outcome.impl_scopes_reliable);
+        let routine = &outcome.implementation_body.routines[0];
+        let has_with = routine
+            .scope
+            .statements
+            .iter()
+            .any(|s| matches!(s, Statement::With { items, .. } if !items.is_empty()));
+        assert!(has_with, "the with-block is captured with its receiver");
+    }
+
+    /// S2: an inline `var X := e;` adds a scope symbol (kind `InlineVar`) AND a
+    /// `LocalVar` statement carrying the initializer.
+    #[test]
+    fn s2_inline_var_adds_scope_symbol() {
+        let source = "unit U;\ninterface\nimplementation\n\
+             procedure P;\nbegin\n  var Count := 5;\n  UseIt(Count);\nend;\nend.";
+        let outcome = parse_outcome(source);
+        assert!(outcome.impl_scopes_reliable);
+        let routine = &outcome.implementation_body.routines[0];
+        assert!(
+            routine.scope.declarations.iter().any(|d| d.name.key == key("Count")
+                && d.kind == crate::ast::LocalKind::InlineVar),
+            "the inline var is a scope declaration"
+        );
+        let has_local_var = routine.scope.statements.iter().any(|s| {
+            matches!(s, Statement::LocalVar(symbol, Some(_)) if symbol.name.key == key("Count"))
+        });
+        assert!(has_local_var, "the inline var statement carries its initializer");
+    }
+
+    /// S2: `initialization` and `finalization` blocks are captured as statement
+    /// lists.
+    #[test]
+    fn s2_initialization_and_finalization_captured() {
+        let source = "unit U;\ninterface\nimplementation\n\
+             procedure P;\nbegin\nend;\n\
+             initialization\n  RegisterThing(1);\n\
+             finalization\n  UnregisterThing;\nend.";
+        let outcome = parse_outcome(source);
+        assert!(outcome.impl_scopes_reliable);
+        let body = &outcome.implementation_body;
+        assert!(body.initialization.as_ref().is_some_and(|s| !s.is_empty()),
+            "initialization statements captured");
+        assert!(body.finalization.as_ref().is_some_and(|s| !s.is_empty()),
+            "finalization statements captured");
+        // usages inside init/final still flow.
+        let usage_keys: Vec<_> = outcome.usages.iter().map(|u| u.symbol).collect();
+        assert!(usage_keys.contains(&key("RegisterThing")));
+        assert!(usage_keys.contains(&key("UnregisterThing")));
+    }
+
+    /// S2: a top-level `begin … end.` unit init block is captured as
+    /// `initialization`.
+    #[test]
+    fn s2_unit_init_block_is_initialization() {
+        let source = "unit U;\ninterface\nimplementation\n\
+             begin\n  Startup(1);\nend.";
+        let outcome = parse_outcome(source);
+        let body = &outcome.implementation_body;
+        assert!(body.initialization.as_ref().is_some_and(|s| !s.is_empty()));
+        assert!(outcome.usages.iter().any(|u| u.symbol == key("Startup")));
+    }
+
+    /// S2: a malformed / unmodeled body (`asm`) degrades — `body.reliable` false,
+    /// never a wrong body span. The derived flag agrees.
+    #[test]
+    fn s2_malformed_body_degrades_without_wrong_span() {
+        let source = "unit U;\ninterface\nimplementation\n\
+             procedure Fast;\nasm\n  NOP\nend;\nend.";
+        let outcome = parse_outcome(source);
+        assert!(!outcome.implementation_body.reliable, "asm body degrades body.reliable");
+        assert_eq!(
+            outcome.impl_scopes_reliable, outcome.implementation_body.reliable,
+            "derived flag equals body.reliable"
+        );
+        // usages still flow.
+        assert!(outcome.usages.iter().any(|u| u.symbol == key("NOP")));
+    }
+
+    /// S2: an assignment statement is modelled as `Assignment { target, value }`.
+    #[test]
+    fn s2_assignment_statement_shape() {
+        let source = "unit U;\ninterface\nimplementation\n\
+             procedure P;\nvar X: Integer;\nbegin\n  X := 42;\nend;\nend.";
+        let outcome = parse_outcome(source);
+        let routine = &outcome.implementation_body.routines[0];
+        let assignment = routine.scope.statements.iter().find_map(|s| match s {
+            Statement::Assignment { target, .. } => Some(target),
+            _ => None,
+        });
+        let Some(Expression::Identifier(target_name)) = assignment else {
+            panic!("expected an assignment with an identifier target");
+        };
+        assert_eq!(target_name.key, key("X"));
+    }
+
+    /// S2: a body-less routine header (`external`) yields a routine whose scope
+    /// spans just the header with no statements, and stays reliable. (A directive
+    /// after the header `;` ends structured capture — parity with the earlier
+    /// scan — but the header routine itself is recorded with an empty scope.)
+    #[test]
+    fn s2_headerless_routine_empty_scope() {
+        let source = "unit U;\ninterface\nimplementation\n\
+             procedure Imported; external 'lib.dll';\nend.";
+        let outcome = parse_outcome(source);
+        assert!(outcome.impl_scopes_reliable);
+        assert_eq!(outcome.implementation_body.routines.len(), 1);
+        let imported = &outcome.implementation_body.routines[0];
+        assert_eq!(imported.name.key, key("Imported"));
+        assert!(imported.scope.statements.is_empty(), "external header carries no statements");
+        // A body-less header spans just the header, not a wrong body region.
+        assert!(imported.scope.span.start <= imported.name.location.span.start);
+    }
+
+    /// S2: a control-flow `if/then/else` is descended, not modelled as a typed
+    /// node — its condition is pulled in as an Expression and the body reached in
+    /// sync (the routine stays reliable).
+    #[test]
+    fn s2_control_flow_descends_reliably() {
+        let source = "unit U;\ninterface\nimplementation\n\
+             procedure P;\nbegin\n  if Cond then\n    A := 1\n  else\n    A := 2;\n  for var i := 0 to 3 do\n    Sum(i);\nend;\nend.";
+        let outcome = parse_outcome(source);
+        assert!(
+            outcome.impl_scopes_reliable,
+            "if/then/else + for-var head must not desync the body"
+        );
+        let usage_keys: Vec<_> = outcome.usages.iter().map(|u| u.symbol).collect();
+        assert!(usage_keys.contains(&key("Cond")));
+        assert!(usage_keys.contains(&key("Sum")));
     }
 }

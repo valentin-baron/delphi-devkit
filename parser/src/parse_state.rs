@@ -153,6 +153,10 @@ pub struct UnitParseState {
     /// false on ANY recovery in that pass (an unmodeled construct, an unexpected
     /// token, unbalanced `end`); consumers then ignore `impl_scopes`.
     impl_scopes_reliable: bool,
+    /// The full implementation-section scope tree (Stage S2). Populated by
+    /// `parse_implementation_body`; `impl_scopes`/`impl_scopes_reliable` are
+    /// DERIVED from it. Taken out into `ParseOutcome` at end of parse.
+    implementation_body: crate::ast_impl::ImplementationBody,
     /// Serves `Declared()`/`SizeOf()` requests for imported units. `None`
     /// = no import resolution available; those queries answer Unknown.
     pub loader: Option<Rc<dyn InterfaceLoader>>,
@@ -180,6 +184,7 @@ impl UnitParseState {
             usages: Vec::new(),
             impl_scopes: Vec::new(),
             impl_scopes_reliable: true,
+            implementation_body: crate::ast_impl::ImplementationBody::default(),
             loader: None,
             cycle_tainted: false,
             context,
@@ -354,6 +359,22 @@ impl UnitParseState {
 
     pub fn take_impl_scopes(&mut self) -> Vec<crate::ast::ImplRoutine> {
         std::mem::take(&mut self.impl_scopes)
+    }
+
+    /// Store the fully-parsed implementation-section scope tree (Stage S2). The
+    /// flat `impl_scopes` table is populated separately (each routine —
+    /// top-level, nested and method — is recorded via [`Self::record_impl_routine`]
+    /// as the parser builds it, so a nested routine's own name/params/locals are
+    /// preserved); here we only DERIVE the section-wide reliability gate from the
+    /// body. `body.reliable` is the single source of truth: it and
+    /// `impl_scopes_reliable` never disagree.
+    pub fn set_implementation_body(&mut self, body: crate::ast_impl::ImplementationBody) {
+        self.impl_scopes_reliable = body.reliable;
+        self.implementation_body = body;
+    }
+
+    pub fn take_implementation_body(&mut self) -> crate::ast_impl::ImplementationBody {
+        std::mem::take(&mut self.implementation_body)
     }
 
     // ─── Conditional compilation ─────────────────────────────────────────
