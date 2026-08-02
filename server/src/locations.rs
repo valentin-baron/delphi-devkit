@@ -105,8 +105,20 @@ pub fn resolve_definition_locations(
     // Position-aware so a body-local variable/parameter resolves to its own
     // declaration (the key-based `definition` cannot see scope). Non-local
     // targets delegate to the same key-based resolution as before.
-    let _ = session.symbol_at(unit_key, offset)?; // nothing under cursor → None
+    //
+    // GUARD (nothing under cursor → None): normally an identifier occurrence must
+    // sit under the cursor. A BARE `inherited` keyword is NOT an identifier
+    // occurrence (so `symbol_at` finds nothing), yet it is a valid navigation
+    // source (Feature A) — so the guard passes when EITHER `symbol_at` finds an
+    // occurrence OR `definition_at` yields a location (which covers the
+    // `inherited` case). This never widens a wrong jump: `definition_at` returns
+    // an empty vec for anything unresolved, so an empty result still maps to None
+    // below.
+    let has_symbol = session.symbol_at(unit_key, offset).is_some();
     let locations = session.definition_at(unit_key, offset);
+    if !has_symbol && locations.is_empty() {
+        return None;
+    }
     let mapped: Vec<Location> = locations
         .into_iter()
         .filter_map(|location| code_location_to_lsp(session, location))
@@ -477,6 +489,80 @@ mod tests {
         assert!(
             resolve_definition_locations(&session, client_key, 100_000).is_none(),
             "an out-of-range cursor yields no definition"
+        );
+    }
+
+    /// LIVE LSP-boundary check for Feature A: a cursor on a BARE `inherited`
+    /// keyword inside `procedure TChild.Foo` resolves — through the SAME
+    /// `resolve_definition_locations` the server handler calls — to TBase.Foo's
+    /// declaration. A bare `inherited` is NOT an identifier occurrence, so without
+    /// the guard relaxation (`symbol_at` returns None there) this returned `None`.
+    #[test]
+    fn definition_on_bare_inherited_resolves_to_base() {
+        let directory = std::env::temp_dir()
+            .join("ddk-server-locations")
+            .join("def_inherited");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("Hier.pas"),
+            "unit Hier;\ninterface\n\
+             type TBase = class\n  procedure Foo;\nend;\n\
+             type TChild = class(TBase)\n  procedure Foo;\nend;\n\
+             implementation\n\
+             procedure TChild.Foo;\nbegin\n  inherited;\nend;\nend.",
+        )
+        .unwrap();
+
+        use delphi_parser::cache_store::{CacheIdentity, CacheStore};
+        use delphi_parser::context::{DefineSet, ProjectContext, SwitchState, TargetPlatform};
+        use delphi_parser::unit_cache::UnitCache;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let context = ProjectContext {
+            configuration: "Debug".to_string(),
+            platform_name: "Win32".to_string(),
+            platform: TargetPlatform::Win32,
+            compiler_version: 36.0,
+            rtl_version: 36.0,
+            base_defines: DefineSet::default(),
+            search_paths: vec![directory.clone()],
+            include_paths: Vec::new(),
+            namespaces: Vec::new(),
+            unit_aliases: HashMap::new(),
+            default_switches: SwitchState::default(),
+            unit_cache: UnitCache::default(),
+        };
+        let identity = CacheIdentity {
+            project_path: &directory.join("proj.dproj"),
+            configuration: "Debug",
+            platform: "Win32",
+            compiler_version: 36.0,
+        };
+        std::fs::write(directory.join("proj.dproj"), b"<Project/>").unwrap();
+        let store = CacheStore::in_directory(&directory, &identity).unwrap();
+        let mut session =
+            ProjectSession::from_parts(Arc::new(context), store, Duration::from_secs(300));
+        session.parse_source_file(directory.join("Hier.pas")).unwrap();
+
+        let key = session.context().intern_key("HIER");
+        let source = std::fs::read_to_string(directory.join("Hier.pas")).unwrap();
+        // Cursor ON the bare `inherited` keyword.
+        let offset = (source.rfind("inherited").unwrap() + 2) as u32;
+
+        let locations =
+            resolve_definition_locations(&session, key, offset).expect("bare inherited resolves");
+        assert_eq!(locations.len(), 1);
+        assert!(
+            locations[0].uri.to_file_path().unwrap().ends_with("Hier.pas"),
+            "inherited go-to lands in Hier.pas: {:?}",
+            locations[0].uri
+        );
+        // TBase.Foo is declared on line 3 (0-based): `  procedure Foo;` inside TBase.
+        assert_eq!(
+            locations[0].range.start.line, 3,
+            "lands on TBase's `  procedure Foo;` (line 3)"
         );
     }
 

@@ -5370,9 +5370,12 @@ impl UnitParser<'_> {
             Token::LBracket => self.parse_set_or_array_literal(),
             // `inherited` / `inherited Method`.
             Token::Inherited => {
+                // Capture the `inherited` keyword's own span before consuming it,
+                // so a cursor on a BARE `inherited` (no method name) is navigable.
+                let keyword_location = lexeme.location;
                 self.cursor.advance()?; // 'inherited'
                 let method = self.take_name_occurrence()?;
-                Ok(Expression::Inherited { method })
+                Ok(Expression::Inherited { method, keyword_location })
             }
             // Anonymous-method opener in expression position.
             Token::Procedure | Token::Function | Token::Reference => {

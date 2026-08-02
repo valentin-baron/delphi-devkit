@@ -587,6 +587,24 @@ impl ProjectSession {
             }
         }
 
+        // IMPL HEADER (Feature B forward): the cursor on `Bar` in an
+        // implementation header `procedure TFoo.Bar`. Return a `Member` target
+        // owned by `TFoo` so `definition_at`/`hover_info` route through
+        // `member_definition` to the INTERFACE declaration of `TFoo.Bar` (and
+        // `definition` folds in the impl-header site too). NEVER-WRONG: only a
+        // qualified header whose method name covers the cursor matches.
+        if let Some((owner_key, method_key, header_location)) =
+            self.implementation_header_at(&meta, position)
+        {
+            return Some(QueryTarget {
+                key: method_key,
+                display: method_key,
+                kind: TargetKind::Member,
+                location: header_location,
+                owner_type: Some(owner_key),
+            });
+        }
+
         // Otherwise a usage occurrence. Pick the tightest span covering the
         // position (nested spans can overlap; the smallest is the ident).
         meta.usages
@@ -736,7 +754,21 @@ impl ProjectSession {
 
         // Member target: resolve the owner type first, then its member.
         if let Some(owner_key) = member_owner {
-            return self.member_definition(&meta, owner_key, symbol_key);
+            let mut locations = self.member_definition(&meta, owner_key, symbol_key);
+            // Feature B (fold) — a method member also offers its IMPLEMENTATION
+            // header site (`procedure TFoo.Bar`), so go-to-definition on an
+            // interface method declaration lands on BOTH the interface decl and
+            // the impl header (the Delphi-friendly behavior). NEVER-WRONG: only an
+            // impl header whose owner AND method key both match is appended, and
+            // only when it is not already the same location (a cursor already ON
+            // the impl header resolves via `member_definition` to the interface
+            // decl; the header site is then the distinct second location).
+            if let Some(header) = self.implementation_header_location(&meta, owner_key, symbol_key) {
+                if !locations.contains(&header) {
+                    locations.push(header);
+                }
+            }
+            return locations;
         }
 
         // (1) own interface symbol
@@ -769,6 +801,21 @@ impl ProjectSession {
     ///
     /// Returns an empty vec when nothing resolves — never a wrong location.
     pub fn definition_at(&self, unit_key: Identifier, position: u32) -> Vec<CodeLocation> {
+        // Feature A — `inherited` navigation. A cursor on an `inherited` keyword
+        // (bare) or on the method name in `inherited Bar` resolves to the base
+        // method's declaration in the nearest ancestor that declares it. Checked
+        // BEFORE `symbol_at` because an `inherited` occurrence is not an ordinary
+        // symbol occurrence; when it resolves, that IS the definition. NEVER-WRONG:
+        // an `inherited` that resolves to no ancestor member falls through and the
+        // normal path runs (which, for a bare `inherited`, finds nothing).
+        if let Some(meta) = self.meta_of(unit_key) {
+            if let Some((_base_owner, base_location)) =
+                self.inherited_definition_at(&meta, position)
+            {
+                return vec![base_location];
+            }
+        }
+
         let Some(target) = self.symbol_at(unit_key, position) else {
             return Vec::new();
         };
@@ -1509,6 +1556,195 @@ impl ProjectSession {
             find_member_occurrence_in_statements(finalization, position, &mut best);
         }
         best
+    }
+
+    /// Feature A — `inherited` navigation. Locates an `Expression::Inherited`
+    /// under `position` (cursor on the `inherited` keyword, or on the method name
+    /// in `inherited Bar`) and resolves it to the inherited method's DECLARATION
+    /// site in the nearest ancestor that declares it. Returns
+    /// `(base_owner_key, base_method_location)` — the owner is the ancestor type
+    /// whose declaration the base method actually came from.
+    ///
+    /// Resolution:
+    ///   1. Find the ENCLOSING routine — the `RoutineImplementation` whose
+    ///      `scope.span` covers `position`. `inherited` only means something in a
+    ///      METHOD body, so the enclosing routine must have an `owner_type_key`
+    ///      (a free routine has no base → `None`, never a wrong jump).
+    ///   2. Determine the target method key: `inherited Bar` → `Bar`; bare
+    ///      `inherited` → the enclosing routine's own `name.key` (the overridden
+    ///      method).
+    ///   3. Walk the owner type's ANCESTORS (NOT the owner itself) for the first
+    ///      that declares that key; return its member declaration location.
+    ///
+    /// NEVER-WRONG: no enclosing method owner, no ancestor declaring the method,
+    /// or nothing under the cursor → `None`. Cycle-safe + cross-unit via
+    /// [`Self::inherited_member_location`].
+    fn inherited_definition_at(
+        &self,
+        meta: &UnitMeta,
+        position: u32,
+    ) -> Option<(Identifier, CodeLocation)> {
+        let body = &meta.implementation_body;
+        // The enclosing METHOD: the tightest routine whose scope span covers the
+        // cursor AND which has an owner type. Tightest-covering handles a method
+        // whose body contains nested routines (they share the top-level routine's
+        // owner, so any covering top-level routine is correct, but the tightest is
+        // the honest enclosing one).
+        let mut enclosing: Option<&crate::ast_impl::RoutineImplementation> = None;
+        for routine in &body.routines {
+            let span = routine.scope.span;
+            if span.start <= position && position < span.end {
+                let tighter = enclosing
+                    .map(|current| span.len() < current.scope.span.len())
+                    .unwrap_or(true);
+                if tighter {
+                    enclosing = Some(routine);
+                }
+            }
+        }
+        let routine = enclosing?;
+        // A free routine (`owner_type_key == None`) has no base → `inherited`
+        // resolves to nothing (never a wrong jump).
+        let owner_type_key = routine.owner_type_key?;
+
+        // The target method key: `inherited Bar` → Bar; bare `inherited` → the
+        // enclosing method's own name key (the overridden method).
+        let mut occurrence: Option<(Identifier, CodeLocation)> = None;
+        find_inherited_occurrence_in_scope(
+            &routine.scope,
+            position,
+            routine.name.key,
+            &mut occurrence,
+        );
+        let (method_key, _span) = occurrence?;
+
+        // Resolve in the owner's ancestors (skip the owner's own members).
+        let location = self.inherited_member_location(meta, owner_type_key, method_key)?;
+        Some((owner_type_key, location))
+    }
+
+    /// The declaration location of `method_key` as seen from `owner_type_key`'s
+    /// BASE — i.e. the first ANCESTOR (transitively) of the owner that declares
+    /// `method_key`. The owner's OWN members are deliberately SKIPPED: `inherited`
+    /// means the base implementation, never the overriding one.
+    ///
+    /// Own → imports resolution (identical discipline to
+    /// [`Self::flattened_members`]): a type key resolves against this unit's
+    /// interface first, then each import in reverse uses order via the loader.
+    ///
+    /// NEVER-WRONG + CYCLE-SAFE + BOUNDED: a `visited` set makes a malformed
+    /// cyclic hierarchy terminate; a `MAX_ANCESTOR_DEPTH` belt caps a pathological
+    /// chain. An ancestor that resolves to no type (DCU-only base, missing unit)
+    /// simply stops that branch. No ancestor declaring `method_key` → `None`.
+    fn inherited_member_location(
+        &self,
+        meta: &UnitMeta,
+        owner_type_key: Identifier,
+        method_key: Identifier,
+    ) -> Option<CodeLocation> {
+        const MAX_ANCESTOR_DEPTH: usize = 64;
+
+        let loader = self.make_loader();
+        let resolve_type = |type_key: Identifier| -> Option<crate::unit_cache::InterfaceSymbol> {
+            if let Some(symbol) = meta.interface().find(type_key) {
+                return Some(symbol.clone());
+            }
+            for import in imports_reversed(meta) {
+                if let crate::parse_state::LoadOutcome::Loaded(imported) =
+                    loader.interface_of(import)
+                {
+                    if let Some(symbol) = imported.interface().find(type_key) {
+                        return Some(symbol.clone());
+                    }
+                }
+            }
+            None
+        };
+
+        // Resolve the owner and seed the frontier with its ANCESTORS (not the
+        // owner itself — `inherited` skips the owner's own members). `visited`
+        // includes the owner so a cyclic `A = class(B)` / `B = class(A)` cannot
+        // route back through it.
+        let owner = resolve_type(owner_type_key)?;
+        let mut type_seen: std::collections::HashSet<Identifier> = std::collections::HashSet::new();
+        type_seen.insert(owner_type_key);
+        let mut frontier: std::collections::VecDeque<(Identifier, usize)> =
+            std::collections::VecDeque::new();
+        for &ancestor_key in &owner.ancestors {
+            if type_seen.insert(ancestor_key) {
+                frontier.push_back((ancestor_key, 1));
+            }
+        }
+
+        while let Some((current_key, depth)) = frontier.pop_front() {
+            if depth > MAX_ANCESTOR_DEPTH {
+                continue;
+            }
+            let Some(symbol) = resolve_type(current_key) else {
+                continue;
+            };
+            // First ancestor (nearest-first: BFS from the owner) declaring the
+            // method wins — that IS the base method `inherited` targets.
+            if let Some(member) = symbol.members.iter().find(|member| member.key == method_key) {
+                return Some(member.location);
+            }
+            for &ancestor_key in &symbol.ancestors {
+                if type_seen.insert(ancestor_key) {
+                    frontier.push_back((ancestor_key, depth + 1));
+                }
+            }
+        }
+        None
+    }
+
+    /// Feature B (reverse) — the IMPLEMENTATION-HEADER site of `owner_key`.`method_key`.
+    /// Searches `meta.implementation_body.routines` for a `RoutineImplementation`
+    /// with `owner_type_key == Some(owner_key)` and `name.key == method_key`;
+    /// returns its header `name.location`. `None` when no matching impl exists.
+    ///
+    /// NEVER-WRONG: only an impl whose owner AND method key both match is
+    /// returned, so an unrelated same-named top-level routine or a method on a
+    /// different type is never offered.
+    fn implementation_header_location(
+        &self,
+        meta: &UnitMeta,
+        owner_key: Identifier,
+        method_key: Identifier,
+    ) -> Option<CodeLocation> {
+        meta.implementation_body
+            .routines
+            .iter()
+            .find(|routine| {
+                routine.owner_type_key == Some(owner_key) && routine.name.key == method_key
+            })
+            .map(|routine| routine.name.location)
+    }
+
+    /// Feature B (forward) — the impl-header method name occurrence under
+    /// `position`. When the cursor is on `Bar` in an implementation header
+    /// `procedure TFoo.Bar`, returns `(TFoo, Bar, name_location)` so `symbol_at`
+    /// can compose a `Member` target routing through `member_definition` to the
+    /// interface declaration of `TFoo.Bar`.
+    ///
+    /// NEVER-WRONG: only a qualified header (`owner_type_key.is_some()`) whose
+    /// `name` span covers the cursor matches — a free routine's header name, or a
+    /// cursor on the `TFoo` part / elsewhere, never produces a member target.
+    fn implementation_header_at(
+        &self,
+        meta: &UnitMeta,
+        position: u32,
+    ) -> Option<(Identifier, Identifier, CodeLocation)> {
+        meta.implementation_body
+            .routines
+            .iter()
+            .find_map(|routine| {
+                let owner = routine.owner_type_key?;
+                if span_covers(routine.name.location, position) {
+                    Some((owner, routine.name.key, routine.name.location))
+                } else {
+                    None
+                }
+            })
     }
 
     /// Infer the declared TYPE key of a receiver `expression`, for member
@@ -2285,6 +2521,143 @@ fn find_member_occurrence_in_expression<'a>(
         }
         Expression::Identifier(_)
         | Expression::Inherited { .. }
+        | Expression::SetOrArrayLiteral(_)
+        | Expression::Literal(_) => {}
+    }
+}
+
+// ─── `inherited` occurrence location over the implementation body (Feature A) ─
+//
+// These walkers find an `Expression::Inherited` whose `inherited` keyword span
+// (bare `inherited`) or whose `method` name span (`inherited Bar`) covers a
+// cursor position, and yield the TARGET METHOD KEY the `inherited` resolves to:
+//   * `inherited Bar` → `Bar`'s folded key (the named method);
+//   * bare `inherited`  → the enclosing routine's OWN method key (the method
+//     being overridden), supplied by the caller from the enclosing
+//     `RoutineImplementation.name.key`.
+// The walk returns the target key AND the covering occurrence's span (so the
+// caller can compose a `QueryTarget`).
+
+/// The target method key + occurrence span of the `inherited` under `position`,
+/// resolved WITHIN a single routine's scope tree. `enclosing_method_key` is the
+/// enclosing routine's own method key (for a bare `inherited`). Returns the
+/// TIGHTEST covering occurrence.
+fn find_inherited_occurrence_in_scope(
+    scope: &crate::ast_impl::Scope,
+    position: u32,
+    enclosing_method_key: Identifier,
+    best: &mut Option<(Identifier, CodeLocation)>,
+) {
+    find_inherited_occurrence_in_statements(&scope.statements, position, enclosing_method_key, best);
+}
+
+fn find_inherited_occurrence_in_statements(
+    statements: &[crate::ast_impl::Statement],
+    position: u32,
+    enclosing_method_key: Identifier,
+    best: &mut Option<(Identifier, CodeLocation)>,
+) {
+    use crate::ast_impl::Statement;
+    for statement in statements {
+        match statement {
+            Statement::Expression(expression) => find_inherited_occurrence_in_expression(
+                expression, position, enclosing_method_key, best,
+            ),
+            Statement::Assignment { target, value } => {
+                find_inherited_occurrence_in_expression(target, position, enclosing_method_key, best);
+                find_inherited_occurrence_in_expression(value, position, enclosing_method_key, best);
+            }
+            Statement::LocalVar(_, Some(expression)) => find_inherited_occurrence_in_expression(
+                expression, position, enclosing_method_key, best,
+            ),
+            Statement::LocalVar(_, None) | Statement::Opaque(_) => {}
+            Statement::With { items, body } => {
+                for item in items {
+                    find_inherited_occurrence_in_expression(
+                        item, position, enclosing_method_key, best,
+                    );
+                }
+                find_inherited_occurrence_in_statements(body, position, enclosing_method_key, best);
+            }
+            // A nested/anonymous scope: an `inherited` there still refers to the
+            // enclosing METHOD's owner (a closure has no method of its own), so
+            // the enclosing method key threads through unchanged.
+            Statement::ChildScope(scope) => {
+                find_inherited_occurrence_in_scope(scope, position, enclosing_method_key, best)
+            }
+            Statement::Group(inner) => {
+                find_inherited_occurrence_in_statements(inner, position, enclosing_method_key, best)
+            }
+        }
+    }
+}
+
+fn find_inherited_occurrence_in_expression(
+    expression: &crate::ast_impl::Expression,
+    position: u32,
+    enclosing_method_key: Identifier,
+    best: &mut Option<(Identifier, CodeLocation)>,
+) {
+    use crate::ast_impl::Expression;
+    match expression {
+        Expression::Inherited { method, keyword_location } => {
+            // The covering occurrence is either the `method` name span
+            // (`inherited Bar`) or the bare `inherited` keyword span. Prefer the
+            // method span when the cursor is on it (it carries the named target);
+            // otherwise the keyword span covers a bare `inherited`.
+            let (target_key, occurrence) = match method {
+                Some(name) if span_covers(name.location, position) => (name.key, name.location),
+                // `inherited Bar` but the cursor is on the keyword, OR a bare
+                // `inherited`: the target is the enclosing method being overridden
+                // for a bare `inherited`, else the named method for `inherited Bar`.
+                _ if span_covers(*keyword_location, position) => match method {
+                    Some(name) => (name.key, *keyword_location),
+                    None => (enclosing_method_key, *keyword_location),
+                },
+                _ => return,
+            };
+            let is_tighter = best
+                .as_ref()
+                .map(|(_, existing)| occurrence.span.len() < existing.span.len())
+                .unwrap_or(true);
+            if is_tighter {
+                *best = Some((target_key, occurrence));
+            }
+        }
+        Expression::Member { receiver, .. } => {
+            find_inherited_occurrence_in_expression(receiver, position, enclosing_method_key, best)
+        }
+        Expression::Call { callee, arguments, .. } => {
+            find_inherited_occurrence_in_expression(callee, position, enclosing_method_key, best);
+            for argument in arguments {
+                find_inherited_occurrence_in_expression(
+                    argument, position, enclosing_method_key, best,
+                );
+            }
+        }
+        Expression::Index { base, indices } => {
+            find_inherited_occurrence_in_expression(base, position, enclosing_method_key, best);
+            for index in indices {
+                find_inherited_occurrence_in_expression(index, position, enclosing_method_key, best);
+            }
+        }
+        Expression::Cast { operand, .. } => {
+            find_inherited_occurrence_in_expression(operand, position, enclosing_method_key, best)
+        }
+        Expression::Unary { operand, .. } => {
+            find_inherited_occurrence_in_expression(operand, position, enclosing_method_key, best)
+        }
+        Expression::Binary { left, right, .. } => {
+            find_inherited_occurrence_in_expression(left, position, enclosing_method_key, best);
+            find_inherited_occurrence_in_expression(right, position, enclosing_method_key, best);
+        }
+        Expression::Parenthesized(inner) => {
+            find_inherited_occurrence_in_expression(inner, position, enclosing_method_key, best)
+        }
+        Expression::AnonymousMethod(scope) => {
+            find_inherited_occurrence_in_scope(scope, position, enclosing_method_key, best)
+        }
+        Expression::Identifier(_)
         | Expression::SetOrArrayLiteral(_)
         | Expression::Literal(_) => {}
     }
@@ -5915,6 +6288,282 @@ mod tests {
         assert!(
             definition.is_empty(),
             "Local.Bar: TThing lacks Bar → no jump, never the top-level const Bar"
+        );
+    }
+
+    // ─── Feature A: `inherited` navigation ───────────────────────────────────
+
+    #[test]
+    fn inherited_bare_resolves_to_base_method_same_unit() {
+        // `procedure TChild.Foo` with a bare `inherited;` → jump to TBase.Foo.
+        let directory = temp_directory("inherited_bare_same_unit");
+        std::fs::write(
+            directory.join("Hier.pas"),
+            "unit Hier;\ninterface\n\
+             type\n  TBase = class\n    procedure Foo;\n  end;\n\
+             \n  TChild = class(TBase)\n    procedure Foo;\n  end;\n\
+             implementation\n\
+             procedure TChild.Foo;\nbegin\n  inherited;\nend;\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("Hier.pas")).unwrap();
+        let key = session.context.intern_key("HIER");
+        let meta = session.meta_of(key).unwrap();
+        let file = meta.usages.first().unwrap().location.file;
+
+        // TBase.Foo's declaration span (the target).
+        let base = meta.interface().find(session.context.intern_key("TBase")).unwrap();
+        let base_foo = base.find_member(session.context.intern_key("Foo")).unwrap().location;
+
+        // Cursor ON the bare `inherited` keyword.
+        let position = position_at_last(&session, file, "inherited") + 2;
+        let definition = session.definition_at(key, position);
+        assert_eq!(
+            definition,
+            vec![base_foo],
+            "bare inherited in TChild.Foo → TBase.Foo declaration"
+        );
+    }
+
+    #[test]
+    fn inherited_named_resolves_to_base_method_same_unit() {
+        // `inherited Bar` inside TChild.Foo → jump to TBase.Bar (a DIFFERENT
+        // method than the enclosing one).
+        let directory = temp_directory("inherited_named_same_unit");
+        std::fs::write(
+            directory.join("Hier.pas"),
+            "unit Hier;\ninterface\n\
+             type\n  TBase = class\n    procedure Bar;\n  end;\n\
+             \n  TChild = class(TBase)\n    procedure Foo;\n  end;\n\
+             implementation\n\
+             procedure TChild.Foo;\nbegin\n  inherited Bar;\nend;\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("Hier.pas")).unwrap();
+        let key = session.context.intern_key("HIER");
+        let meta = session.meta_of(key).unwrap();
+        let file = meta.usages.first().unwrap().location.file;
+
+        let base = meta.interface().find(session.context.intern_key("TBase")).unwrap();
+        let base_bar = base.find_member(session.context.intern_key("Bar")).unwrap().location;
+
+        // Cursor on the `Bar` in `inherited Bar`.
+        let content = session.arena.content(file).unwrap();
+        let inherited_bar = content.rfind("inherited Bar").unwrap();
+        let bar_position = (inherited_bar + "inherited ".len()) as u32;
+        let definition = session.definition_at(key, bar_position);
+        assert_eq!(
+            definition,
+            vec![base_bar],
+            "inherited Bar → TBase.Bar declaration"
+        );
+
+        // Cursor on the `inherited` KEYWORD of `inherited Bar` → still TBase.Bar
+        // (the named target, not the enclosing Foo).
+        let keyword_position = (inherited_bar + 2) as u32;
+        assert_eq!(
+            session.definition_at(key, keyword_position),
+            vec![base_bar],
+            "inherited keyword of `inherited Bar` → named TBase.Bar"
+        );
+    }
+
+    #[test]
+    fn inherited_bare_resolves_cross_unit() {
+        // TBase in a SEPARATE unit; TChild = class(TBase) overrides Foo. A bare
+        // `inherited` resolves cross-unit to Base.pas's TBase.Foo.
+        let directory = temp_directory("inherited_bare_cross_unit");
+        std::fs::write(
+            directory.join("Base.pas"),
+            "unit Base;\ninterface\n\
+             type\n  TBase = class\n    procedure Foo;\n  end;\n\
+             implementation\nend.",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("Child.pas"),
+            "unit Child;\ninterface\nuses Base;\n\
+             type\n  TChild = class(TBase)\n    procedure Foo;\n  end;\n\
+             implementation\n\
+             procedure TChild.Foo;\nbegin\n  inherited;\nend;\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("Base.pas")).unwrap();
+        session.parse_source_file(directory.join("Child.pas")).unwrap();
+        let child_key = session.context.intern_key("CHILD");
+        let child_meta = session.meta_of(child_key).unwrap();
+        let child_file = child_meta.usages.first().unwrap().location.file;
+
+        // TBase.Foo lives in Base.pas — resolve it via the base unit's meta.
+        let base_key = session.context.intern_key("BASE");
+        let base_meta = session.meta_of(base_key).unwrap();
+        let base = base_meta.interface().find(session.context.intern_key("TBase")).unwrap();
+        let base_foo = base.find_member(session.context.intern_key("Foo")).unwrap().location;
+
+        let position = position_at_last(&session, child_file, "inherited") + 2;
+        let definition = session.definition_at(child_key, position);
+        assert_eq!(
+            definition,
+            vec![base_foo],
+            "bare inherited cross-unit → TBase.Foo in Base.pas"
+        );
+    }
+
+    #[test]
+    fn inherited_never_wrong_no_ancestor_and_free_routine() {
+        // NEVER-WRONG: (1) a bare `inherited` in a method whose owner has NO
+        // ancestor declaring the method → empty; (2) `inherited` in a FREE routine
+        // (no owner) → empty. A same-named unrelated top-level symbol is never
+        // returned.
+        let directory = temp_directory("inherited_never_wrong");
+        std::fs::write(
+            directory.join("Nope.pas"),
+            "unit Nope;\ninterface\n\
+             type\n  TLone = class\n    procedure Foo;\n  end;\n\
+             procedure Foo;\n\
+             implementation\n\
+             procedure TLone.Foo;\nbegin\n  inherited;\nend;\n\
+             procedure Foo;\nbegin\n  inherited;\nend;\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("Nope.pas")).unwrap();
+        let key = session.context.intern_key("NOPE");
+        let meta = session.meta_of(key).unwrap();
+        let file = meta.usages.first().unwrap().location.file;
+        let content = session.arena.content(file).unwrap();
+
+        // (1) TLone.Foo: TLone (no base class → no ancestor) → bare inherited
+        // resolves to nothing. It must NOT jump to the top-level `procedure Foo`.
+        let first_inherited = content.find("inherited").unwrap();
+        assert!(
+            session.definition_at(key, (first_inherited + 2) as u32).is_empty(),
+            "no ancestor declaring Foo → empty, never the top-level procedure Foo"
+        );
+
+        // (2) free routine `procedure Foo` with a bare inherited → no owner → empty.
+        let second_inherited = content.rfind("inherited").unwrap();
+        assert!(
+            session.definition_at(key, (second_inherited + 2) as u32).is_empty(),
+            "inherited in a free routine has no base → empty"
+        );
+    }
+
+    // ─── Feature B: interface ↔ implementation method jump (#40) ──────────────
+
+    #[test]
+    fn impl_header_jumps_to_interface_declaration() {
+        // FORWARD: cursor on `Bar` in the impl header `procedure TFoo.Bar` →
+        // definition includes TFoo.Bar's INTERFACE declaration.
+        let directory = temp_directory("impl_header_forward");
+        std::fs::write(
+            directory.join("Foo.pas"),
+            "unit Foo;\ninterface\n\
+             type\n  TFoo = class\n    procedure Bar;\n  end;\n\
+             implementation\n\
+             procedure TFoo.Bar;\nbegin\nend;\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("Foo.pas")).unwrap();
+        let key = session.context.intern_key("FOO");
+        let meta = session.meta_of(key).unwrap();
+        let file = meta.usages.first().unwrap().location.file;
+
+        let foo = meta.interface().find(session.context.intern_key("TFoo")).unwrap();
+        let interface_bar = foo.find_member(session.context.intern_key("Bar")).unwrap().location;
+
+        // Cursor on `Bar` in the impl header `procedure TFoo.Bar`.
+        let content = session.arena.content(file).unwrap();
+        let header = content.find("TFoo.Bar").unwrap();
+        let bar_position = (header + "TFoo.".len()) as u32;
+        let definition = session.definition_at(key, bar_position);
+        assert!(
+            definition.contains(&interface_bar),
+            "impl header cursor on Bar → interface TFoo.Bar decl, got {definition:?}"
+        );
+    }
+
+    #[test]
+    fn interface_declaration_definition_includes_impl_header() {
+        // REVERSE (folded): cursor on the interface DECLARATION of Bar →
+        // definition includes BOTH the interface decl AND the impl-header site.
+        let directory = temp_directory("impl_header_reverse");
+        std::fs::write(
+            directory.join("Foo.pas"),
+            "unit Foo;\ninterface\n\
+             type\n  TFoo = class\n    procedure Bar;\n  end;\n\
+             implementation\n\
+             procedure TFoo.Bar;\nbegin\nend;\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("Foo.pas")).unwrap();
+        let key = session.context.intern_key("FOO");
+        let meta = session.meta_of(key).unwrap();
+        let file = meta.usages.first().unwrap().location.file;
+
+        let foo = meta.interface().find(session.context.intern_key("TFoo")).unwrap();
+        let interface_bar = foo.find_member(session.context.intern_key("Bar")).unwrap().location;
+        let impl_header = session
+            .implementation_header_location(&meta, session.context.intern_key("TFoo"), session.context.intern_key("Bar"))
+            .expect("impl header exists");
+
+        // Cursor on the `Bar` in the interface `procedure Bar;` declaration.
+        let content = session.arena.content(file).unwrap();
+        let decl = content.find("procedure Bar;").unwrap();
+        let bar_position = (decl + "procedure ".len()) as u32;
+        let definition = session.definition_at(key, bar_position);
+        assert!(
+            definition.contains(&interface_bar),
+            "interface decl in result: {definition:?}"
+        );
+        assert!(
+            definition.contains(&impl_header),
+            "impl-header site folded into interface-decl definition: {definition:?}"
+        );
+    }
+
+    #[test]
+    fn impl_header_fold_never_wrong_when_no_impl_exists() {
+        // NEVER-WRONG: a method with NO implementation body (interface-only, e.g.
+        // an abstract/external decl) → definition is just the interface decl; no
+        // bogus impl-header site is invented.
+        let directory = temp_directory("impl_header_none");
+        std::fs::write(
+            directory.join("Abs.pas"),
+            "unit Abs;\ninterface\n\
+             type\n  TFoo = class\n    procedure Bar; virtual; abstract;\n  end;\n\
+             implementation\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("Abs.pas")).unwrap();
+        let key = session.context.intern_key("ABS");
+        let meta = session.meta_of(key).unwrap();
+
+        let foo = meta.interface().find(session.context.intern_key("TFoo")).unwrap();
+        let interface_bar = foo.find_member(session.context.intern_key("Bar")).unwrap().location;
+        let file = interface_bar.file;
+
+        let content = session.arena.content(file).unwrap();
+        let decl = content.find("procedure Bar;").unwrap();
+        let bar_position = (decl + "procedure ".len()) as u32;
+        let definition = session.definition_at(key, bar_position);
+        assert_eq!(
+            definition,
+            vec![interface_bar],
+            "no impl body → just the interface decl, no fabricated impl site"
         );
     }
 }

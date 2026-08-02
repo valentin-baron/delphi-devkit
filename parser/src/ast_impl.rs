@@ -106,7 +106,14 @@ pub enum Expression {
     /// arguments follow, the whole `inherited Foo(...)` postfix chain is built
     /// with this node as its innermost receiver; `method` holds the immediate
     /// method name that followed `inherited`, when present.
-    Inherited { method: Option<QualifiedName> },
+    ///
+    /// `keyword_location` is the span of the `inherited` keyword itself. It is
+    /// what makes a BARE `inherited` (no method name) navigable — a cursor on the
+    /// keyword has no `method` span to land on, so the locator matches this span.
+    Inherited {
+        method: Option<QualifiedName>,
+        keyword_location: CodeLocation,
+    },
     /// A prefix (`@ not - +`) or postfix (`^`) unary application.
     Unary {
         operator: UnaryOperator,
@@ -629,7 +636,7 @@ mod tests {
     #[test]
     fn bare_inherited() {
         let expression = parse_expression("inherited");
-        let Expression::Inherited { method } = expression else {
+        let Expression::Inherited { method, .. } = expression else {
             panic!("expected Inherited, got {expression:?}");
         };
         assert!(method.is_none());
@@ -647,7 +654,7 @@ mod tests {
             panic!("expected Call over Inherited, got {expression:?}");
         };
         assert_eq!(arguments.len(), 1);
-        let Expression::Inherited { method } = *callee else {
+        let Expression::Inherited { method, .. } = *callee else {
             panic!("expected Inherited callee");
         };
         let method = method.expect("method name after inherited");
