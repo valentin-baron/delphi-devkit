@@ -1057,6 +1057,48 @@ the `Declared(A.B)` own+imported walk, `member_completions` / `member_receiver_a
 Genuinely NEW: the expression parser, the cross-unit inheritance walk, and typing
 local-variable receivers.
 
+## Iteration 16 work log (2026-08-02) — IMPLEMENTATION-SECTION SEMANTIC AST (S1–S3)
+
+Built the real implementation-section AST for ALL scopes (the `impl-ast-spec.md`
+plan), lean/fast/cache-first. Each stage: implement → ADVERSARIAL REVIEW → 820-unit
+real-code probe → commit.
+
+- **S1 — Expression AST + Pratt parser** (`ast_impl.rs`; commit e0f8bea). Delphi
+  operator precedence (unary > mul/`as` > add > relational), postfix chain
+  (`.member`/`(args)`/`[idx]`/`^`deref), `inherited`, casts, error-tolerant. Review
+  verified the precedence table vs Delphi's.
+- **S2 — Statement/scope parser → `ImplementationBody`** (commit b7cba9a). Real
+  scope tree: `RoutineImplementation` + `Scope{Routine|Nested|Anonymous|Method|
+  With}`, typed `LocalSymbol`s, shallow statements (`Assignment|LocalVar|With|
+  ChildScope|Group|Opaque`), init/finalization. `impl_scopes`+`usages` DERIVED from
+  the body (queries unchanged). begin/end balance proven: only begin/case/try
+  recurse (all end-terminated → no over-consumption); degrade never a wrong span.
+  ADVERSARIAL REVIEW CAUGHT a real editor bug the probe could not: `parse_primary_
+  expression` consumed structural terminators, so a half-typed `X := <cursor>end;`
+  swallowed the routine's `end` and extended its scope over the NEXT routine
+  (reliable=true → wrong binding). Fixed (non-consuming on non-expression-starters)
+  + zero-progress guards on expression loops + regression tests.
+- **S3 — Persist + weigh + measure** (commit <this>; format v14→v15). Body is the
+  serialized source of truth; `impl_scopes` de-duplicated to a lazy OnceCell
+  rebuild from the body (disk carries the body ONCE). Weigher counts body nodes.
+  MEMORY (820 units, weigher estimate): interface-only 260MB, with-body 335MB
+  (+29%, ~94KB/unit); compressed on disk 13.3MB total. Bounded by the 256MB moka
+  cap + eviction. Cross-unit interface loads pull bodies too (+29%/import) → **S3b
+  lazy-body split** is a worthwhile, non-urgent follow-up (interface segment loads
+  without the body; body loads on demand only for the active/open unit).
+
+Real code: 98.4% reliable, 0 parse-failed, 17745 routines, 18270 scopes, ~760k
+statement/expr nodes. 310 parser + 118 server tests green.
+
+REMAINING for the semantic layer:
+- **S3b** (optional, memory): lazily-loaded body segment (see above).
+- **S4** — rewire queries onto the body's scope tree + richer occurrences: local/
+  param/nested/anon/method-scope jump+hover directly from the tree; owner-qualified
+  member usages (closes #41). Then the feature slices that BUILD on the AST:
+  completion via receiver typing + cross-unit inheritance flattening (#19/#35),
+  `inherited` navigation + interface↔impl method sync (#40), exact references (#41)
+  → rename (#42).
+
 ## Next iteration start here
 
 ~~Deep type parse~~ DONE (it. 7). ~~Member symbols v5~~ DONE (it. 7).
