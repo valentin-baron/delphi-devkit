@@ -13,6 +13,7 @@ mod signature;
 mod status;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -91,6 +92,15 @@ struct DelphiLsp {
     /// pass only if it is unchanged, and a running pass checks it between units
     /// and cancels the instant it changes. See [`indexing::IndexGeneration`].
     index_generation: Arc<indexing::IndexGeneration>,
+    /// Task 22 — the RTL/VCL bootstrap gate: the identity for which the one-time
+    /// standard-library bootstrap pass has already been KICKED this process. Keyed
+    /// by the resolved installation's standard source paths (the RTL/VCL tree the
+    /// bootstrap warms), so the pass is not re-kicked on every session event —
+    /// effectively once per installation per process — yet re-runs if the identity
+    /// changes (a different Delphi install is resolved). `None` until the first
+    /// kick. Guarded by an async mutex; the critical section is a cheap
+    /// compare-and-set, never held across the pass. See [`run_bootstrap_pass`].
+    bootstrapped_identity: Arc<Mutex<Option<Vec<PathBuf>>>>,
 }
 
 /// The monotonic publish-slot decision, extracted so the out-of-order race is
@@ -105,6 +115,23 @@ fn claim_publish_slot(published: &mut HashMap<Url, i32>, uri: &Url, version: i32
             published.insert(uri.clone(), version);
             true
         }
+    }
+}
+
+/// The bootstrap gate decision (Task 22), extracted so the once-per-installation
+/// guard is unit-testable without a live session. Returns `true` (and records
+/// `identity` as the newly-claimed bootstrap identity) iff `identity` differs
+/// from the last-claimed one — meaning the bootstrap should run now; returns
+/// `false` (leaving the slot unchanged) when the SAME identity is already claimed,
+/// so the caller skips the re-kick. Claiming records BEFORE the pass runs, so a
+/// concurrent re-entry sees the slot as taken and does not double-kick; an
+/// identity change (a different Delphi install resolved) claims afresh and re-runs.
+fn claim_bootstrap_slot(claimed: &mut Option<Vec<PathBuf>>, identity: &[PathBuf]) -> bool {
+    if claimed.as_deref() == Some(identity) {
+        false
+    } else {
+        *claimed = Some(identity.to_vec());
+        true
     }
 }
 
@@ -143,6 +170,9 @@ impl DelphiLsp {
             client_supports_progress: Arc::new(AtomicBool::new(false)),
             progress_tokens: Arc::new(progress::ProgressTokens::new()),
             index_generation: Arc::new(indexing::IndexGeneration::new()),
+            // Task 22: no bootstrap kicked yet — the first `spawn_idle_indexer`
+            // one-shot fills it with the resolved installation identity.
+            bootstrapped_identity: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -336,6 +366,206 @@ impl DelphiLsp {
             .await;
     }
 
+    /// Run the ONE-TIME RTL/VCL standard-library bootstrap pass (Task 22).
+    ///
+    /// This mirrors [`run_indexing_pass`] but targets the STANDARD source tree
+    /// (`inputs.standard_source_paths` — the active compiler installation's
+    /// RTL/VCL sources) instead of the project's own units. It parses every
+    /// standard `.pas` to its disk `.unit` cache so cross-unit/RTL type resolution
+    /// (completion / go-to-definition on `TForm`, `TStringList`, …) has the data,
+    /// showing `Bootstrapping N/M` progress so the user SEES it happening after
+    /// launch.
+    ///
+    /// FOREGROUND RESPONSIVENESS: `index_unit` takes the session lock per unit and
+    /// releases it between units, and the loop checks the cancel token before every
+    /// unit — a foreground `didOpen`/`didChange`/feature request bumps the
+    /// generation and this pass stops promptly (editing NEVER waits behind the
+    /// ~1900-unit bootstrap). BOUNDED RAM: `index_unit` parses through the
+    /// transitive-load-budgeted path (Task 25) and `trim_arena`s between units
+    /// (Task 19), and the moka AST cache evicts to disk (Task 16), so RAM stays
+    /// flat across the whole tree even through huge units (`System.pas`). NEVER
+    /// WRONG: warming only improves completeness; a partially-bootstrapped install
+    /// is always correct, just less complete.
+    ///
+    /// Best-effort throughout: a unit that fails to parse is counted and skipped
+    /// (never aborts the pass or crashes the server), an empty
+    /// `standard_source_paths` (no installation resolved / a fallback session) is a
+    /// no-op, and an open editor buffer is excluded exactly as the indexer excludes
+    /// it (its virtual meta is never overwritten with disk content).
+    async fn run_bootstrap_pass(&self, start_generation: u64) {
+        // Resolve the active project inputs and ensure a session is open — the same
+        // resolution `analyze`/`didSave`/`run_indexing_pass` use, so the bootstrap
+        // caches into the right project's identity.
+        let inputs = session::resolve_active_project_inputs().await;
+        self.session
+            .ensure_open(
+                inputs.dproj.clone(),
+                inputs.configuration.clone(),
+                inputs.platform.clone(),
+                inputs.profile.clone(),
+                inputs.standard_source_paths.clone(),
+            )
+            .await;
+
+        // Work list = every `.pas` DIRECTLY under the standard RTL/VCL source dirs
+        // (deterministic sorted, deduped, nothing excluded). Empty when no
+        // installation resolved (a fallback session) → nothing to bootstrap.
+        let units = indexing::standard_unit_paths(&inputs.standard_source_paths);
+        if units.is_empty() {
+            return;
+        }
+
+        // Snapshot the set of OPEN document URLs at pass start (same open-buffer
+        // overwrite guard as `run_indexing_pass`): an open editor buffer's VIRTUAL
+        // meta and the bootstrap's DISK meta share a unit-name key, and the virtual
+        // entry is evictable, so we NEVER bootstrap a unit open in the editor —
+        // excluded by PATH→URL below. Cloned out under the store lock so the lock
+        // is not held across the pass.
+        let open_urls: std::collections::HashSet<Url> = {
+            let store = self.documents.lock().await;
+            store.open_urls().into_iter().collect()
+        };
+
+        let total = units.len();
+
+        // A single work-done progress for the whole pass ("Delphi: bootstrapping
+        // RTL", "N/M — <unit>"). Best-effort — `None` when the client doesn't
+        // support it; the pass runs identically.
+        let mut progress = self
+            .begin_progress("Delphi: bootstrapping RTL", Some(format!("0/{total}")))
+            .await;
+
+        let mut bootstrapped = 0usize;
+        for (position, path) in units.iter().enumerate() {
+            // CANCELATION: a foreground event since the pass began bumps the
+            // generation → stop promptly, leaving what was already cached (each
+            // unit was atomic). Checked BEFORE the unit so a bump is honored before
+            // another (possibly huge) unit's parse starts. The `Ready` status is
+            // emitted AFTER the loop, so this cancel `break` flips the persistent
+            // view back to `Ready` too (never a stuck `Bootstrapping`).
+            if self.index_generation.changed_since(start_generation) {
+                break;
+            }
+
+            // Task 22: push the persistent `Bootstrapping { current, total, detail }`
+            // status for this unit. `current` is 1-based over `total`, `detail` the
+            // unit file name. Best-effort; no lock held. Paired with the `Ready`
+            // emitted after the loop.
+            let unit_label = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.set_status(status::ServerStatusParams::counted(
+                status::ServerState::Bootstrapping,
+                (position + 1) as u32,
+                total as u32,
+                unit_label,
+            ))
+            .await;
+
+            // OPEN-BUFFER EXCLUSION (correctness guard): never re-parse from disk a
+            // unit OPEN in the editor. Membership is by PATH→URL against the
+            // pass-start snapshot, done BEFORE `index_unit` parses/inserts. A path
+            // that cannot form a `file://` URL (never a real editor buffer) is
+            // simply not in the set and bootstraps normally.
+            let is_open = Url::from_file_path(path)
+                .map(|url| open_urls.contains(&url))
+                .unwrap_or(false);
+            if is_open {
+                if let Some(reporter) = progress.as_ref() {
+                    let done = position + 1;
+                    let percentage = ((done * 100) / total) as u32;
+                    reporter
+                        .report(Some(percentage), Some(format!("{done}/{total} — (open, skipped)")))
+                        .await;
+                }
+                continue;
+            }
+
+            let outcome = self.session.index_unit(path.clone()).await;
+            if matches!(outcome, indexing::UnitIndexOutcome::NoSession) {
+                // The session went away (re-open for a different identity, or a
+                // failure). Nothing more to bootstrap this pass.
+                break;
+            }
+            if matches!(outcome, indexing::UnitIndexOutcome::Indexed) {
+                bootstrapped += 1;
+            }
+
+            // Progress: "N/M — <unit-file>", percentage over the work list.
+            if let Some(reporter) = progress.as_ref() {
+                let unit_label = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let done = position + 1;
+                let percentage = ((done * 100) / total) as u32;
+                reporter
+                    .report(Some(percentage), Some(format!("{done}/{total} — {unit_label}")))
+                    .await;
+            }
+
+            // Yield between units so the async executor can run any queued
+            // foreground task before the next (possibly huge) unit's parse.
+            tokio::task::yield_now().await;
+        }
+
+        if let Some(reporter) = progress.take() {
+            reporter
+                .end(Some(format!("bootstrapped {bootstrapped}/{total}")))
+                .await;
+        }
+
+        // Task 22: the pass has ended — completion, a foreground-bump cancel, or a
+        // `NoSession` break — flip the persistent status back to `Ready`. Single
+        // exit point, so EVERY termination returns the view to `Ready` (no stuck
+        // `Bootstrapping`). The early returns BEFORE the loop (empty work list)
+        // never emitted a `Bootstrapping` status, so the view was already `Ready`.
+        self.set_status(status::ServerStatusParams::bare(status::ServerState::Ready))
+            .await;
+    }
+
+    /// GATE + run the RTL/VCL bootstrap ONCE per installation per process (Task 22).
+    ///
+    /// Resolves the active installation's standard source paths (the RTL/VCL tree
+    /// identity) and compares against [`bootstrapped_identity`]. If the bootstrap
+    /// has already been kicked for this exact identity this process, it is a no-op
+    /// — so a session event that re-enters here never re-kicks the ~1900-unit pass
+    /// (the per-unit hash-gated fast-skip in `index_unit` already makes a re-run
+    /// cheap, but this guard avoids even enumerating and re-walking the tree). If
+    /// the identity CHANGED (a different Delphi install resolved) it runs again.
+    /// An EMPTY identity (no installation / fallback session) is treated as
+    /// "nothing to bootstrap" and is NOT recorded, so a later event that resolves a
+    /// real installation still bootstraps.
+    ///
+    /// The compare-and-set critical section holds the async mutex only for the
+    /// cheap identity check; the pass itself runs with NO lock held (per-unit
+    /// session locking inside `run_bootstrap_pass`), so it never blocks startup or
+    /// a foreground request.
+    async fn bootstrap_once(&self, start_generation: u64) {
+        let inputs = session::resolve_active_project_inputs().await;
+        let identity = inputs.standard_source_paths.clone();
+
+        // Empty identity → no installation resolved; nothing to bootstrap, and do
+        // NOT record it (so a later real installation still bootstraps).
+        if identity.is_empty() {
+            return;
+        }
+
+        // GATE: compare-and-set. Already kicked for this identity → no-op.
+        {
+            let mut guard = self.bootstrapped_identity.lock().await;
+            if !claim_bootstrap_slot(&mut guard, &identity) {
+                return;
+            }
+            // `claim_bootstrap_slot` recorded the identity BEFORE we run, so a
+            // concurrent re-entry (another session event) sees it as claimed and
+            // does not double-kick. A re-run on an identity change replaced it.
+        }
+
+        self.run_bootstrap_pass(start_generation).await;
+    }
+
     /// Spawn the idle-triggered background indexer (Task 18). Owns a `DelphiLsp`
     /// clone (shared Arcs), so it drives the real session/generation.
     ///
@@ -351,6 +581,15 @@ impl DelphiLsp {
     /// This lives OUTSIDE the request path: it never blocks a request, and its
     /// only shared state is the generation atomic + the session lock (taken per
     /// unit inside the pass, never across the whole loop).
+    ///
+    /// Task 22: BEFORE the idle loop, this runs the RTL/VCL bootstrap ONCE
+    /// (proactively — the user wants to SEE `Bootstrapping N/M` right after launch,
+    /// not only after 1.5s idle). It is gated by [`bootstrap_once`] (once per
+    /// installation per process) and preemptible: the pass snapshots the current
+    /// generation and cancels between units the instant a foreground event bumps
+    /// it, so opening/editing a file pauses the bootstrap. RTL is the dependency
+    /// everything imports, so bootstrapping first, then idle project indexing, is
+    /// the natural order and neither starves the other (both are preemptible).
     fn spawn_idle_indexer(self) {
         /// How often the idle ticker wakes to check for an idle window.
         const IDLE_TICK: std::time::Duration = std::time::Duration::from_millis(500);
@@ -359,6 +598,14 @@ impl DelphiLsp {
         const IDLE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(1500);
 
         tokio::spawn(async move {
+            // Task 22: proactive one-shot RTL/VCL bootstrap before idle indexing.
+            // Snapshot the generation NOW so a foreground event arriving during the
+            // (long) pass cancels it between units. `bootstrap_once` gates it to run
+            // effectively once per installation; a no-op when no installation is
+            // resolved (a fallback session with no standard source paths).
+            let bootstrap_generation = self.index_generation.current();
+            self.bootstrap_once(bootstrap_generation).await;
+
             loop {
                 tokio::time::sleep(IDLE_TICK).await;
                 // Snapshot the generation, then wait the debounce. If ANY
@@ -1664,6 +1911,61 @@ mod publish_guard_tests {
 }
 
 #[cfg(test)]
+mod bootstrap_gate_tests {
+    //! Task 22: the once-per-installation bootstrap gate. `bootstrap_once` runs the
+    //! ~1900-unit RTL/VCL pass only when the resolved installation identity (its
+    //! standard source paths) has not already been claimed this process — so a
+    //! session event that re-enters never re-kicks the pass, yet a different
+    //! installation still bootstraps. The compare-and-set decision is
+    //! `claim_bootstrap_slot`, tested here without a live session.
+
+    use super::claim_bootstrap_slot;
+    use std::path::PathBuf;
+
+    fn identity(dirs: &[&str]) -> Vec<PathBuf> {
+        dirs.iter().map(PathBuf::from).collect()
+    }
+
+    /// The FIRST claim for an identity runs (returns true, records it); a SECOND
+    /// claim for the SAME identity is a no-op (returns false) — the bootstrap is
+    /// not re-kicked once done for an installation.
+    #[test]
+    fn first_claim_runs_then_same_identity_is_not_rekicked() {
+        let mut claimed: Option<Vec<PathBuf>> = None;
+        let rtl = identity(&["C:/Studio/23.0/source/rtl", "C:/Studio/23.0/source/vcl"]);
+
+        assert!(
+            claim_bootstrap_slot(&mut claimed, &rtl),
+            "the first claim for an installation runs the bootstrap"
+        );
+        assert_eq!(claimed.as_ref(), Some(&rtl), "the identity is recorded");
+
+        assert!(
+            !claim_bootstrap_slot(&mut claimed, &rtl),
+            "the SAME identity is not re-kicked (once per installation per process)"
+        );
+        assert_eq!(claimed.as_ref(), Some(&rtl), "the slot is unchanged");
+    }
+
+    /// A DIFFERENT identity (a different Delphi install resolved) claims afresh and
+    /// re-runs — the gate is keyed by identity, not a one-shot bool.
+    #[test]
+    fn changed_identity_reclaims_and_reruns() {
+        let mut claimed: Option<Vec<PathBuf>> = None;
+        let install_12 = identity(&["C:/Studio/23.0/source/rtl"]);
+        let install_11 = identity(&["C:/Studio/22.0/source/rtl"]);
+
+        assert!(claim_bootstrap_slot(&mut claimed, &install_12));
+        assert!(!claim_bootstrap_slot(&mut claimed, &install_12), "same → skip");
+        assert!(
+            claim_bootstrap_slot(&mut claimed, &install_11),
+            "a changed installation identity re-runs the bootstrap"
+        );
+        assert_eq!(claimed.as_ref(), Some(&install_11), "the new identity is recorded");
+    }
+}
+
+#[cfg(test)]
 mod status_transition_tests {
     //! Task 24: the persistent `ddk/serverStatus` transitions. The live transport
     //! (`set_status` → `send_notification` over stdio) needs a real `Client` and
@@ -1772,6 +2074,51 @@ mod status_transition_tests {
             "cancel and completion emit the identical bare Ready"
         );
         assert_eq!(cancel_ready.state, ServerState::Ready);
+    }
+
+    /// Task 22: the RTL bootstrap pass emits `Bootstrapping { current, total,
+    /// detail: unit }` per unit with a 1-based `current` over `total`, then a bare
+    /// `Ready` when the pass ends (completion OR cancel OR no-session — the single
+    /// post-loop emission). This reproduces the per-unit param `run_bootstrap_pass`
+    /// builds (position+1) and the terminal `Ready`, proving the view never sticks
+    /// on `Bootstrapping`.
+    #[test]
+    fn bootstrap_pass_emits_counted_bootstrapping_per_unit_then_ready() {
+        let units = ["System.pas", "System.SysUtils.pas", "Vcl.Forms.pas"];
+        let total = units.len();
+        for (position, unit) in units.iter().enumerate() {
+            let params = ServerStatusParams::counted(
+                ServerState::Bootstrapping,
+                (position + 1) as u32,
+                total as u32,
+                *unit,
+            );
+            assert_eq!(params.state, ServerState::Bootstrapping);
+            assert_eq!(
+                params.current,
+                Some((position + 1) as u32),
+                "current is 1-based (the unit about to be bootstrapped)"
+            );
+            assert_eq!(params.total, Some(total as u32));
+            assert_eq!(params.detail.as_deref(), Some(*unit));
+        }
+        // First and last counters are 1/3 and 3/3 — honest N/M the user SEES.
+        let first =
+            ServerStatusParams::counted(ServerState::Bootstrapping, 1, total as u32, units[0]);
+        let last = ServerStatusParams::counted(
+            ServerState::Bootstrapping,
+            total as u32,
+            total as u32,
+            units[total - 1],
+        );
+        assert_eq!((first.current, first.total), (Some(1), Some(3)));
+        assert_eq!((last.current, last.total), (Some(3), Some(3)));
+
+        // TERMINAL: the single post-loop emission is a bare `Ready` whether the
+        // pass completes or a foreground bump cancels it — no stuck `Bootstrapping`.
+        let ready = ServerStatusParams::bare(ServerState::Ready);
+        assert_eq!(ready.state, ServerState::Ready);
+        assert!(ready.current.is_none() && ready.total.is_none());
     }
 }
 

@@ -1499,4 +1499,70 @@ mod tests {
             "the virtual unit is dropped as unreadable on load: {report:?}"
         );
     }
+
+    // ─── Task 22: RTL/VCL bootstrap ─────────────────────────────────────
+    //
+    // These drive the composable pieces of `run_bootstrap_pass` — the standard
+    // work-list enumerator plus the per-unit `index_unit` warm — against a
+    // fallback session whose search path AND snapshot base is a temp directory
+    // standing in for the RTL/VCL `source` tree. The live pass loop itself
+    // resolves ddk-core installation state and cannot run headless; these
+    // exercise its worker seam exactly as the Task-18 tests do for indexing.
+
+    /// A bootstrap pass over a directory of standard `.pas` units caches/persists
+    /// every one (a `Done` entry + a snapshot `.bin`), and a RE-RUN skips them all
+    /// AlreadyFresh (the hash-gated fast-skip that makes the bootstrap effectively
+    /// once-per-installation). This drives `standard_unit_paths` (the enumerator)
+    /// then `index_unit` per unit — the exact seam `run_bootstrap_pass` runs.
+    #[tokio::test]
+    async fn bootstrap_caches_all_standard_units_and_reruns_skip_fresh() {
+        let base = fresh_snapshot_base("bootstrap-caches");
+        // Stand in for the RTL/VCL source tree: a handful of standalone units with
+        // dotted (RTL-style) names.
+        for name in ["System.Classes", "System.SysUtils", "Vcl.Controls", "Vcl.Forms"] {
+            std::fs::write(
+                base.join(format!("{name}.pas")),
+                format!("unit {name};\ninterface\ntype T{{}} = class end;\nimplementation\nend.")
+                    .replace("T{}", "TExported"),
+            )
+            .unwrap();
+        }
+
+        // The bootstrap work-list enumerator over the standard source dir: sorted,
+        // deduped, nothing excluded.
+        let units = crate::indexing::standard_unit_paths(&[base.clone()]);
+        assert_eq!(units.len(), 4, "all four standard units enumerated: {units:?}");
+
+        let manager = SessionManager::new();
+        manager
+            .inject_session_for_test(build_fallback_session_with_snapshot_base(base.clone()))
+            .await;
+
+        // COLD bootstrap: every standard unit is freshly Indexed (parsed + cached).
+        let mut bootstrapped = 0;
+        for path in &units {
+            match manager.index_unit(path.clone()).await {
+                UnitIndexOutcome::Indexed => bootstrapped += 1,
+                other => panic!("cold bootstrap should Index {path:?}, got {other:?}"),
+            }
+        }
+        assert_eq!(bootstrapped, units.len(), "every standard unit bootstrapped");
+
+        // Persistence: the .unit cache snapshot lands on disk.
+        manager.save_now().await.expect("save").expect("session open");
+        assert!(
+            snapshot_written(&base),
+            "the bootstrapped standard units persist to a snapshot"
+        );
+
+        // RE-RUN (idempotent): a second pass skips every unit as AlreadyFresh — the
+        // hash-gated fast-skip that makes re-kicking the bootstrap cheap.
+        for path in &units {
+            assert_eq!(
+                manager.index_unit(path.clone()).await,
+                UnitIndexOutcome::AlreadyFresh,
+                "a re-run of the bootstrap skips already-fresh {path:?}"
+            );
+        }
+    }
 }

@@ -146,6 +146,28 @@ pub fn project_unit_paths(
     units.into_iter().collect()
 }
 
+/// Enumerate the STANDARD RTL/VCL source `.pas` units to bootstrap (Task 22):
+/// every `.pas` DIRECTLY under each `standard_source_directory` (deduplicated,
+/// deterministically sorted). Unlike [`project_unit_paths`], nothing is
+/// excluded — these dirs ARE the standard library tree we want to warm.
+///
+/// This is the one-time-per-installation RTL bootstrap's work list: the
+/// `standard_source_paths` the active compiler installation resolves to (each a
+/// directory that DIRECTLY contains `.pas` units, as
+/// [`session::standard_source_paths`](crate::session) already recursed the
+/// `source` tree down to the leaf `.pas`-bearing dirs). It is implemented on top
+/// of [`project_unit_paths`] with an EMPTY exclude set, so it inherits the same
+/// determinism (`BTreeSet`-sorted), dedup (by canonical path), only-immediate
+/// (`.pas`-only, no recursion — the dir list is already the recursed leaf set),
+/// and `.dpr`/`.dpk` exclusion.
+///
+/// Empty input (no installation resolved / a fallback session with no standard
+/// source paths) → an empty list, so the bootstrap pass is a no-op.
+pub fn standard_unit_paths(standard_source_directories: &[PathBuf]) -> Vec<PathBuf> {
+    // No exclusions: the standard source dirs are exactly what we bootstrap.
+    project_unit_paths(standard_source_directories, &[])
+}
+
 /// Whether `path` is a Delphi unit source file (`.pas`, case-insensitive). Only
 /// `.pas` is a unit; `.dpr`/`.dpk` are program/package sources (not importable
 /// units) and are excluded from the indexing work list.
@@ -259,6 +281,54 @@ mod tests {
         let mut sorted = stems.clone();
         sorted.sort();
         assert_eq!(stems, sorted, "deterministic sorted order");
+    }
+
+    #[test]
+    fn standard_unit_paths_enumerates_sorted_deduped_and_empty_for_empty_input() {
+        // Empty input → empty list, so the bootstrap pass is a no-op.
+        assert!(
+            standard_unit_paths(&[]).is_empty(),
+            "no standard source dirs → nothing to bootstrap"
+        );
+
+        let root = std::env::temp_dir()
+            .join("ddk-bootstrap-enum")
+            .join(format!("{}", std::process::id()));
+        let rtl = root.join("rtl");
+        let vcl = root.join("vcl");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&rtl).unwrap();
+        std::fs::create_dir_all(&vcl).unwrap();
+
+        std::fs::write(rtl.join("System.pas"), "unit System; end.").unwrap();
+        std::fs::write(rtl.join("System.SysUtils.pas"), "unit System.SysUtils; end.").unwrap();
+        std::fs::write(vcl.join("Vcl.Forms.pas"), "unit Vcl.Forms; end.").unwrap();
+        std::fs::write(vcl.join("Vcl.Forms.PAS.bak"), "not a unit").unwrap(); // not .pas
+        std::fs::write(vcl.join("Design.dpk"), "package Design; end.").unwrap(); // not a unit
+
+        // The SAME dir listed twice must not double-count (dedup by canonical
+        // path), and NOTHING is excluded (empty exclude set).
+        let units = standard_unit_paths(&[rtl.clone(), vcl.clone(), rtl.clone()]);
+        let stems: BTreeSet<String> = units.iter().map(|p| unit_stem(p).unwrap()).collect();
+
+        assert_eq!(
+            units.len(),
+            3,
+            "exactly the three .pas RTL/VCL units, deduped (no .dpk/.bak): {units:?}"
+        );
+        assert!(stems.contains("System"));
+        assert!(stems.contains("System.SysUtils"));
+        assert!(stems.contains("Vcl.Forms"));
+
+        // Sorted by path (the enumerator's `BTreeSet<PathBuf>` order) — a stable,
+        // deterministic order across runs.
+        let mut sorted = units.clone();
+        sorted.sort();
+        assert_eq!(units, sorted, "deterministic sorted-by-path order");
+
+        // Deterministic across calls.
+        let again = standard_unit_paths(&[rtl.clone(), vcl.clone()]);
+        assert_eq!(units, again, "deterministic across calls");
     }
 
     #[test]
