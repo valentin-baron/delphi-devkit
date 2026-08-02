@@ -13,6 +13,7 @@
 //! linker ([`dfm_link`]), and the LSP query API ([`query`]) sit on top.
 
 pub mod ast;
+pub mod ast_impl;
 pub mod cache_store;
 pub mod context;
 pub mod ddk;

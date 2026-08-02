@@ -12,6 +12,7 @@ use crate::ast::{
     Source, StructuredKind, StructuredType, TypeExpression, Unit, UsedUnit, UsesDeclarations,
     VariantArm, VariantPart, Visibility, VisibilitySection,
 };
+use crate::ast_impl::{BinaryOperator, Expression, UnaryOperator};
 use crate::context::{Identifier, ProjectContext};
 use crate::meta::{CodeLocation, FileId, Span};
 use crate::source::{FileReadError, SourceArena};
@@ -220,7 +221,7 @@ pub fn parse_path(
     parse_file(arena, context, file)
 }
 
-struct UnitParser<'arena> {
+pub(crate) struct UnitParser<'arena> {
     cursor: TokenCursor<'arena>,
     /// Current grammar nesting depth (see [`MAX_PARSE_DEPTH`]).
     depth: usize,
@@ -4286,6 +4287,559 @@ fn unquote_string_literal(literal: &str) -> String {
         .and_then(|inner| inner.strip_suffix('\''))
         .unwrap_or(literal)
         .replace("''", "'")
+}
+
+// ─── Expression parser (Stage S1) ───────────────────────────────────────────
+//
+// A precedence-climbing (Pratt) parser over the existing `TokenCursor`, building
+// the `crate::ast_impl::Expression` tree. Standalone in S1: driven only by the
+// test entry point below; S2 wires it into statement/scope parsing.
+//
+// OCCURRENCE RECORDING — single source of truth: every identifier-like lexeme
+// the expression parser steps over is fed through `emit_impl_usage` (the SAME
+// path the flat impl scan uses), so the flat `usages` reference index stays
+// complete regardless of the expression structure recognized on top. The built
+// `Expression` tree is a SECOND, richer view of the same tokens — it is never the
+// occurrence source in S1.
+//
+// DELPHI OPERATOR PRECEDENCE (Embarcadero "Operator Precedence" table),
+// highest-binding first. The Pratt loop treats each binary level as
+// left-associative:
+//
+//   level 4 (tightest, unary):     @  not  unary +  unary -   [and postfix ^]
+//   level 3 (multiplicative):      *  /  div  mod  and  shl  shr  as
+//   level 2 (additive):            +  -  or  xor
+//   level 1 (loosest, relational): =  <>  <  >  <=  >=  in  is
+//
+// `as` sits at the multiplicative level but yields a `Cast` node (not a
+// `Binary`); `is` sits at the relational level and yields `Binary(Is)`.
+//
+// S1 STANDALONE: these methods are driven only by the test entry point below;
+// S2 (statement/scope parser) is the first non-test caller. `allow(dead_code)`
+// keeps the S1 commit warning-clean until then.
+#[allow(dead_code)]
+impl UnitParser<'_> {
+    /// Numeric binding power of a binary operator level; higher binds tighter.
+    /// `0` means "not a binary operator here" (stop climbing). Unary/postfix
+    /// operators are handled separately (they bind tighter than every level).
+    fn binary_binding_power(token: Token) -> u8 {
+        use Token::*;
+        match token {
+            // level 3 — multiplicative (`as` shares this level, handled apart)
+            Star | Slash | Div | Mod | And | Shl | Shr | As => 3,
+            // level 2 — additive
+            Plus | Minus | Or | Xor => 2,
+            // level 1 — relational
+            Eq | NEq | Lt | Gt | LtEq | GtEq | In | Is => 1,
+            _ => 0,
+        }
+    }
+
+    /// Map a binary operator token to its [`BinaryOperator`]. Only called for
+    /// tokens whose binding power is non-zero and which are not `as`.
+    fn binary_operator_of(token: Token) -> BinaryOperator {
+        use Token as T;
+        match token {
+            T::Star => BinaryOperator::Multiply,
+            T::Slash => BinaryOperator::Divide,
+            T::Div => BinaryOperator::IntegerDivide,
+            T::Mod => BinaryOperator::Modulo,
+            T::And => BinaryOperator::And,
+            T::Shl => BinaryOperator::ShiftLeft,
+            T::Shr => BinaryOperator::ShiftRight,
+            T::Plus => BinaryOperator::Add,
+            T::Minus => BinaryOperator::Subtract,
+            T::Or => BinaryOperator::Or,
+            T::Xor => BinaryOperator::Xor,
+            T::Eq => BinaryOperator::Equal,
+            T::NEq => BinaryOperator::NotEqual,
+            T::Lt => BinaryOperator::Less,
+            T::Gt => BinaryOperator::Greater,
+            T::LtEq => BinaryOperator::LessEqual,
+            T::GtEq => BinaryOperator::GreaterEqual,
+            T::In => BinaryOperator::In,
+            T::Is => BinaryOperator::Is,
+            other => unreachable!("binary_operator_of on non-binary token {other:?}"),
+        }
+    }
+
+    /// Parse a whole expression at the loosest precedence. The public S1 entry
+    /// point (statement/scope parsing in S2 will call this per operand position).
+    pub(crate) fn parse_expression(&mut self) -> Result<Expression, ParseError> {
+        self.parse_binary_expression(1)
+    }
+
+    /// Precedence-climbing core: parse a unary/primary operand, then fold in
+    /// binary operators whose binding power is `>= minimum_power`. Left-assoc:
+    /// the right operand is parsed at `power + 1`.
+    fn parse_binary_expression(
+        &mut self,
+        minimum_power: u8,
+    ) -> Result<Expression, ParseError> {
+        self.enter_depth()?;
+        let result = (|| {
+            let mut left = self.parse_unary_expression()?;
+            loop {
+                let Some(token) = self.peek_token()? else {
+                    break;
+                };
+                let power = Self::binary_binding_power(token);
+                if power == 0 || power < minimum_power {
+                    break;
+                }
+                // `as` is a cast, not a binary node — consume it and wrap.
+                if token == Token::As {
+                    self.cursor.advance()?; // 'as'
+                    let type_name = self.parse_type_reference_name()?;
+                    left = Expression::Cast {
+                        type_name,
+                        operand: Box::new(left),
+                    };
+                    continue;
+                }
+                self.cursor.advance()?; // the operator
+                let operator = Self::binary_operator_of(token);
+                let right = self.parse_binary_expression(power + 1)?;
+                left = Expression::Binary {
+                    operator,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                };
+            }
+            Ok(left)
+        })();
+        self.exit_depth();
+        result
+    }
+
+    /// Parse a prefix-unary operator chain (`@ not - +`) then a primary with its
+    /// postfix chain. Prefix operators bind looser than postfixes, so `@a.b` is
+    /// `@(a.b)` (the postfix `.b` attaches to `a` first, matching Delphi).
+    fn parse_unary_expression(&mut self) -> Result<Expression, ParseError> {
+        let operator = match self.peek_token()? {
+            Some(Token::At_) => Some(UnaryOperator::AddressOf),
+            Some(Token::Not) => Some(UnaryOperator::Not),
+            Some(Token::Minus) => Some(UnaryOperator::Negate),
+            Some(Token::Plus) => Some(UnaryOperator::Plus),
+            _ => None,
+        };
+        if let Some(operator) = operator {
+            self.cursor.advance()?; // the prefix operator
+            let operand = self.parse_unary_expression()?;
+            return Ok(Expression::Unary {
+                operator,
+                operand: Box::new(operand),
+            });
+        }
+        self.parse_postfix_expression()
+    }
+
+    /// Parse a primary then apply postfix operators (`.member`, `(args)`,
+    /// `[indices]`, `^` deref) in a loop until none applies. This is what builds
+    /// `a.b(c)[d].e` as a correctly-nested receiver chain.
+    fn parse_postfix_expression(&mut self) -> Result<Expression, ParseError> {
+        let mut expression = self.parse_primary_expression()?;
+        loop {
+            match self.peek_token()? {
+                Some(Token::Dot) => {
+                    self.cursor.advance()?; // '.'
+                    match self.take_name_occurrence()? {
+                        Some(member) => {
+                            expression = Expression::Member {
+                                receiver: Box::new(expression),
+                                member,
+                            };
+                        }
+                        // Malformed `a . <non-name>`: degrade locally — keep the
+                        // receiver, stop the chain. The offending `.` is already
+                        // consumed (>=1 token progress), so no infinite loop.
+                        None => break,
+                    }
+                }
+                Some(Token::LParen) => {
+                    let (arguments, arguments_span) = self.parse_argument_list()?;
+                    expression = Expression::Call {
+                        callee: Box::new(expression),
+                        arguments,
+                        arguments_span,
+                    };
+                }
+                Some(Token::LBracket) => {
+                    let indices = self.parse_index_list()?;
+                    expression = Expression::Index {
+                        base: Box::new(expression),
+                        indices,
+                    };
+                }
+                Some(Token::Caret) => {
+                    self.cursor.advance()?; // '^'
+                    expression = Expression::Unary {
+                        operator: UnaryOperator::Dereference,
+                        operand: Box::new(expression),
+                    };
+                }
+                _ => break,
+            }
+        }
+        Ok(expression)
+    }
+
+    /// Parse a primary expression: a literal, `nil`, `(expr)`, `[set/array]`, an
+    /// identifier, `inherited [name]`, or an anonymous-method opener.
+    fn parse_primary_expression(&mut self) -> Result<Expression, ParseError> {
+        let Some(lexeme) = self.cursor.peek()? else {
+            // EOF where an operand is required: best-effort empty-span literal so
+            // the caller resyncs rather than the whole parse aborting.
+            return Ok(Expression::Literal(self.cursor.last_location()));
+        };
+        match lexeme.token {
+            // Opaque literal leaves.
+            Token::IntLiteral
+            | Token::FloatLiteral
+            | Token::StringLiteral
+            | Token::CharLiteral
+            | Token::Nil
+            | Token::True
+            | Token::False => {
+                self.cursor.advance()?;
+                Ok(Expression::Literal(lexeme.location))
+            }
+            // Parenthesized sub-expression.
+            Token::LParen => {
+                self.cursor.advance()?; // '('
+                let inner = self.parse_expression()?;
+                // Tolerate a missing ')' — consume it when present, else degrade
+                // locally (the inner expression already advanced the cursor).
+                if self.peek_token()? == Some(Token::RParen) {
+                    self.cursor.advance()?;
+                }
+                Ok(Expression::Parenthesized(Box::new(inner)))
+            }
+            // Set / array-constructor literal: capture the balanced bracket span,
+            // still emitting identifier occurrences inside for the reference index.
+            Token::LBracket => self.parse_set_or_array_literal(),
+            // `inherited` / `inherited Method`.
+            Token::Inherited => {
+                self.cursor.advance()?; // 'inherited'
+                let method = self.take_name_occurrence()?;
+                Ok(Expression::Inherited { method })
+            }
+            // Anonymous-method opener in expression position.
+            Token::Procedure | Token::Function | Token::Reference => {
+                self.parse_anonymous_method_opaque()
+            }
+            // A bare (single-part) name — the postfix loop stitches on `.member`.
+            token if token.can_be_identifier() => {
+                self.cursor.advance()?;
+                let name = self.name_from_lexeme(lexeme);
+                Ok(Expression::Identifier(name))
+            }
+            // Unexpected token where a primary is required: degrade to an opaque
+            // literal over the offending span. Consume exactly one token to
+            // guarantee forward progress (never loop forever).
+            _ => {
+                self.cursor.advance()?;
+                Ok(Expression::Literal(lexeme.location))
+            }
+        }
+    }
+
+    /// Take one identifier-like name at the current position, recording it as a
+    /// usage occurrence. `None` when the current token is not identifier-like
+    /// (the caller degrades). A single part only — dotted access is built as
+    /// nested `Member` nodes by the postfix loop.
+    fn take_name_occurrence(&mut self) -> Result<Option<QualifiedName>, ParseError> {
+        let Some(lexeme) = self.cursor.peek()? else {
+            return Ok(None);
+        };
+        if !lexeme.token.can_be_identifier() {
+            return Ok(None);
+        }
+        self.cursor.advance()?;
+        Ok(Some(self.name_from_lexeme(lexeme)))
+    }
+
+    /// Build a single-part `QualifiedName` from an already-consumed identifier
+    /// lexeme, recording the usage occurrence (single source of truth).
+    fn name_from_lexeme(&mut self, lexeme: Lexeme) -> QualifiedName {
+        let key = self.emit_impl_usage(lexeme);
+        let name = {
+            let text = self.identifier_text(lexeme);
+            self.cursor.state().context.intern(text)
+        };
+        QualifiedName {
+            name,
+            key,
+            location: lexeme.location,
+        }
+    }
+
+    /// A type reference after `as`: a (possibly dotted) name. Recorded as an
+    /// occurrence like any other name. Dotted `as Unit.TFoo` is folded into one
+    /// `QualifiedName` (the whole reference), unlike value member access.
+    fn parse_type_reference_name(&mut self) -> Result<QualifiedName, ParseError> {
+        let Some(first) = self.take_name_occurrence()? else {
+            // `x as <junk>`: degrade to an empty-span synthetic name so the Cast
+            // still forms and the caller resyncs.
+            let location = self.cursor.last_location();
+            let empty = self.cursor.state().context.intern("");
+            return Ok(QualifiedName {
+                name: empty,
+                key: empty,
+                location,
+            });
+        };
+        let mut result = first;
+        while self.peek_token()? == Some(Token::Dot) {
+            self.cursor.advance()?; // '.'
+            let Some(part) = self.take_name_occurrence()? else {
+                break;
+            };
+            // Extend the span to cover the whole dotted reference; keep the last
+            // part's key/name as the reference target's leaf (good enough for S1;
+            // S2 refines type-reference modelling).
+            let start = result.location.span.start;
+            let location = if result.location.file == part.location.file {
+                CodeLocation {
+                    file: result.location.file,
+                    span: Span {
+                        start,
+                        end: part.location.span.end,
+                    },
+                }
+            } else {
+                result.location
+            };
+            result = QualifiedName {
+                name: part.name,
+                key: part.key,
+                location,
+            };
+        }
+        Ok(result)
+    }
+
+    /// Parse a `(...)` argument list (the `(` at the cursor). Returns the parsed
+    /// argument expressions and the span of the whole `(...)` group. Tolerant of
+    /// a missing `)` (degrades at EOF).
+    fn parse_argument_list(
+        &mut self,
+    ) -> Result<(Vec<Expression>, CodeLocation), ParseError> {
+        let open = self.cursor.advance()?.expect("peeked '('");
+        let file = open.location.file;
+        let start = open.location.span.start;
+        let mut arguments = Vec::new();
+        // Empty argument list `()`.
+        if self.peek_token()? == Some(Token::RParen) {
+            let close = self.cursor.advance()?.expect("peeked ')'");
+            return Ok((arguments, Self::span_between(file, start, close.location)));
+        }
+        loop {
+            arguments.push(self.parse_expression()?);
+            match self.peek_token()? {
+                Some(Token::Comma) => {
+                    self.cursor.advance()?;
+                    continue;
+                }
+                Some(Token::RParen) => {
+                    let close = self.cursor.advance()?.expect("peeked ')'");
+                    return Ok((arguments, Self::span_between(file, start, close.location)));
+                }
+                // Malformed argument list: stop at the last position, degrade
+                // locally. The last consumed token anchors the group span.
+                _ => {
+                    return Ok((
+                        arguments,
+                        Self::span_between(file, start, self.cursor.last_location()),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Parse a `[...]` index list (the `[` at the cursor). Returns the index
+    /// expressions (`a[i, j]` → two). Tolerant of a missing `]`.
+    fn parse_index_list(&mut self) -> Result<Vec<Expression>, ParseError> {
+        self.cursor.advance()?; // '['
+        let mut indices = Vec::new();
+        if self.peek_token()? == Some(Token::RBracket) {
+            self.cursor.advance()?;
+            return Ok(indices);
+        }
+        loop {
+            indices.push(self.parse_expression()?);
+            match self.peek_token()? {
+                Some(Token::Comma) => {
+                    self.cursor.advance()?;
+                    continue;
+                }
+                Some(Token::RBracket) => {
+                    self.cursor.advance()?;
+                    return Ok(indices);
+                }
+                _ => return Ok(indices), // degrade locally
+            }
+        }
+    }
+
+    /// Capture a `[...]` set/array-constructor literal as one balanced-bracket
+    /// span, still emitting an occurrence for every identifier-like token inside
+    /// (so the reference index stays complete). The `[` is at the cursor.
+    fn parse_set_or_array_literal(&mut self) -> Result<Expression, ParseError> {
+        let open = self.cursor.advance()?.expect("peeked '['");
+        let file = open.location.file;
+        let start = open.location.span.start;
+        let mut depth = 1usize;
+        let mut end_location = open.location;
+        while depth > 0 {
+            let Some(lexeme) = self.cursor.advance()? else {
+                break; // EOF: degrade to the span captured so far
+            };
+            end_location = lexeme.location;
+            match lexeme.token {
+                Token::LBracket => depth += 1,
+                Token::RBracket => depth -= 1,
+                other if other.can_be_identifier() => {
+                    self.emit_impl_usage(lexeme);
+                }
+                _ => {}
+            }
+        }
+        Ok(Expression::SetOrArrayLiteral(Self::span_between(
+            file,
+            start,
+            end_location,
+        )))
+    }
+
+    /// Capture an anonymous-method opener (`procedure`/`function`, optionally
+    /// preceded by `reference to`) through its matching `end` as one opaque span,
+    /// balancing `begin`/`case`/`try`/…`end` nesting. Identifier occurrences
+    /// inside are still emitted so the reference index stays complete.
+    //
+    // S2: replace with a real child `Scope` parse.
+    fn parse_anonymous_method_opaque(&mut self) -> Result<Expression, ParseError> {
+        let opener = self.cursor.advance()?.expect("peeked opener");
+        let file = opener.location.file;
+        let start = opener.location.span.start;
+        let mut end_location = opener.location;
+        // `reference to procedure/function …`
+        if opener.token == Token::Reference {
+            if self.peek_token()? == Some(Token::To) {
+                end_location = self.cursor.advance()?.expect("peeked 'to'").location;
+            }
+            if matches!(
+                self.peek_token()?,
+                Some(Token::Procedure) | Some(Token::Function)
+            ) {
+                end_location = self.cursor.advance()?.expect("peeked keyword").location;
+            }
+        }
+        // Scan to the matching `end`, tracking block-opener depth. The header
+        // (params/return type) precedes the first block opener; the routine's own
+        // `begin` (or `asm`) is the first block. We require a block to open before
+        // an `end` matches, so a bare `function(...): T` header without a body
+        // (rare, malformed in expression position) degrades cleanly at the next
+        // structural boundary rather than mis-swallowing.
+        let mut depth: usize = 0;
+        let mut saw_block = false;
+        loop {
+            let Some(lexeme) = self.cursor.peek()? else {
+                break; // EOF: degrade to span so far
+            };
+            match lexeme.token {
+                Token::Begin
+                | Token::Case
+                | Token::Try
+                | Token::Asm
+                | Token::Record
+                | Token::Class
+                | Token::Object
+                | Token::Interface => {
+                    depth += 1;
+                    saw_block = true;
+                    end_location = self.cursor.advance()?.expect("peeked").location;
+                }
+                Token::End => {
+                    end_location = self.cursor.advance()?.expect("peeked").location;
+                    if saw_block {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        // an `end` before any block opener — malformed; stop here
+                        break;
+                    }
+                }
+                other => {
+                    let advanced = self.cursor.advance()?.expect("peeked");
+                    end_location = advanced.location;
+                    if other.can_be_identifier() {
+                        self.emit_impl_usage(advanced);
+                    }
+                }
+            }
+        }
+        Ok(Expression::AnonymousMethodOpaque(Self::span_between(
+            file,
+            start,
+            end_location,
+        )))
+    }
+
+    /// A `CodeLocation` spanning from byte `start` (in `file`) through the end of
+    /// `last`'s span. Used to stamp group spans (`(...)`, `[...]`, closures).
+    fn span_between(file: FileId, start: u32, last: CodeLocation) -> CodeLocation {
+        let end = if last.file == file {
+            last.span.end
+        } else {
+            start // group split across an include boundary — collapse to a point
+        };
+        CodeLocation {
+            file,
+            span: Span { start, end },
+        }
+    }
+
+    /// Test-only entry point: build a `UnitParser` over a virtual source snippet
+    /// and parse a single expression from it. Mirrors the cursor construction the
+    /// other parser tests use.
+    #[cfg(test)]
+    pub(crate) fn parse_expression_for_test(source: &str) -> Expression {
+        use crate::context::{DefineSet, SwitchState, TargetPlatform};
+        use crate::unit_cache::UnitCache;
+        use std::collections::HashMap;
+
+        let context = Arc::new(ProjectContext {
+            configuration: "Debug".to_string(),
+            platform_name: "Win32".to_string(),
+            platform: TargetPlatform::Win32,
+            compiler_version: 36.0,
+            rtl_version: 36.0,
+            base_defines: DefineSet::default(),
+            search_paths: Vec::new(),
+            include_paths: Vec::new(),
+            namespaces: Vec::new(),
+            unit_aliases: HashMap::new(),
+            default_switches: SwitchState::default(),
+            unit_cache: UnitCache::default(),
+        });
+        let arena = crate::globals::arena();
+        let file = arena.insert_virtual("expr_test.pas", source);
+        let cursor = TokenCursor::new(arena, context, file);
+        let mut parser = UnitParser {
+            cursor,
+            depth: 0,
+            pending_type_eq: false,
+            pending_attributes: Vec::new(),
+            recovered: false,
+            block_nesting: 0,
+        };
+        parser
+            .parse_expression()
+            .expect("expression parse must not hard-fail (error-tolerant)")
+    }
 }
 
 #[cfg(test)]
