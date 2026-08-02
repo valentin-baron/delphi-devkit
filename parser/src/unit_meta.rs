@@ -81,7 +81,16 @@ pub struct UnitMeta {
     /// for an older meta (pre-format-15, via `#[serde(default)]`) or a meta built
     /// through [`Self::new`] without the builder; the derived table is then empty
     /// (matches nothing, safe) and the gate reads `body.reliable` (defaults true).
-    #[serde(default)]
+    ///
+    /// NEVER SERIALIZED (`#[serde(skip)]`): the body is WORKING-SET state for the
+    /// ONE active editor unit only. The persisted `.unit` cache is interface +
+    /// flat usages + stamps — a cross-unit reload can therefore never drag a body
+    /// into RAM (the 20 GB OOM this guards). It is retained in the live cache only
+    /// for the active unit (`parse_buffer` / a direct `parse_source_file(true)`);
+    /// every indexed / bootstrapped / cross-unit-imported meta carries an EMPTY
+    /// body (`impl_scopes()` then yields empty — local resolution is
+    /// active-unit-only, never a wrong answer).
+    #[serde(skip)]
     pub implementation_body: crate::ast_impl::ImplementationBody,
     /// Derived interface surface (symbols + flattened members), built lazily
     /// from `ast` and cached. Never serialized — rebuilt on demand.
@@ -739,13 +748,16 @@ mod tests {
         assert_eq!(interface_again.symbols.len(), interface.symbols.len());
     }
 
-    /// S3: the `implementation_body` (scope tree + typed locals + reliability
-    /// flag) survives a bincode round-trip under the bumped format, and the
-    /// DERIVED flat `impl_scopes` view rebuilds identically after the round-trip —
-    /// the body is the single source of truth, the flat table is never separately
-    /// serialized.
+    /// MEMORY FIX: the `implementation_body` is `#[serde(skip)]` — working-set
+    /// state for the active editor unit ONLY, NEVER persisted. Before a round-trip
+    /// the body is populated (this meta was built with a body) and the DERIVED flat
+    /// `impl_scopes` view reflects it; AFTER a bincode round-trip the body is EMPTY
+    /// (skipped, so a cross-unit reload can never drag a body into RAM), and the
+    /// derived flat table is correspondingly empty. The interface + flat usages are
+    /// what persist and are asserted intact elsewhere; this test locks the
+    /// body-not-persisted invariant that bounds memory.
     #[test]
-    fn impl_scopes_survive_serde_round_trip() {
+    fn implementation_body_is_not_persisted_across_serde_round_trip() {
         let directory = std::env::temp_dir().join("delphi_parser_impl_scopes_serde");
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join("Scoped.pas");
@@ -782,41 +794,30 @@ mod tests {
         assert_eq!(meta.implementation_body.routines.len(), 1);
 
         let bytes = bincode::serialize(&meta).unwrap();
-        // the local name survives as text (dual-track, no raw Spur).
-        assert!(String::from_utf8_lossy(&bytes).contains("Local"));
-
         let restored: UnitMeta = bincode::deserialize(&bytes).unwrap();
-        // The body itself survived (single source of truth).
-        assert_eq!(
-            restored.implementation_body.routines.len(),
-            1,
-            "the body's routine survives the round-trip"
+        // The body did NOT survive — it is working-set state for the active unit
+        // only, never dragged into RAM by a cross-unit reload.
+        assert!(
+            restored.implementation_body.routines.is_empty(),
+            "the body must NOT survive the round-trip (memory fix: bodies are active-unit-only)"
         );
-        assert!(restored.implementation_body.reliable, "reliable flag survives");
-        let routine_body = &restored.implementation_body.routines[0];
-        assert_eq!(routine_body.owner_type_key, Some(crate::globals::intern_key("TThing")));
-        assert_eq!(routine_body.name.key, crate::globals::intern_key("Run"));
-
-        // The DERIVED flat view rebuilds IDENTICALLY from the restored body.
-        assert!(restored.impl_scopes_reliable(), "derived reliability flag survives");
-        assert_eq!(restored.impl_scopes().len(), 1);
-        let routine = &restored.impl_scopes()[0];
-        assert_eq!(routine.owner_type_key, Some(crate::globals::intern_key("TThing")));
-        assert_eq!(routine.name.key, crate::globals::intern_key("Run"));
-        assert_eq!(routine.locals.len(), 1);
-        assert_eq!(routine.locals[0].name.key, crate::globals::intern_key("Local"));
-        assert_eq!(
-            routine.locals[0].type_key,
-            Some(crate::globals::intern_key("TThing"))
-        );
+        // The DERIVED flat view is correspondingly empty for a bodyless meta —
+        // local resolution is active-unit-only, so this yields nothing (safe).
+        assert!(restored.impl_scopes().is_empty());
+        // A bodyless meta's reliability gate defaults true (its empty table matches
+        // nothing), so no wrong local attribution is possible.
+        assert!(restored.impl_scopes_reliable());
     }
 
-    /// S3 round-trip through the REAL compressed segment path
-    /// (`serialize_meta` → `decode_segment`): a non-trivial body (several
-    /// routines, a nested + an anonymous scope, locals) survives, and the lazily
-    /// derived `impl_scopes` rebuilds identically after the round-trip.
+    /// MEMORY FIX, real compressed segment path (`serialize_meta` →
+    /// `decode_segment`): a non-trivial body (several routines, a nested + an
+    /// anonymous scope, locals) is present on the live meta before save but is
+    /// ABSENT after the segment round-trip — the body is `#[serde(skip)]` so the
+    /// durable `.unit` segment carries interface + flat usages only and a reload
+    /// can never restore a body. The derived flat `impl_scopes` is empty for the
+    /// reloaded bodyless meta.
     #[test]
-    fn implementation_body_survives_segment_round_trip() {
+    fn implementation_body_is_not_persisted_through_segment_round_trip() {
         let directory = std::env::temp_dir().join("delphi_parser_impl_body_segment");
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join("Bodies.pas");
@@ -865,31 +866,16 @@ mod tests {
         let restored = crate::unit_cache::decode_segment_for_test(&segment)
             .expect("segment decodes under the bumped format");
 
-        // The body survived: routine count, a scope's declarations, reliability.
-        assert_eq!(restored.implementation_body.routines.len(), 2);
-        assert!(restored.implementation_body.reliable);
-        let alpha = &restored.implementation_body.routines[0];
-        assert_eq!(alpha.name.key, crate::globals::intern_key("Alpha"));
+        // The body did NOT survive — it is #[serde(skip)], so the durable segment
+        // carries interface + flat usages only; a reload restores no body.
         assert!(
-            alpha.scope.declarations.iter().any(|symbol| symbol.name.key
-                == crate::globals::intern_key("A")),
-            "Alpha's local A survives on the scope"
+            restored.implementation_body.routines.is_empty(),
+            "the body must NOT survive the segment round-trip (bodies are active-unit-only)"
         );
-        let beta = &restored.implementation_body.routines[1];
-        assert_eq!(beta.name.key, crate::globals::intern_key("Beta"));
-        assert!(
-            beta.scope.declarations.iter().any(|symbol| symbol.name.key
-                == crate::globals::intern_key("P")
-                && symbol.kind == crate::ast::LocalKind::Param),
-            "Beta's parameter P survives as a Param declaration"
-        );
-
-        // The DERIVED flat view rebuilds identically after the round-trip.
-        assert_eq!(
-            restored.impl_scopes().len(),
-            flat_before,
-            "derived impl_scopes rebuilds to the same routine count after a round-trip"
-        );
+        // The DERIVED flat view is empty for the reloaded bodyless meta (the live
+        // meta had {flat_before} entries; a reload never restores them).
+        let _ = flat_before;
+        assert!(restored.impl_scopes().is_empty());
         assert!(restored.impl_scopes_reliable());
     }
 

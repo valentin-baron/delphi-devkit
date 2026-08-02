@@ -251,7 +251,7 @@ mod tests {
         let mut session =
             ProjectSession::from_parts(Arc::new(context), store, Duration::from_secs(300));
         session
-            .parse_source_file(directory.join("Client.pas"))
+            .parse_source_file(directory.join("Client.pas"), true)
             .unwrap();
         (session, directory)
     }
@@ -457,7 +457,7 @@ mod tests {
         let store = CacheStore::in_directory(&directory, &identity).unwrap();
         let mut session =
             ProjectSession::from_parts(Arc::new(context), store, Duration::from_secs(300));
-        session.parse_source_file(directory.join("Client.pas")).unwrap();
+        session.parse_source_file(directory.join("Client.pas"), true).unwrap();
 
         let client_key = session.context().intern_key("CLIENT");
         let client_src = std::fs::read_to_string(directory.join("Client.pas")).unwrap();
@@ -544,7 +544,7 @@ mod tests {
         let store = CacheStore::in_directory(&directory, &identity).unwrap();
         let mut session =
             ProjectSession::from_parts(Arc::new(context), store, Duration::from_secs(300));
-        session.parse_source_file(directory.join("Hier.pas")).unwrap();
+        session.parse_source_file(directory.join("Hier.pas"), true).unwrap();
 
         let key = session.context().intern_key("HIER");
         let source = std::fs::read_to_string(directory.join("Hier.pas")).unwrap();
@@ -582,7 +582,7 @@ mod tests {
     fn session_with_both_units_parsed(tag: &str) -> (ProjectSession, std::path::PathBuf) {
         let (mut session, directory) = session_with_two_units(tag);
         session
-            .parse_source_file(directory.join("Models.pas"))
+            .parse_source_file(directory.join("Models.pas"), true)
             .unwrap();
         (session, directory)
     }

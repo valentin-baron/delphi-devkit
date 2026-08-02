@@ -250,9 +250,17 @@ impl ProjectSession {
     /// Parse one source file through the full pipeline: lazy import loading
     /// (nested units land in the cache AND the reverse index via the
     /// loader), artifact production, dirty tracking.
+    ///
+    /// `retain_body`: keep the implementation-section body on the cached meta.
+    /// Pass `true` when this file IS the active editor unit (didSave of the open
+    /// unit; tests that query the parsed unit's body). Pass `false` for indexing /
+    /// RTL bootstrap — those metas must be bodyless so process RAM stays bounded
+    /// (the 20 GB OOM this guards). The flat usages powering find-references are
+    /// retained regardless of this flag.
     pub fn parse_source_file(
         &mut self,
         path: impl AsRef<Path>,
+        retain_body: bool,
     ) -> Result<(ParseOutcome, Option<Arc<UnitMeta>>), SessionError> {
         let file = self.arena.load(path).map_err(|error| {
             SessionError::message(format!("{}: {}", error.path.display(), error.message))
@@ -266,7 +274,7 @@ impl ProjectSession {
             Some(self.store.clone()),
         );
         let (outcome, meta) =
-            pipeline::parse_and_cache(self.arena, &self.context, file, Some(loader))
+            pipeline::parse_and_cache(self.arena, &self.context, file, Some(loader), retain_body)
                 .map_err(|error| SessionError {
                     location: crate::parser::error_location(&error),
                     message: format!("parse failed: {error:?}"),
@@ -352,8 +360,11 @@ impl ProjectSession {
             Some(self.index.clone()),
             Some(self.store.clone()),
         );
+        // The buffer parse IS the active editor unit — always retain its body; it
+        // powers local/member/inherited resolution + completion for the one unit
+        // open in the editor.
         let (outcome, meta) =
-            pipeline::parse_and_cache(self.arena, &self.context, file, Some(loader)).map_err(
+            pipeline::parse_and_cache(self.arena, &self.context, file, Some(loader), true).map_err(
                 |error| SessionError {
                     location: crate::parser::error_location(&error),
                     message: format!("parse failed: {error:?}"),
@@ -3415,7 +3426,7 @@ mod tests {
 
         // Parse the consumer: materializes Con19 AND its import Lib19 into the
         // arena. All borrows from the parse are dropped when it returns.
-        let (_, meta) = session.parse_source_file(directory.join("Con19.pas")).unwrap();
+        let (_, meta) = session.parse_source_file(directory.join("Con19.pas"), true).unwrap();
         let con_meta = meta.expect("consumer meta");
         let con_key = con_meta.name();
 
@@ -3482,7 +3493,7 @@ mod tests {
 
         // First parse of App: parses App AND its import Lib. Lib is persisted on
         // insert (disk unit).
-        session.parse_source_file(directory.join("App.pas")).unwrap();
+        session.parse_source_file(directory.join("App.pas"), true).unwrap();
         assert!(session.store.unit_file_path("Lib").exists(), "Lib persisted on insert");
 
         // Evict Lib from RAM only (its per-unit file survives on disk).
@@ -3494,7 +3505,7 @@ mod tests {
         // the loader's interface_of(Lib) must RELOAD Lib from disk, NOT re-parse
         // it. So the parse-probe advances by exactly 1 (App only).
         let before = crate::pipeline::parse_probe::count();
-        session.parse_source_file(directory.join("App.pas")).unwrap();
+        session.parse_source_file(directory.join("App.pas"), true).unwrap();
         let after_match = crate::pipeline::parse_probe::count();
         assert_eq!(
             after_match - before,
@@ -3515,7 +3526,7 @@ mod tests {
         session.context.unit_cache.run_pending_tasks();
 
         let before_change = crate::pipeline::parse_probe::count();
-        session.parse_source_file(directory.join("App.pas")).unwrap();
+        session.parse_source_file(directory.join("App.pas"), true).unwrap();
         let after_change = crate::pipeline::parse_probe::count();
         assert_eq!(
             after_change - before_change,
@@ -3642,7 +3653,7 @@ mod tests {
         );
 
         let (_, artifact) = session
-            .parse_source_file(directory.join("UnitB.pas"))
+            .parse_source_file(directory.join("UnitB.pas"), true)
             .unwrap();
         let artifact = artifact.unwrap();
         assert_eq!(artifact.dependencies.len(), 1);
@@ -3710,7 +3721,7 @@ mod tests {
             Duration::from_secs(300),
         );
 
-        let (_, meta) = session.parse_source_file(&pas).unwrap();
+        let (_, meta) = session.parse_source_file(&pas, true).unwrap();
         let meta = meta.unwrap();
         // the sibling dfm was associated
         assert!(meta.dfm.is_some(), "sibling dfm must be stamped");
@@ -3795,7 +3806,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Client.pas")).unwrap();
+        session.parse_source_file(directory.join("Client.pas"), true).unwrap();
 
         let client_key = session.context.intern_key("CLIENT");
         let models_key = session.context.intern_key("MODELS");
@@ -3855,7 +3866,7 @@ mod tests {
              procedure Run(Amount: Integer);\nvar Local: Integer;\nbegin\n  Local := Amount;\nend;\nend.";
         std::fs::write(directory.join("U.pas"), source).unwrap();
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("U.pas")).unwrap();
+        session.parse_source_file(directory.join("U.pas"), true).unwrap();
         let unit_key = session.context.intern_key("U");
 
         let meta = session.meta_of(unit_key).unwrap();
@@ -3903,7 +3914,7 @@ mod tests {
              procedure Run;\nvar Local: Integer;\nbegin\n  Local := 1;\nend;\nend.";
         std::fs::write(directory.join("U.pas"), source).unwrap();
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("U.pas")).unwrap();
+        session.parse_source_file(directory.join("U.pas"), true).unwrap();
         let unit_key = session.context.intern_key("U");
         let meta = session.meta_of(unit_key).unwrap();
         assert!(meta.impl_scopes_reliable());
@@ -3960,7 +3971,7 @@ mod tests {
              procedure Run;\nvar Value: Integer;\nbegin\n  SomeObj.Value := 1;\n  Value := 2;\nend;\nend.";
         std::fs::write(directory.join("U.pas"), source).unwrap();
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("U.pas")).unwrap();
+        session.parse_source_file(directory.join("U.pas"), true).unwrap();
         let unit_key = session.context.intern_key("U");
         let meta = session.meta_of(unit_key).unwrap();
         assert!(meta.impl_scopes_reliable(), "sanity: reliable pass");
@@ -4023,7 +4034,7 @@ mod tests {
              begin\n  Inner;\nend;\nend.";
         std::fs::write(directory.join("U.pas"), source).unwrap();
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("U.pas")).unwrap();
+        session.parse_source_file(directory.join("U.pas"), true).unwrap();
         let unit_key = session.context.intern_key("U");
         let meta = session.meta_of(unit_key).unwrap();
         assert!(meta.impl_scopes_reliable(), "sanity: reliable pass");
@@ -4111,7 +4122,7 @@ mod tests {
              procedure Run;\nvar Local: Integer;\nbegin\nasm\n  NOP\nend;\nend;\nend.";
         std::fs::write(directory.join("U.pas"), source).unwrap();
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("U.pas")).unwrap();
+        session.parse_source_file(directory.join("U.pas"), true).unwrap();
         let unit_key = session.context.intern_key("U");
         let meta = session.meta_of(unit_key).unwrap();
         assert!(
@@ -4143,7 +4154,7 @@ mod tests {
              procedure Run;\nvar Local: Integer;\nbegin\n  Local := 1;\nend;\nend.";
         std::fs::write(directory.join("U.pas"), source).unwrap();
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("U.pas")).unwrap();
+        session.parse_source_file(directory.join("U.pas"), true).unwrap();
         let unit_key = session.context.intern_key("U");
 
         let local_use = source.rfind("Local").unwrap() as u32;
@@ -4176,7 +4187,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Client.pas")).unwrap();
+        session.parse_source_file(directory.join("Client.pas"), true).unwrap();
         let client_key = session.context.intern_key("CLIENT");
         let models_key = session.context.intern_key("MODELS");
 
@@ -4268,8 +4279,8 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("UserA.pas")).unwrap();
-        session.parse_source_file(directory.join("UserB.pas")).unwrap();
+        session.parse_source_file(directory.join("UserA.pas"), true).unwrap();
+        session.parse_source_file(directory.join("UserB.pas"), true).unwrap();
 
         let thing_key = session.context.intern_key("TThing");
         let occurrences = session.references(thing_key);
@@ -4322,7 +4333,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("App.pas")).unwrap();
+        session.parse_source_file(directory.join("App.pas"), true).unwrap();
         let app_key = session.context.intern_key("APP");
 
         // top-level completion: own symbols + imported Lib symbols + builtins
@@ -4382,7 +4393,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Shapes.pas")).unwrap();
+        session.parse_source_file(directory.join("Shapes.pas"), true).unwrap();
         let key = session.context.intern_key("SHAPES");
         let meta = session.meta_of(key).unwrap();
 
@@ -4447,7 +4458,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Calc.pas")).unwrap();
+        session.parse_source_file(directory.join("Calc.pas"), true).unwrap();
         let key = session.context.intern_key("CALC");
 
         let signatures = session.signature_help(
@@ -4488,7 +4499,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Main.pas")).unwrap();
+        session.parse_source_file(directory.join("Main.pas"), true).unwrap();
         let main_key = session.context.intern_key("MAIN");
 
         // cross-unit function
@@ -4521,7 +4532,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Io.pas")).unwrap();
+        session.parse_source_file(directory.join("Io.pas"), true).unwrap();
         let key = session.context.intern_key("IO");
 
         let signatures = session.signature_help(key, session.context.intern_key("Read"), None);
@@ -4555,7 +4566,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Over.pas")).unwrap();
+        session.parse_source_file(directory.join("Over.pas"), true).unwrap();
         let key = session.context.intern_key("OVER");
 
         let signatures = session.signature_help(
@@ -4605,7 +4616,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Buf.pas")).unwrap();
+        session.parse_source_file(directory.join("Buf.pas"), true).unwrap();
         let key = session.context.intern_key("BUF");
 
         let signatures = session.signature_help(
@@ -4649,7 +4660,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Gen.pas")).unwrap();
+        session.parse_source_file(directory.join("Gen.pas"), true).unwrap();
         let key = session.context.intern_key("GEN");
 
         let map = session.signature_help(
@@ -4695,7 +4706,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Api.pas")).unwrap();
+        session.parse_source_file(directory.join("Api.pas"), true).unwrap();
         let key = session.context.intern_key("API");
         let content = std::fs::read_to_string(directory.join("Api.pas")).unwrap();
 
@@ -4730,7 +4741,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Types.pas")).unwrap();
+        session.parse_source_file(directory.join("Types.pas"), true).unwrap();
         let key = session.context.intern_key("TYPES");
 
         // unknown name
@@ -4781,7 +4792,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Form9.pas")).unwrap();
+        session.parse_source_file(directory.join("Form9.pas"), true).unwrap();
         let key = session.context.intern_key("FORM9");
 
         let diagnostics = session.diagnostics(key);
@@ -4831,7 +4842,7 @@ mod tests {
 
         let mut session = query_session(&directory);
         session
-            .parse_source_file(directory.join("Consumer.pas"))
+            .parse_source_file(directory.join("Consumer.pas"), true)
             .unwrap();
         // Cache the imports' interfaces. unused-uses is CACHE-ONLY (Task-15 OOM
         // fix): it never force-parses an import on the analyze hot path, so a
@@ -4839,10 +4850,10 @@ mod tests {
         // (e.g. the user navigated into it). Pre-cache both here to exercise the
         // flagging logic.
         session
-            .parse_source_file(directory.join("Used.pas"))
+            .parse_source_file(directory.join("Used.pas"), true)
             .unwrap();
         session
-            .parse_source_file(directory.join("Unused.pas"))
+            .parse_source_file(directory.join("Unused.pas"), true)
             .unwrap();
         let key = session.context.intern_key("CONSUMER");
 
@@ -4902,7 +4913,7 @@ mod tests {
 
         let mut session = query_session(&directory);
         session
-            .parse_source_file(directory.join("Consumer.pas"))
+            .parse_source_file(directory.join("Consumer.pas"), true)
             .unwrap();
         let key = session.context.intern_key("CONSUMER");
         let flagged: Vec<String> = session
@@ -4931,7 +4942,7 @@ mod tests {
 
         let mut session = query_session(&directory);
         session
-            .parse_source_file(directory.join("Consumer.pas"))
+            .parse_source_file(directory.join("Consumer.pas"), true)
             .unwrap();
         let key = session.context.intern_key("CONSUMER");
         let flagged: Vec<String> = session
@@ -4966,7 +4977,7 @@ mod tests {
 
         let mut session = query_session(&directory);
         let (_, meta) = session
-            .parse_source_file(directory.join("Consumer.pas"))
+            .parse_source_file(directory.join("Consumer.pas"), true)
             .unwrap();
         let meta = meta.unwrap();
         // Config was genuinely consulted as a dependency (proves the guard fired).
@@ -5004,15 +5015,15 @@ mod tests {
 
         let mut session = query_session(&directory);
         session
-            .parse_source_file(directory.join("Consumer.pas"))
+            .parse_source_file(directory.join("Consumer.pas"), true)
             .unwrap();
         // Pre-cache the imports — unused-uses is cache-only (Task-15 OOM fix)
         // and never force-parses an import on the analyze hot path.
         session
-            .parse_source_file(directory.join("Used.pas"))
+            .parse_source_file(directory.join("Used.pas"), true)
             .unwrap();
         session
-            .parse_source_file(directory.join("Unused.pas"))
+            .parse_source_file(directory.join("Unused.pas"), true)
             .unwrap();
         let key = session.context.intern_key("CONSUMER");
         let flagged: Vec<String> = session
@@ -5045,7 +5056,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        let (_, meta) = session.parse_source_file(&source).unwrap();
+        let (_, meta) = session.parse_source_file(&source, true).unwrap();
         let meta = meta.expect("a recovered unit still produces a meta");
 
         // surviving declarations present, broken one dropped (no bogus symbol)
@@ -5089,7 +5100,7 @@ mod tests {
         let disk_path = directory.join("Widgets.pas");
         std::fs::write(&disk_path, source).unwrap();
         let mut disk_session = query_session(&directory);
-        let (_, disk_meta) = disk_session.parse_source_file(&disk_path).unwrap();
+        let (_, disk_meta) = disk_session.parse_source_file(&disk_path, true).unwrap();
         let disk_meta = disk_meta.expect("on-disk unit meta");
 
         // in-memory buffer parse (unsaved) — a DIFFERENT display path so it
@@ -5388,7 +5399,7 @@ mod tests {
         let mut session = query_session(&directory);
         // Warm the cache: parse Dependency through the FULL path so it is resident.
         session
-            .parse_source_file(directory.join("Dependency.pas"))
+            .parse_source_file(directory.join("Dependency.pas"), true)
             .unwrap();
         let dependency_key = session.context.intern_key("DEPENDENCY");
         assert!(
@@ -5481,7 +5492,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Lexy.pas")).unwrap();
+        session.parse_source_file(directory.join("Lexy.pas"), true).unwrap();
         let key = session.context.intern_key("LEXY");
         let tokens = session.semantic_tokens(key);
         assert!(!tokens.is_empty());
@@ -5528,7 +5539,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Decl.pas")).unwrap();
+        session.parse_source_file(directory.join("Decl.pas"), true).unwrap();
         let key = session.context.intern_key("DECL");
         let tokens = session.semantic_tokens(key);
 
@@ -5586,7 +5597,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Client.pas")).unwrap();
+        session.parse_source_file(directory.join("Client.pas"), true).unwrap();
         let key = session.context.intern_key("CLIENT");
         let tokens = session.semantic_tokens(key);
 
@@ -5662,7 +5673,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Forms.pas")).unwrap();
+        session.parse_source_file(directory.join("Forms.pas"), true).unwrap();
         let key = session.context.intern_key("FORMS");
         let meta = session.meta_of(key).unwrap();
 
@@ -5714,7 +5725,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Hier.pas")).unwrap();
+        session.parse_source_file(directory.join("Hier.pas"), true).unwrap();
         let key = session.context.intern_key("HIER");
         let meta = session.meta_of(key).unwrap();
         let child_key = session.context.intern_key("TChild");
@@ -5787,7 +5798,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Child.pas")).unwrap();
+        session.parse_source_file(directory.join("Child.pas"), true).unwrap();
         let key = session.context.intern_key("CHILD");
         let meta = session.meta_of(key).unwrap();
         let child_key = session.context.intern_key("TChild");
@@ -5862,7 +5873,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Lonely.pas")).unwrap();
+        session.parse_source_file(directory.join("Lonely.pas"), true).unwrap();
         let key = session.context.intern_key("LONELY");
         let meta = session.meta_of(key).unwrap();
         let child_key = session.context.intern_key("TChild");
@@ -5899,7 +5910,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Cyc.pas")).unwrap();
+        session.parse_source_file(directory.join("Cyc.pas"), true).unwrap();
         let key = session.context.intern_key("CYC");
         let meta = session.meta_of(key).unwrap();
 
@@ -5931,7 +5942,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Combined.pas")).unwrap();
+        session.parse_source_file(directory.join("Combined.pas"), true).unwrap();
         let key = session.context.intern_key("COMBINED");
         let meta = session.meta_of(key).unwrap();
 
@@ -5997,7 +6008,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Same.pas")).unwrap();
+        session.parse_source_file(directory.join("Same.pas"), true).unwrap();
         let key = session.context.intern_key("SAME");
         let meta = session.meta_of(key).unwrap();
         let file = meta.usages.first().unwrap().location.file;
@@ -6051,7 +6062,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("User.pas")).unwrap();
+        session.parse_source_file(directory.join("User.pas"), true).unwrap();
         let key = session.context.intern_key("USER");
         let meta = session.meta_of(key).unwrap();
         let file = meta.usages.first().unwrap().location.file;
@@ -6093,7 +6104,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Inh.pas")).unwrap();
+        session.parse_source_file(directory.join("Inh.pas"), true).unwrap();
         let key = session.context.intern_key("INH");
         let meta = session.meta_of(key).unwrap();
         let file = meta.usages.first().unwrap().location.file;
@@ -6134,7 +6145,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("ChildU.pas")).unwrap();
+        session.parse_source_file(directory.join("ChildU.pas"), true).unwrap();
         let key = session.context.intern_key("CHILDU");
         let meta = session.meta_of(key).unwrap();
         let file = meta.usages.first().unwrap().location.file;
@@ -6175,7 +6186,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Chain.pas")).unwrap();
+        session.parse_source_file(directory.join("Chain.pas"), true).unwrap();
         let key = session.context.intern_key("CHAIN");
         let meta = session.meta_of(key).unwrap();
         let file = meta.usages.first().unwrap().location.file;
@@ -6215,7 +6226,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Cast.pas")).unwrap();
+        session.parse_source_file(directory.join("Cast.pas"), true).unwrap();
         let key = session.context.intern_key("CAST");
         let meta = session.meta_of(key).unwrap();
         let file = meta.usages.first().unwrap().location.file;
@@ -6258,7 +6269,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("NW.pas")).unwrap();
+        session.parse_source_file(directory.join("NW.pas"), true).unwrap();
         let key = session.context.intern_key("NW");
         let meta = session.meta_of(key).unwrap();
         let file = meta.usages.first().unwrap().location.file;
@@ -6308,7 +6319,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Hier.pas")).unwrap();
+        session.parse_source_file(directory.join("Hier.pas"), true).unwrap();
         let key = session.context.intern_key("HIER");
         let meta = session.meta_of(key).unwrap();
         let file = meta.usages.first().unwrap().location.file;
@@ -6343,7 +6354,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Hier.pas")).unwrap();
+        session.parse_source_file(directory.join("Hier.pas"), true).unwrap();
         let key = session.context.intern_key("HIER");
         let meta = session.meta_of(key).unwrap();
         let file = meta.usages.first().unwrap().location.file;
@@ -6394,8 +6405,8 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Base.pas")).unwrap();
-        session.parse_source_file(directory.join("Child.pas")).unwrap();
+        session.parse_source_file(directory.join("Base.pas"), true).unwrap();
+        session.parse_source_file(directory.join("Child.pas"), true).unwrap();
         let child_key = session.context.intern_key("CHILD");
         let child_meta = session.meta_of(child_key).unwrap();
         let child_file = child_meta.usages.first().unwrap().location.file;
@@ -6434,7 +6445,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Nope.pas")).unwrap();
+        session.parse_source_file(directory.join("Nope.pas"), true).unwrap();
         let key = session.context.intern_key("NOPE");
         let meta = session.meta_of(key).unwrap();
         let file = meta.usages.first().unwrap().location.file;
@@ -6473,7 +6484,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Foo.pas")).unwrap();
+        session.parse_source_file(directory.join("Foo.pas"), true).unwrap();
         let key = session.context.intern_key("FOO");
         let meta = session.meta_of(key).unwrap();
         let file = meta.usages.first().unwrap().location.file;
@@ -6507,7 +6518,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Foo.pas")).unwrap();
+        session.parse_source_file(directory.join("Foo.pas"), true).unwrap();
         let key = session.context.intern_key("FOO");
         let meta = session.meta_of(key).unwrap();
         let file = meta.usages.first().unwrap().location.file;
@@ -6548,7 +6559,7 @@ mod tests {
         .unwrap();
 
         let mut session = query_session(&directory);
-        session.parse_source_file(directory.join("Abs.pas")).unwrap();
+        session.parse_source_file(directory.join("Abs.pas"), true).unwrap();
         let key = session.context.intern_key("ABS");
         let meta = session.meta_of(key).unwrap();
 

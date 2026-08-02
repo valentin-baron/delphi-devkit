@@ -83,6 +83,17 @@ pub fn sibling_dfm_stamp(unit_source_path: &std::path::Path) -> Option<SourceSta
 /// Build the cacheable [`UnitMeta`] for a parsed unit: the owned AST plus the
 /// stamps/deps/usages/taint the shallow AST cannot reproduce. The unit AST is
 /// MOVED into the meta (no clone).
+///
+/// `retain_body` controls whether the implementation-section body AST is kept on
+/// the meta. When `true` (the ACTIVE editor unit only), the body is attached and
+/// powers local/member/inherited resolution + completion. When `false` (indexing,
+/// RTL bootstrap, every cross-unit import load), the body is DROPPED — the meta
+/// carries an EMPTY [`crate::ast_impl::ImplementationBody`]. The flat `usages`
+/// (the reference index / find-references source) are attached in BOTH cases:
+/// they are `outcome.usages`, independent of the body structures, so cross-unit
+/// references never regress. Dropping the body for non-active units is what bounds
+/// process RAM (the 20 GB OOM this fixes): a body is working-set state, needed only
+/// for the one unit open in the editor.
 #[allow(clippy::too_many_arguments)]
 pub fn build_unit_meta(
     arena: &SourceArena,
@@ -94,6 +105,7 @@ pub fn build_unit_meta(
     implementation_body: crate::ast_impl::ImplementationBody,
     cycle_tainted: bool,
     recovered: bool,
+    retain_body: bool,
 ) -> UnitMeta {
     let own = stamp_file(arena, file);
     let includes = outcome_includes
@@ -108,6 +120,15 @@ pub fn build_unit_meta(
     // read (no re-decode). Saturating cast: a >4GiB source is implausible and
     // would only saturate the weight, never wrap.
     let source_len = arena.loaded_content(file).len().min(u32::MAX as usize) as u32;
+    // The body is retained ONLY for the active editor unit (`retain_body`). For
+    // every indexed / bootstrapped / cross-unit-imported unit it is dropped: the
+    // meta carries an EMPTY body so it is never held resident (memory fix). The
+    // flat `usages` above are attached in BOTH cases (references never regress).
+    let body = if retain_body {
+        implementation_body
+    } else {
+        crate::ast_impl::ImplementationBody::default()
+    };
     UnitMeta::new(
         unit,
         cycle_tainted,
@@ -120,7 +141,7 @@ pub fn build_unit_meta(
     .with_dfm(dfm)
     .with_recovered(recovered)
     .with_source_len(source_len)
-    .with_implementation_body(implementation_body)
+    .with_implementation_body(body)
 }
 
 /// Parse a materialized file; when it is a unit, build + cache its [`UnitMeta`].
@@ -132,11 +153,17 @@ pub fn build_unit_meta(
 /// returned [`UnitMeta`]; read it there (`meta.ast`). For a non-unit source it
 /// is [`crate::parser::ParsedSource::Present`] with the real AST. A caller can
 /// therefore never mistake a moved unit for real `source` data.
+/// `retain_body`: keep the implementation-section body on the cached meta (the
+/// ACTIVE editor unit only) or drop it (indexing / bootstrap / cross-unit
+/// imports — bodyless, memory-bounded). See [`build_unit_meta`]. The flat usages
+/// are retained regardless, so find-references / the reference index never
+/// regress.
 pub fn parse_and_cache(
     arena: &SourceArena,
     context: &Arc<ProjectContext>,
     file: FileId,
     loader: Option<std::rc::Rc<dyn InterfaceLoader>>,
+    retain_body: bool,
 ) -> Result<(ParseOutcome, Option<Arc<UnitMeta>>), ParseError> {
     // Test-only probe: count how many times a source is actually PARSED. The
     // Task-16 reload-on-miss path (loader.interface_of → store.load_unit) must
@@ -150,7 +177,15 @@ pub fn parse_and_cache(
     let includes = outcome.seen_includes.clone();
     let dependencies = outcome.dependencies.clone();
     let usages = outcome.usages.clone();
-    let implementation_body = outcome.implementation_body.clone();
+    // Clone the body only when it will be retained (the active editor unit); for
+    // a bodyless (indexed / imported) meta this clone is skipped entirely — the
+    // body is one of the largest structures a parse produces, so not cloning it
+    // for the ~1900 bootstrap + every import load is itself a memory + time win.
+    let implementation_body = if retain_body {
+        outcome.implementation_body.clone()
+    } else {
+        crate::ast_impl::ImplementationBody::default()
+    };
     let cycle_tainted = outcome.cycle_tainted;
     let recovered = outcome.recovered;
 
@@ -173,6 +208,7 @@ pub fn parse_and_cache(
                 implementation_body,
                 cycle_tainted,
                 recovered,
+                retain_body,
             ));
             context.unit_cache.insert(meta.name(), meta.clone());
             // begin_unit/end_unit are now balanced inside the parser itself
@@ -239,7 +275,7 @@ mod tests {
         let arena = SourceArena::new();
         let file = arena.load(directory.join("UnitA.pas")).unwrap();
 
-        let (_, meta) = parse_and_cache(&arena, &context, file, None).unwrap();
+        let (_, meta) = parse_and_cache(&arena, &context, file, None, true).unwrap();
         let meta = meta.expect("unit produces meta");
 
         // symbols captured with kinds (derived from the AST on demand)
@@ -294,7 +330,7 @@ mod tests {
                 std::fs::read(path).unwrap().as_slice(),
                 "arena raw bytes must equal on-disk bytes"
             );
-            let (_, meta) = parse_and_cache(&arena, &context, file, None).unwrap();
+            let (_, meta) = parse_and_cache(&arena, &context, file, None, true).unwrap();
             let meta = meta.expect("unit produces meta");
             // the stamp equals hash_file(path) — load validation will match
             assert_eq!(
@@ -314,7 +350,7 @@ mod tests {
             "unit U;\ninterface\ntype TAlias = TBaseThing;\nprocedure Run;\nimplementation\n\
              procedure Run;\nbegin\n  DoThing(GCount);\nend;\nend.",
         );
-        let (_, meta) = parse_and_cache(&arena, &context, file, None).unwrap();
+        let (_, meta) = parse_and_cache(&arena, &context, file, None, true).unwrap();
         let meta = meta.unwrap();
         // interface-side type references are usages too (the `Run`
         // declaration line contributes nothing — no body idents there)
@@ -332,6 +368,58 @@ mod tests {
             .find(|usage| usage.symbol == context.intern_key("DOTHING"))
             .unwrap();
         assert_eq!(arena.location_text(dothing.location), "DoThing");
+    }
+
+    /// MEMORY INVARIANT (the 20 GB OOM fix): a unit parsed with `retain_body=false`
+    /// (the indexing / RTL-bootstrap / cross-unit-import path) yields a cached meta
+    /// whose `implementation_body` is EMPTY — bodies are working-set state for the
+    /// active editor unit ONLY and must never be held resident for the thousands of
+    /// indexed/imported units. The SAME source parsed with `retain_body=true` (the
+    /// active editor unit, `parse_buffer` / a direct `parse_source_file(true)`)
+    /// yields a POPULATED body. Crucially, the flat `usages` (find-references) are
+    /// present in BOTH cases, so references never regress with the body dropped.
+    #[test]
+    fn body_retained_only_for_active_unit_not_when_indexing() {
+        let context = test_context(Vec::new());
+        let arena = SourceArena::new();
+        // A unit with a real implementation body: a routine with a typed local.
+        let source = "unit Bodied;\ninterface\nprocedure Run;\nimplementation\n\
+             procedure Run;\nvar Local: Integer;\nbegin\n  Local := 1;\n  DoThing(Local);\nend;\nend.";
+
+        // Indexing-style parse (retain_body = false): the meta is BODYLESS.
+        let indexed_file = arena.insert_virtual("BodiedIndexed.pas", source);
+        let (_, indexed) = parse_and_cache(&arena, &context, indexed_file, None, false).unwrap();
+        let indexed = indexed.unwrap();
+        assert!(
+            indexed.implementation_body.routines.is_empty(),
+            "an indexed (retain_body=false) meta must carry an EMPTY body — bodies are \
+             active-unit-only (the 20 GB OOM fix)"
+        );
+        // The derived flat table is correspondingly empty (local resolution is
+        // active-unit-only) and its reliability gate defaults true (matches nothing).
+        assert!(indexed.impl_scopes().is_empty());
+        assert!(indexed.impl_scopes_reliable());
+        // References are UNAFFECTED: flat usages are retained even bodyless.
+        let indexed_usages: Vec<_> =
+            indexed.usages.iter().map(|usage| usage.symbol).collect();
+        assert!(
+            indexed_usages.contains(&context.intern_key("DoThing")),
+            "flat usages (find-references) must be retained even when the body is dropped"
+        );
+
+        // Active-editor-style parse (retain_body = true): the meta has a POPULATED
+        // body — one routine with its typed local.
+        let active_file = arena.insert_virtual("BodiedActive.pas", source);
+        let (_, active) = parse_and_cache(&arena, &context, active_file, None, true).unwrap();
+        let active = active.unwrap();
+        assert!(
+            !active.implementation_body.routines.is_empty(),
+            "the active editor unit (retain_body=true) must carry a POPULATED body"
+        );
+        assert!(!active.impl_scopes().is_empty(), "derived flat table is populated for the active unit");
+        // And references are present here too (same source, same usages).
+        let active_usages: Vec<_> = active.usages.iter().map(|usage| usage.symbol).collect();
+        assert!(active_usages.contains(&context.intern_key("DoThing")));
     }
 
     #[test]
@@ -355,7 +443,7 @@ mod tests {
         // parse through the GLOBAL arena so serialized FileIds resolve on load
         let arena = crate::globals::arena();
         let file = arena.load(&disk_path).unwrap();
-        let (_, meta) = parse_and_cache(arena, &context, file, None).unwrap();
+        let (_, meta) = parse_and_cache(arena, &context, file, None, true).unwrap();
         let meta = meta.unwrap();
 
         let thing = meta
@@ -414,7 +502,7 @@ mod tests {
 
         let tiny_src = "unit Tiny; interface implementation end.";
         let tiny_file = arena.insert_virtual("Tiny.pas", tiny_src);
-        let (_, tiny) = parse_and_cache(&arena, &context, tiny_file, None).unwrap();
+        let (_, tiny) = parse_and_cache(&arena, &context, tiny_file, None, true).unwrap();
         let tiny = tiny.unwrap();
 
         // a large unit: many declarations → a large source and a large AST
@@ -426,7 +514,7 @@ mod tests {
         }
         big_src.push_str("implementation end.");
         let big_file = arena.insert_virtual("Big.pas", &big_src);
-        let (_, big) = parse_and_cache(&arena, &context, big_file, None).unwrap();
+        let (_, big) = parse_and_cache(&arena, &context, big_file, None, true).unwrap();
         let big = big.unwrap();
 
         let tiny_weight = tiny.estimated_bytes();
@@ -459,7 +547,7 @@ mod tests {
         let context = test_context(Vec::new());
         let arena = SourceArena::new();
         let file = arena.insert_virtual("d.dpr", "program D; begin end.");
-        let (outcome, artifact) = parse_and_cache(&arena, &context, file, None).unwrap();
+        let (outcome, artifact) = parse_and_cache(&arena, &context, file, None, true).unwrap();
         assert!(artifact.is_none());
         // a program is not moved into a meta — its real source is Present
         assert!(matches!(outcome.source.present(), Some(Source::Program(_))));

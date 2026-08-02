@@ -314,7 +314,12 @@ impl SessionManager {
                 }
             }
 
-            let outcome = match project_session.parse_source_file(&path) {
+            // Indexing + RTL bootstrap: bodyless. An indexed unit is never the
+            // active editor unit, so its implementation body is dead weight —
+            // retaining it for every indexed / bootstrapped unit (~1900 RTL units
+            // + the whole project) is THE 20 GB OOM this fixes. Interface + flat
+            // usages (find-references) are retained regardless.
+            let outcome = match project_session.parse_source_file(&path, false) {
                 Ok(_) => UnitIndexOutcome::Indexed,
                 Err(_) => UnitIndexOutcome::Failed,
             };
@@ -400,7 +405,11 @@ impl SessionManager {
             // save — the imports pulled in before the failure are still worth
             // persisting — but we surface the parse error to the caller AFTER
             // the save so it is logged, not swallowed.
-            let parse_result = project_session.parse_source_file(&path);
+            // didSave of a unit: the just-saved file is typically the open/active
+            // editor unit, so retain its body (it powers local/member/inherited
+            // resolution + completion for that unit). The body is #[serde(skip)],
+            // so this retention is RAM-only and never widens the disk snapshot.
+            let parse_result = project_session.parse_source_file(&path, true);
             let save_report = project_session.save_now()?;
             // SAFE CHECKPOINT (Task-19): the disk parse ran and the snapshot is
             // written — every owned result is built and no arena `&str`/`&[u8]`
@@ -947,7 +956,7 @@ mod tests {
         let mut session = build_fallback_session_with_snapshot_base(base.clone());
         // Parse an on-disk unit so there is durable state to persist.
         session
-            .parse_source_file(base.join("Persisted.pas"))
+            .parse_source_file(base.join("Persisted.pas"), true)
             .expect("on-disk unit parses");
         let manager = SessionManager::new();
         manager.inject_session_for_test(session).await;

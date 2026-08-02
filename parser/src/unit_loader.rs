@@ -284,7 +284,12 @@ impl InterfaceLoader for UnitLoader {
             .expect("loader is alive while serving a request");
 
         self.active_files.borrow_mut().push(file);
-        let result = parse_and_cache(&self.arena, &self.context, file, Some(loader));
+        // Cross-unit import: loaded for its INTERFACE only. Do NOT retain the
+        // body — an imported unit is never the active editor unit, so its body is
+        // dead weight; retaining it for every import load (RTL/VCL closure) is the
+        // 20 GB OOM this fixes. Interface + flat usages (cross-unit references)
+        // are kept regardless.
+        let result = parse_and_cache(&self.arena, &self.context, file, Some(loader), false);
         self.active_files.borrow_mut().pop();
 
         match result {
@@ -396,7 +401,7 @@ mod tests {
 
         let file = arena.load(directory.join("UnitB.pas")).unwrap();
         let (outcome, artifact) =
-            pipeline::parse_and_cache(&arena, &context, file, Some(loader)).unwrap();
+            pipeline::parse_and_cache(&arena, &context, file, Some(loader), true).unwrap();
 
         // branch taken: Alpha found in lazily-parsed UnitA; Missing → false
         // (all imports resolvable → confident false, no diagnostic policy hit)
@@ -439,7 +444,7 @@ mod tests {
 
         let file = arena.load(directory.join("UnitA.pas")).unwrap();
         let (_outcome, meta) =
-            pipeline::parse_and_cache(&arena, &context, file, Some(loader)).unwrap();
+            pipeline::parse_and_cache(&arena, &context, file, Some(loader), true).unwrap();
         // parse completes; the cycle-dependent branch fell to AssumeFalse
         // and left a diagnostic trail
         let names = declaration_names(&meta.unwrap());
@@ -464,7 +469,7 @@ mod tests {
 
         let file = arena.load(directory.join("UnitB.pas")).unwrap();
         let (outcome, meta) =
-            pipeline::parse_and_cache(&arena, &context, file, Some(loader)).unwrap();
+            pipeline::parse_and_cache(&arena, &context, file, Some(loader), true).unwrap();
         assert_eq!(declaration_names(&meta.unwrap()), ["Safe"]);
         assert!(!outcome.diagnostics.is_empty(), "Unknown must leave a diagnostic");
     }
@@ -503,7 +508,7 @@ mod tests {
 
         let file = arena.load(directory.join("Consumer.pas")).unwrap();
         let (_outcome, meta) =
-            pipeline::parse_and_cache(&arena, &context, file, Some(loader)).unwrap();
+            pipeline::parse_and_cache(&arena, &context, file, Some(loader), true).unwrap();
         // Computed = 1 + 2 is not a single literal → Unknown → AssumeFalse
         // (honest: the value EXISTS but is not capturable yet — diagnostic)
         assert_eq!(
@@ -544,7 +549,7 @@ mod tests {
         let loader = UnitLoader::new(arena, context.clone(), None);
         let file = arena.load(directory.join("Consumer.pas")).unwrap();
         let (_outcome, meta) =
-            pipeline::parse_and_cache(&arena, &context, file, Some(loader)).unwrap();
+            pipeline::parse_and_cache(&arena, &context, file, Some(loader), true).unwrap();
         // The qualified SizeOf resolved to 8 despite the missing NowhereUnit
         // being scanned first → `Sized` kept, `Unsized` not.
         assert_eq!(declaration_names(&meta.unwrap()), ["Sized"]);
@@ -578,7 +583,7 @@ mod tests {
         let loader = UnitLoader::new(arena, context.clone(), None);
         let file = arena.load(directory.join("UseBits.pas")).unwrap();
         let (_outcome, meta) =
-            pipeline::parse_and_cache(&arena, &context, file, Some(loader)).unwrap();
+            pipeline::parse_and_cache(&arena, &context, file, Some(loader), true).unwrap();
         assert_eq!(declaration_names(&meta.unwrap()), ["Matched", "NotEqual"]);
     }
 
@@ -603,7 +608,7 @@ mod tests {
         let loader = UnitLoader::new(arena, context.clone(), None);
         let file = arena.load(directory.join("UnitO.pas")).unwrap();
         let (_outcome, meta) =
-            pipeline::parse_and_cache(&arena, &context, file, Some(loader)).unwrap();
+            pipeline::parse_and_cache(&arena, &context, file, Some(loader), true).unwrap();
         let names = declaration_names(&meta.unwrap());
         // present direct members → true. `TFoo.Nope`: TFoo is a class, so it
         // can inherit (implicit TObject) → the missing member degrades to
@@ -642,7 +647,7 @@ mod tests {
         let loader = UnitLoader::new(arena, context.clone(), None);
         let file = arena.load(directory.join("Inherit.pas")).unwrap();
         let (outcome, meta) =
-            pipeline::parse_and_cache(&arena, &context, file, Some(loader)).unwrap();
+            pipeline::parse_and_cache(&arena, &context, file, Some(loader), true).unwrap();
         let names = declaration_names(&meta.unwrap());
         // direct member of the child → true
         assert!(names.contains(&"HasChild".to_string()));
@@ -704,7 +709,7 @@ mod tests {
         let loader = UnitLoader::new(arena, context.clone(), None);
         let file = arena.load(directory.join("Client.pas")).unwrap();
         let (_outcome, meta) =
-            pipeline::parse_and_cache(&arena, &context, file, Some(loader)).unwrap();
+            pipeline::parse_and_cache(&arena, &context, file, Some(loader), true).unwrap();
         let meta = meta.unwrap();
         let names = declaration_names(&meta);
         assert!(names.contains(&"HasName".to_string()));
@@ -751,7 +756,7 @@ mod tests {
         let loader = UnitLoader::new(arena, context.clone(), None);
         let file = arena.load(directory.join("User.pas")).unwrap();
         let (outcome, meta) =
-            pipeline::parse_and_cache(&arena, &context, file, Some(loader)).unwrap();
+            pipeline::parse_and_cache(&arena, &context, file, Some(loader), true).unwrap();
         let names = declaration_names(&meta.unwrap());
         assert!(names.contains(&"HasChild".to_string()));
         let inherited_true = names.contains(&"InheritedTrue".to_string());
@@ -800,7 +805,7 @@ mod tests {
         let loader = UnitLoader::new(arena, context.clone(), None);
         let file = arena.load(directory.join("Alias.pas")).unwrap();
         let (outcome, meta) =
-            pipeline::parse_and_cache(&arena, &context, file, Some(loader)).unwrap();
+            pipeline::parse_and_cache(&arena, &context, file, Some(loader), true).unwrap();
         let names = declaration_names(&meta.unwrap());
         // A member of the aliased target — direct OR inherited — must NOT be a
         // confident false. Until #33 resolves the alias target we cannot return
@@ -864,7 +869,7 @@ mod tests {
         let loader = UnitLoader::new(arena, context.clone(), None);
         let file = arena.load(directory.join("AliasUser.pas")).unwrap();
         let (outcome, meta) =
-            pipeline::parse_and_cache(&arena, &context, file, Some(loader)).unwrap();
+            pipeline::parse_and_cache(&arena, &context, file, Some(loader), true).unwrap();
         let names = declaration_names(&meta.unwrap());
         assert!(
             names.contains(&"DirectElse".to_string()) && !names.contains(&"DirectTrue".to_string()),
@@ -900,7 +905,7 @@ mod tests {
         let loader = UnitLoader::new(arena, context.clone(), None);
         let file = arena.load(directory.join("UnitU.pas")).unwrap();
         let (outcome, meta) =
-            pipeline::parse_and_cache(&arena, &context, file, Some(loader)).unwrap();
+            pipeline::parse_and_cache(&arena, &context, file, Some(loader), true).unwrap();
         // Unknown → AssumeFalse policy → else branch, plus a diagnostic
         assert_eq!(declaration_names(&meta.unwrap()), ["Safe"]);
         assert!(!outcome.diagnostics.is_empty(), "Unknown must leave a diagnostic");
@@ -927,7 +932,7 @@ mod tests {
         let loader = UnitLoader::new(arena, context.clone(), None);
         let file = arena.load(directory.join("Nested.pas")).unwrap();
         let (_outcome, meta) =
-            pipeline::parse_and_cache(&arena, &context, file, Some(loader)).unwrap();
+            pipeline::parse_and_cache(&arena, &context, file, Some(loader), true).unwrap();
         let names = declaration_names(&meta.unwrap());
         assert!(names.contains(&"HasLeaf".to_string()));
         assert!(names.contains(&"NoNope".to_string()));
@@ -1009,7 +1014,7 @@ mod tests {
 
         let file = arena.load(directory.join("Chain0.pas")).unwrap();
         let (_outcome, meta) =
-            pipeline::parse_and_cache(&arena, &context, file, Some(loader.clone())).unwrap();
+            pipeline::parse_and_cache(&arena, &context, file, Some(loader.clone()), true).unwrap();
         // Chain0 itself parsed successfully.
         assert!(meta.is_some());
 
@@ -1067,7 +1072,7 @@ mod tests {
 
         let file = arena.load(directory.join("Chain0.pas")).unwrap();
         let (_outcome, meta) =
-            pipeline::parse_and_cache(&arena, &context, file, Some(loader.clone())).unwrap();
+            pipeline::parse_and_cache(&arena, &context, file, Some(loader.clone()), true).unwrap();
         assert!(meta.is_some());
 
         // Under budget, the whole tail resolved: the last link is in the cache and
@@ -1096,7 +1101,7 @@ mod tests {
 
         let file = arena.load(directory.join("Chain0.pas")).unwrap();
         let (_outcome, meta) =
-            pipeline::parse_and_cache(&arena, &context, file, Some(loader.clone())).unwrap();
+            pipeline::parse_and_cache(&arena, &context, file, Some(loader.clone()), true).unwrap();
         // Chain0 parses (its own buffer), but its `{$IF Declared(Marker1)}` could
         // not force-load Chain1 — that import stays out of the cache.
         assert!(meta.is_some());

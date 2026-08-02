@@ -171,7 +171,7 @@ mod tests {
         .unwrap();
 
         let mut session = session_in(&directory);
-        session.parse_source_file(directory.join("Calc.pas")).unwrap();
+        session.parse_source_file(directory.join("Calc.pas"), true).unwrap();
         let key = session.context().intern_key("CALC");
         let content = std::fs::read_to_string(directory.join("Calc.pas")).unwrap();
         // the CALL-SITE `Add` in the body (not the declaration).
@@ -217,7 +217,7 @@ mod tests {
         .unwrap();
 
         let mut session = session_in(&directory);
-        session.parse_source_file(directory.join("App.pas")).unwrap();
+        session.parse_source_file(directory.join("App.pas"), true).unwrap();
         let key = session.context().intern_key("APP");
         let content = std::fs::read_to_string(directory.join("App.pas")).unwrap();
         // offset inside `Compute` in `TUser.Compute(5)`.
@@ -246,7 +246,7 @@ mod tests {
         .unwrap();
 
         let mut session = session_in(&directory);
-        session.parse_source_file(directory.join("U.pas")).unwrap();
+        session.parse_source_file(directory.join("U.pas"), true).unwrap();
         let key = session.context().intern_key("U");
         let content = std::fs::read_to_string(directory.join("U.pas")).unwrap();
         // `TThing(` is a type cast, not a routine call → no signature.
@@ -272,7 +272,7 @@ mod tests {
         .unwrap();
 
         let mut session = session_in(&directory);
-        session.parse_source_file(directory.join("Log.pas")).unwrap();
+        session.parse_source_file(directory.join("Log.pas"), true).unwrap();
         let key = session.context().intern_key("LOG");
         let content = std::fs::read_to_string(directory.join("Log.pas")).unwrap();
         let callee = content.rfind("Write(").unwrap() as u32;

@@ -7022,6 +7022,13 @@ mod tests {
         // size (body-included). Interpreted after the loop.
         let mut total_estimated_with_body: u64 = 0;
         let mut total_estimated_interface_only: u64 = 0;
+        // MEMORY FIX MEASUREMENT: the weight of the meta AS ACTUALLY BUILT BY THE
+        // INDEXING PATH now — `pipeline::build_unit_meta(.., retain_body=false)` —
+        // which drops the body. This figure should essentially EQUAL the
+        // interface-only figure (bodies are no longer retained for indexed units),
+        // confirming the fix. Contrast with `total_estimated_with_body`, the
+        // hypothetical cost had we retained every body (the pre-fix OOM shape).
+        let mut total_estimated_indexed_bodyless: u64 = 0;
         let mut total_serialized_compressed: u64 = 0;
         let mut units_measured: u64 = 0;
         for path in &files {
@@ -7053,35 +7060,48 @@ mod tests {
                         path.display()
                     );
 
-                    // S3 MEMORY MEASUREMENT: build the real UnitMeta and weigh it.
-                    // (a) full weight (body included) = estimated_bytes(). (b) the
-                    // interface-only figure (the cost a cross-unit interface load
-                    // pays) = full minus the body's structural charge, which the
-                    // weigher adds as node_count * BODY_BYTES_PER_NODE. Only for
-                    // real units (a Unit AST); non-unit sources produce no meta.
-                    let source_len =
-                        arena.loaded_content(file).len().min(u32::MAX as usize) as u32;
+                    // MEMORY MEASUREMENT: build the real UnitMeta via the
+                    // production `build_unit_meta` with retain_body = false (the
+                    // indexing path) and weigh it. The as-indexed (bodyless) figure
+                    // is the interface-only cost; the hypothetical with-body figure
+                    // adds back the body's structural charge (node_count *
+                    // BODY_BYTES_PER_NODE). Only for real units (a Unit AST);
+                    // non-unit sources produce no meta. `build_unit_meta` reads the
+                    // source length from the arena itself.
                     if let Some(crate::ast::Source::Unit(unit)) = outcome.source.take() {
-                        let body = outcome.implementation_body.clone();
-                        let body_charge = (body.node_count()
+                        // The body's structural weigher charge (what retaining a
+                        // body ADDS to a meta's weight): node_count * per-node.
+                        let body_charge = (outcome.implementation_body.node_count()
                             * crate::unit_meta::UnitMeta::BODY_BYTES_PER_NODE)
                             as u64;
-                        let with_body = crate::unit_meta::UnitMeta::new(
+                        // Build the meta AS THE INDEXING PATH NOW DOES:
+                        // retain_body = false → the body is DROPPED, so this meta is
+                        // bodyless (the memory fix). The `unit` AST is moved in here.
+                        let indexed = crate::pipeline::build_unit_meta(
+                            arena,
+                            file,
                             unit,
-                            outcome.cycle_tainted,
-                            path.to_path_buf(),
-                            0,
-                            Vec::new(),
+                            &outcome.seen_includes,
                             outcome.dependencies.clone(),
                             outcome.usages.clone(),
-                        )
-                        .with_source_len(source_len)
-                        .with_implementation_body(body);
-                        let full = with_body.estimated_bytes() as u64;
-                        total_estimated_with_body += full;
-                        total_estimated_interface_only += full.saturating_sub(body_charge);
-                        // Real compressed on-disk segment size (body included).
-                        if let Ok(segment) = crate::unit_cache::serialize_meta(&with_body) {
+                            outcome.implementation_body.clone(),
+                            outcome.cycle_tainted,
+                            outcome.recovered,
+                            false, // retain_body = false: bodyless, as when indexing
+                        );
+                        // As-indexed (bodyless) weight — the real figure now.
+                        let indexed_bytes = indexed.estimated_bytes() as u64;
+                        total_estimated_indexed_bodyless += indexed_bytes;
+                        // The bodyless meta's weight IS the interface-only cost (its
+                        // body charge is zero — no body retained).
+                        total_estimated_interface_only += indexed_bytes;
+                        // The hypothetical WITH-body weight (the pre-fix shape): the
+                        // same meta plus what a retained body would have added.
+                        total_estimated_with_body += indexed_bytes + body_charge;
+                        // Real compressed on-disk segment size. The body is
+                        // #[serde(skip)], so the segment is body-free regardless —
+                        // exactly the interface + flat-usages snapshot that persists.
+                        if let Ok(segment) = crate::unit_cache::serialize_meta(&indexed) {
                             total_serialized_compressed += segment.len() as u64;
                         }
                         units_measured += 1;
@@ -7141,10 +7161,18 @@ mod tests {
         } else {
             0.0
         };
+        let indexed_bodyless_mb = total_estimated_indexed_bodyless as f64 / megabyte;
         println!(
-            "S3 memory over {units_measured} units: weighed estimate WITH body = {with_body_mb:.2} MB; INTERFACE-ONLY (body excluded) = {interface_only_mb:.2} MB; body adds {:.2} MB total; avg body cost = {avg_body_bytes} bytes/unit; with-body/interface-only weight ratio = {ratio:.2}x; total compressed on-disk (body included) = {:.2} MB",
+            "S3 memory over {units_measured} units: AS-INDEXED (retain_body=false, bodyless) = {indexed_bodyless_mb:.2} MB; INTERFACE-ONLY (body excluded) = {interface_only_mb:.2} MB; hypothetical WITH body (pre-fix shape) = {with_body_mb:.2} MB; a retained body WOULD add {:.2} MB total; avg body cost = {avg_body_bytes} bytes/unit; hypothetical-with-body/as-indexed weight ratio = {ratio:.2}x; total compressed on-disk (body #[serde(skip)], never persisted) = {:.2} MB",
             body_only as f64 / megabyte,
             total_serialized_compressed as f64 / megabyte,
+        );
+        // MEMORY FIX ASSERTION: the AS-INDEXED (bodyless) total must EQUAL the
+        // interface-only total — indexing no longer retains any body, so the two
+        // figures are the same. (Pre-fix, with-body would have been `ratio`x this.)
+        assert_eq!(
+            total_estimated_indexed_bodyless, total_estimated_interface_only,
+            "as-indexed weight must equal interface-only — bodies are no longer retained when indexing"
         );
     }
 
@@ -7486,7 +7514,7 @@ mod tests {
                     context_ref.clone(),
                     Some(index_ref.clone()),
                 );
-                crate::pipeline::parse_and_cache(arena, context_ref, file, Some(loader))
+                crate::pipeline::parse_and_cache(arena, context_ref, file, Some(loader), true)
             }));
 
             match result {

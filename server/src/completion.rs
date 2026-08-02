@@ -190,7 +190,7 @@ mod tests {
         .unwrap();
 
         let mut session = session_in(&directory);
-        session.parse_source_file(directory.join("App.pas")).unwrap();
+        session.parse_source_file(directory.join("App.pas"), true).unwrap();
         let app_key = session.context().intern_key("APP");
 
         // A position just after the `Paint` declaration (top-level, no dot).
@@ -235,7 +235,7 @@ mod tests {
 
         let mut session = session_in(&directory);
         session
-            .parse_source_file(directory.join("Shapes.pas"))
+            .parse_source_file(directory.join("Shapes.pas"), true)
             .unwrap();
         let key = session.context().intern_key("SHAPES");
 
@@ -272,7 +272,7 @@ mod tests {
         .unwrap();
 
         let mut session = session_in(&directory);
-        session.parse_source_file(directory.join("Only.pas")).unwrap();
+        session.parse_source_file(directory.join("Only.pas"), true).unwrap();
         let key = session.context().intern_key("ONLY");
         let content = std::fs::read_to_string(directory.join("Only.pas")).unwrap();
         let dot = content.rfind("TGhost.").unwrap() + "TGhost.".len();

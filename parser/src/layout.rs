@@ -675,7 +675,7 @@ mod tests {
         let context = context_for(platform, switches);
         let arena = crate::globals::arena();
         let file = arena.insert_virtual("SizeOfProbe.pas", source);
-        let (_outcome, meta) = parse_and_cache(arena, &context, file, None).unwrap();
+        let (_outcome, meta) = parse_and_cache(arena, &context, file, None, true).unwrap();
         meta.unwrap()
             .ast
             .interface_declarations
@@ -932,7 +932,7 @@ mod tests {
         let arena = crate::globals::arena();
         let loader = UnitLoader::new(arena, context.clone(), None);
         let file = arena.load(directory.join("UsesShapes.pas")).unwrap();
-        let (_outcome, meta) = parse_and_cache(arena, &context, file, Some(loader)).unwrap();
+        let (_outcome, meta) = parse_and_cache(arena, &context, file, Some(loader), true).unwrap();
         let meta = meta.unwrap();
         let names: Vec<String> = meta
             .ast
@@ -983,7 +983,7 @@ mod tests {
         let arena = crate::globals::arena();
         let loader = UnitLoader::new(arena, context.clone(), None);
         let file = arena.load(directory.join("UsesShapes.pas")).unwrap();
-        let (_outcome, meta) = parse_and_cache(arena, &context, file, Some(loader)).unwrap();
+        let (_outcome, meta) = parse_and_cache(arena, &context, file, Some(loader), true).unwrap();
         let meta = meta.unwrap();
         let names: Vec<String> = meta
             .ast

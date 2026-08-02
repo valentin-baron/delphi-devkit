@@ -2199,8 +2199,8 @@ mod lifecycle_tests {
         // an import, so the imports must already be cached for the check to
         // evaluate them. Parse them from disk first (as would happen once the
         // user navigates into them).
-        session.parse_source_file(directory.join("Used.pas")).unwrap();
-        session.parse_source_file(directory.join("Unused.pas")).unwrap();
+        session.parse_source_file(directory.join("Used.pas"), true).unwrap();
+        session.parse_source_file(directory.join("Unused.pas"), true).unwrap();
         let text = "unit Consumer;\ninterface\nuses Used, Unused;\n\
              implementation\n\
              procedure P;\nvar X: TUsed;\nbegin X := TUsed.Create; end;\n\
@@ -2381,7 +2381,7 @@ mod lifecycle_tests {
         let mut session = build_fallback_session_with_search_path(directory.clone());
         // Parse the import from disk so it becomes a resident on-disk arena entry.
         let import_path = directory.join("Imported19.pas");
-        session.parse_source_file(&import_path).unwrap();
+        session.parse_source_file(&import_path, true).unwrap();
 
         // A consumer buffer that uses the import and references its type.
         let text = "unit Consumer19;\ninterface\nuses Imported19;\n\
