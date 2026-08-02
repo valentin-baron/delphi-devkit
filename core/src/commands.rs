@@ -1646,26 +1646,6 @@ pub enum DelphiLspOrAmbiguity {
     Ambiguity(AmbiguousProjects),
 }
 
-/// The compiler configuration a managed project builds with: its workspace's,
-/// or the group project's when the project only lives there.
-async fn compiler_for_project(
-    data: &ProjectsData,
-    project_id: usize,
-) -> Option<CompilerConfiguration> {
-    for workspace in &data.workspaces {
-        if workspace.project_links.iter().any(|l| l.project_id == project_id) {
-            return Some(workspace.compiler().await);
-        }
-    }
-    let group_project = data.group_project.as_ref()?;
-    group_project
-        .project_links
-        .iter()
-        .any(|l| l.project_id == project_id)
-        .then_some(())?;
-    Some(data.group_projects_compiler().await)
-}
-
 /// Build the generation request for a project already managed by DDK.
 async fn delphilsp_request_for_project(
     project_id: usize,
@@ -1678,7 +1658,7 @@ async fn delphilsp_request_for_project(
         Some(p) => p,
         _ => bail!("Project with ID {project_id} not found."),
     };
-    let compiler = match compiler_for_project(&data, project_id).await {
+    let compiler = match data.compiler_for_project(project_id).await {
         Some(c) => c,
         _ => bail!(
             "Project \"{}\" is not linked to a workspace or the group project, so no compiler can be determined.",

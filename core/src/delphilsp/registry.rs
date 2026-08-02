@@ -27,8 +27,7 @@ pub struct IdeLibrarySettings {
 mod imp {
     use super::IdeLibrarySettings;
     use winreg::RegKey;
-    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, REG_EXPAND_SZ, REG_SZ};
-    use winreg::types::FromRegValue;
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
 
     fn bds_key(bds_version: &str, sub_key: &str) -> Option<RegKey> {
         let path = format!("SOFTWARE\\Embarcadero\\BDS\\{bds_version}\\{sub_key}");
@@ -57,21 +56,6 @@ mod imp {
         }
     }
 
-    pub fn read_ide_environment_variables(bds_version: &str) -> Vec<(String, String)> {
-        let Some(key) = bds_key(bds_version, "Environment Variables") else {
-            return Vec::new();
-        };
-        key.enum_values()
-            .filter_map(|entry| entry.ok())
-            // Only string values define a usable `$(NAME)` macro.
-            .filter(|(_, value)| matches!(value.vtype, REG_SZ | REG_EXPAND_SZ))
-            .filter_map(|(name, value)| {
-                // Proper registry decoding — `RegValue`'s Display is debug formatting.
-                let text = String::from_reg_value(&value).ok()?.trim().to_string();
-                (!name.trim().is_empty() && !text.is_empty()).then_some((name, text))
-            })
-            .collect()
-    }
 }
 
 #[cfg(not(windows))]
@@ -81,10 +65,15 @@ mod imp {
     pub fn read_ide_library_settings(_bds_version: &str, _platform: &str) -> IdeLibrarySettings {
         IdeLibrarySettings::default()
     }
-
-    pub fn read_ide_environment_variables(_bds_version: &str) -> Vec<(String, String)> {
-        Vec::new()
-    }
 }
 
-pub use imp::{read_ide_environment_variables, read_ide_library_settings};
+pub use imp::read_ide_library_settings;
+
+/// The user-defined environment-variable overrides of one BDS version
+/// (`"23.0"`). Thin adapter over [`crate::utils::bds_environment_overrides`],
+/// which owns the registry reading (including the Borland/CodeGear vendor
+/// roots of pre-XE versions).
+pub fn read_ide_environment_variables(bds_version: &str) -> Vec<(String, String)> {
+    let major = bds_version.split('.').next().and_then(|n| n.parse().ok()).unwrap_or(0);
+    crate::utils::bds_environment_overrides(major)
+}

@@ -31,10 +31,26 @@ pub fn bds_environment_overrides(bds_major_version: usize) -> Vec<(String, Strin
     let Ok(env_key) = hkcu.open_subkey(key_path) else {
         return Vec::new();
     };
+    read_environment_values(&env_key)
+}
+
+/// Decode the name/value pairs of an IDE `Environment Variables` registry key.
+/// Only string values (`REG_SZ`/`REG_EXPAND_SZ`) define a usable `$(NAME)`
+/// variable; names and values are trimmed and empty ones dropped.
+#[cfg(windows)]
+fn read_environment_values(env_key: &winreg::RegKey) -> Vec<(String, String)> {
+    use winreg::enums::{REG_EXPAND_SZ, REG_SZ};
+    use winreg::types::FromRegValue;
+
     env_key
         .enum_values()
         .flatten()
-        .map(|(name, value)| (name, value.to_string()))
+        .filter(|(_, value)| matches!(value.vtype, REG_SZ | REG_EXPAND_SZ))
+        .filter_map(|(name, value)| {
+            // Proper registry decoding — `RegValue`'s Display is debug formatting.
+            let text = String::from_reg_value(&value).ok()?.trim().to_string();
+            (!name.trim().is_empty() && !text.is_empty()).then_some((name, text))
+        })
         .collect()
 }
 
@@ -66,11 +82,7 @@ pub fn ide_environment_overrides() -> Vec<(String, String)> {
         let Ok(env_key) = bds.open_subkey(format!(r"{version}\Environment Variables")) else {
             continue;
         };
-        let overrides: Vec<(String, String)> = env_key
-            .enum_values()
-            .flatten()
-            .map(|(name, value)| (name, value.to_string()))
-            .collect();
+        let overrides = read_environment_values(&env_key);
         if !overrides.is_empty() {
             return overrides;
         }

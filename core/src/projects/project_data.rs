@@ -74,23 +74,31 @@ impl ProjectsData {
         }
     }
 
-    /// The IDE environment-variable overrides applying to a project: those of
-    /// the compiler configuration of the first workspace containing it, else
-    /// the group project's compiler when it is a group-project member, else
-    /// (no owning context to pick a configuration from) the fallback set of
-    /// the highest installed BDS version.
-    pub async fn ide_environment_for_project(&self, project_id: usize) -> Vec<(String, String)> {
+    /// The compiler configuration a managed project builds with: that of the
+    /// first workspace containing it, else the group project's compiler when
+    /// it is a group-project member, else `None` (orphan project).
+    pub async fn compiler_for_project(&self, project_id: usize) -> Option<CompilerConfiguration> {
         for workspace in &self.workspaces {
             if workspace.project_links.iter().any(|link| link.project_id == project_id) {
-                return workspace.compiler().await.ide_environment_overrides();
+                return Some(workspace.compiler().await);
             }
         }
-        if let Some(group_project) = &self.group_project {
-            if group_project.project_links.iter().any(|link| link.project_id == project_id) {
-                return self.group_projects_compiler().await.ide_environment_overrides();
-            }
+        let group_project = self.group_project.as_ref()?;
+        if group_project.project_links.iter().any(|link| link.project_id == project_id) {
+            return Some(self.group_projects_compiler().await);
         }
-        crate::utils::ide_environment_overrides()
+        None
+    }
+
+    /// The IDE environment-variable overrides applying to a project: those of
+    /// its compiler configuration ([`Self::compiler_for_project`]), else (no
+    /// owning context to pick a configuration from) the fallback set of the
+    /// highest installed BDS version.
+    pub async fn ide_environment_for_project(&self, project_id: usize) -> Vec<(String, String)> {
+        match self.compiler_for_project(project_id).await {
+            Some(compiler) => compiler.ide_environment_overrides(),
+            _ => crate::utils::ide_environment_overrides(),
+        }
     }
 
     async fn validate_compilers(&self) -> Result<()> {
