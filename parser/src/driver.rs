@@ -561,6 +561,32 @@ impl ProjectSession {
                 }
             }
         }
+        // MEMBER USAGE (ledger #41): the cursor is on the `Member` part of a
+        // `receiver.Member` access in the implementation body. Type the receiver
+        // expression; when it resolves to some owner type, return a `Member`
+        // target with that owner so `definition_at`/`hover_info` route through
+        // the inheritance-flattened `member_definition`/`member_hover`.
+        //
+        // NEVER-WRONG: only when the receiver ACTUALLY types (else fall through
+        // to today's bare-usage behavior). A member on an un-typeable receiver
+        // — or a same-named top-level symbol — is never returned as a wrong
+        // jump; the member's owner must resolve first.
+        if let Some((receiver, member_key, member_location)) =
+            self.member_occurrence_at(&meta, position)
+        {
+            if let Some(owner_type) =
+                self.type_of_expression(&meta, member_location.span.start, receiver)
+            {
+                return Some(QueryTarget {
+                    key: member_key,
+                    display: member_key,
+                    kind: TargetKind::Member,
+                    location: member_location,
+                    owner_type: Some(owner_type),
+                });
+            }
+        }
+
         // Otherwise a usage occurrence. Pick the tightest span covering the
         // position (nested spans can overlap; the smallest is the ident).
         meta.usages
@@ -1454,6 +1480,122 @@ impl ProjectSession {
         None
     }
 
+    /// The INNERMOST `Expression::Member` in this unit's `implementation_body`
+    /// whose `member` name span covers `position` — i.e. the cursor is on the
+    /// `Member` part of a `receiver.Member` access. Returns the member's
+    /// receiver expression, its folded key and its exact occurrence span.
+    ///
+    /// Same-unit only: never loads another unit's body (memory discipline —
+    /// only the ACTIVE unit's `implementation_body` is consulted). Walks the
+    /// whole scope tree (routines → nested/anonymous scopes → statements →
+    /// expressions, including `with` items and initialization/finalization) and
+    /// keeps the TIGHTEST covering member occurrence, so a chain `A.B.C` with
+    /// the cursor on `C` returns `(A.B, C)` — the outermost `Member` whose own
+    /// `member` span is the one under the cursor.
+    fn member_occurrence_at<'a>(
+        &self,
+        meta: &'a UnitMeta,
+        position: u32,
+    ) -> Option<(&'a crate::ast_impl::Expression, Identifier, CodeLocation)> {
+        let body = &meta.implementation_body;
+        let mut best: Option<(&crate::ast_impl::Expression, Identifier, CodeLocation)> = None;
+        for routine in &body.routines {
+            find_member_occurrence_in_scope(&routine.scope, position, &mut best);
+        }
+        if let Some(initialization) = &body.initialization {
+            find_member_occurrence_in_statements(initialization, position, &mut best);
+        }
+        if let Some(finalization) = &body.finalization {
+            find_member_occurrence_in_statements(finalization, position, &mut best);
+        }
+        best
+    }
+
+    /// Infer the declared TYPE key of a receiver `expression`, for member
+    /// go-to/hover. `position_for_scope` locates the enclosing routine when a
+    /// leaf identifier must be resolved as a body local/parameter.
+    ///
+    /// NEVER-WRONG: returns `None` on anything unresolved. An inferred type is
+    /// only ever a type that genuinely owns the receiver — so the caller never
+    /// produces a wrong owner (and thus never a wrong jump). Same-unit for the
+    /// scope-local branch; cross-unit type/member lookups reuse the existing
+    /// own→imports loader machinery (`member_receiver_at`, `flattened_members`).
+    fn type_of_expression(
+        &self,
+        meta: &UnitMeta,
+        position_for_scope: u32,
+        expression: &crate::ast_impl::Expression,
+    ) -> Option<Identifier> {
+        use crate::ast_impl::Expression;
+        match expression {
+            // A bare (possibly dotted) name. Mirror `member_receiver_at`'s
+            // branches (a)–(d): a body local/param, an own type or typed
+            // var/const/field, or an imported type.
+            Expression::Identifier(name) => {
+                let receiver_key = name.key;
+                // (1) a body local/param of the enclosing routine with a simple
+                // declared type (reuse the exact same machinery `member_receiver_at`
+                // relies on). Locate the scope from the local occurrence's own
+                // position when present, else the cursor position.
+                if let Some(type_key) =
+                    self.local_receiver_type_key(meta, name.location.span.start, receiver_key)
+                {
+                    return Some(type_key);
+                }
+                // (2) an OWN interface symbol that IS a type (static `TFoo.`),
+                // or a var/const/field with a known declared type.
+                if let Some(symbol) = meta.interface().find(receiver_key) {
+                    if symbol.kind == SymbolKind::Type {
+                        return Some(receiver_key);
+                    }
+                    if let Some(type_key) = symbol_declared_type_key(symbol) {
+                        return Some(type_key);
+                    }
+                }
+                // (3) an imported unit's type (static `TFoo.` from a uses).
+                let loader = self.make_loader();
+                for import in imports_reversed(meta) {
+                    if let crate::parse_state::LoadOutcome::Loaded(imported) =
+                        loader.interface_of(import)
+                    {
+                        if let Some(symbol) = imported.interface().find(receiver_key) {
+                            if symbol.kind == SymbolKind::Type {
+                                return Some(receiver_key);
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            // `receiver.member` — type the receiver, then look up the member's
+            // OWN declared type on that owner's flattened (inheritance-aware)
+            // surface. This gives chain support (`A.B.C`).
+            Expression::Member { receiver, member } => {
+                let owner_type = self.type_of_expression(meta, position_for_scope, receiver)?;
+                self.flattened_members(meta, owner_type)
+                    .iter()
+                    .find(|(_, resolved)| resolved.key == member.key)
+                    .and_then(|(_, resolved)| resolved.type_key)
+            }
+            // `operand as type_name` — the cast type is the receiver type.
+            Expression::Cast { type_name, .. } => Some(type_name.key),
+            // `(inner)` — grouping is transparent.
+            Expression::Parenthesized(inner) => {
+                self.type_of_expression(meta, position_for_scope, inner)
+            }
+            // `callee(args)` — a call yields the callee's declared type. When
+            // `callee` is a `Member`, typing it already resolves that member's
+            // declared type (methods carry their return type as `type_key`).
+            Expression::Call { callee, .. } => {
+                self.type_of_expression(meta, position_for_scope, callee)
+            }
+            // Array-element typing is a later refinement — never a wrong answer.
+            Expression::Index { .. } => None,
+            // Anything else carries no tractable receiver type.
+            _ => None,
+        }
+    }
+
     /// Whether an actual `.` (member-access dot) sits between `receiver_end` and
     /// `position` in `file`'s source, modulo whitespace — i.e. the last
     /// non-whitespace byte before the cursor is a `.`. The dot gate for member
@@ -2038,6 +2180,114 @@ impl ProjectSession {
 /// zero-length span covers nothing.
 fn span_covers(location: CodeLocation, position: u32) -> bool {
     location.span.start <= position && position < location.span.end
+}
+
+// ─── Member-occurrence location over the implementation body (ledger #41) ────
+//
+// These walkers find the `Expression::Member` whose OWN `member` name span
+// covers a cursor position — the receiver of that `Member` is what the member
+// go-to/hover types. The TIGHTEST covering member wins (in a chain `A.B.C`, the
+// cursor lands on exactly one member span; nested `Member`s do not overlap on
+// their own member spans, but keeping the shortest is a robust tiebreak).
+
+type MemberOccurrence<'a> = (&'a crate::ast_impl::Expression, Identifier, CodeLocation);
+
+fn find_member_occurrence_in_scope<'a>(
+    scope: &'a crate::ast_impl::Scope,
+    position: u32,
+    best: &mut Option<MemberOccurrence<'a>>,
+) {
+    find_member_occurrence_in_statements(&scope.statements, position, best);
+}
+
+fn find_member_occurrence_in_statements<'a>(
+    statements: &'a [crate::ast_impl::Statement],
+    position: u32,
+    best: &mut Option<MemberOccurrence<'a>>,
+) {
+    use crate::ast_impl::Statement;
+    for statement in statements {
+        match statement {
+            Statement::Expression(expression) => {
+                find_member_occurrence_in_expression(expression, position, best)
+            }
+            Statement::Assignment { target, value } => {
+                find_member_occurrence_in_expression(target, position, best);
+                find_member_occurrence_in_expression(value, position, best);
+            }
+            Statement::LocalVar(_, Some(expression)) => {
+                find_member_occurrence_in_expression(expression, position, best)
+            }
+            Statement::LocalVar(_, None) | Statement::Opaque(_) => {}
+            Statement::With { items, body } => {
+                for item in items {
+                    find_member_occurrence_in_expression(item, position, best);
+                }
+                find_member_occurrence_in_statements(body, position, best);
+            }
+            Statement::ChildScope(scope) => find_member_occurrence_in_scope(scope, position, best),
+            Statement::Group(inner) => find_member_occurrence_in_statements(inner, position, best),
+        }
+    }
+}
+
+fn find_member_occurrence_in_expression<'a>(
+    expression: &'a crate::ast_impl::Expression,
+    position: u32,
+    best: &mut Option<MemberOccurrence<'a>>,
+) {
+    use crate::ast_impl::Expression;
+    match expression {
+        Expression::Member { receiver, member } => {
+            // First recurse into the receiver (a nested member `A.B` under a
+            // `A.B.C` still has its own coverable member spans).
+            find_member_occurrence_in_expression(receiver, position, best);
+            if span_covers(member.location, position) {
+                let candidate: MemberOccurrence<'a> = (receiver, member.key, member.location);
+                let is_tighter = best
+                    .as_ref()
+                    .map(|(_, _, existing)| {
+                        member.location.span.len() < existing.span.len()
+                    })
+                    .unwrap_or(true);
+                if is_tighter {
+                    *best = Some(candidate);
+                }
+            }
+        }
+        Expression::Call { callee, arguments, .. } => {
+            find_member_occurrence_in_expression(callee, position, best);
+            for argument in arguments {
+                find_member_occurrence_in_expression(argument, position, best);
+            }
+        }
+        Expression::Index { base, indices } => {
+            find_member_occurrence_in_expression(base, position, best);
+            for index in indices {
+                find_member_occurrence_in_expression(index, position, best);
+            }
+        }
+        Expression::Cast { operand, .. } => {
+            find_member_occurrence_in_expression(operand, position, best)
+        }
+        Expression::Unary { operand, .. } => {
+            find_member_occurrence_in_expression(operand, position, best)
+        }
+        Expression::Binary { left, right, .. } => {
+            find_member_occurrence_in_expression(left, position, best);
+            find_member_occurrence_in_expression(right, position, best);
+        }
+        Expression::Parenthesized(inner) => {
+            find_member_occurrence_in_expression(inner, position, best)
+        }
+        Expression::AnonymousMethod(scope) => {
+            find_member_occurrence_in_scope(scope, position, best)
+        }
+        Expression::Identifier(_)
+        | Expression::Inherited { .. }
+        | Expression::SetOrArrayLiteral(_)
+        | Expression::Literal(_) => {}
+    }
 }
 
 /// Map a body-local declaration kind to a [`CompletionKind`] for hover. A
@@ -5346,6 +5596,325 @@ mod tests {
             definition,
             vec![base_method_location],
             "go-to on inherited BaseMethod lands in TBase"
+        );
+    }
+
+    // ─── Member-usage go-to-definition + hover (ledger #41) ──────────────────
+
+    /// Byte offset of the FIRST char of the LAST occurrence of `needle` in
+    /// `file`'s source — a cursor position landing ON that identifier. Panics if
+    /// the text is absent.
+    fn position_at_last(session: &ProjectSession, file: FileId, needle: &str) -> u32 {
+        let content = session.arena.content(file).unwrap();
+        content.rfind(needle).expect("needle text present") as u32
+    }
+
+    #[test]
+    fn member_usage_goto_and_hover_same_unit() {
+        // Part 1: `Local.Field` where Local: TThing (same unit), TThing has
+        // Field → go-to on `Field` lands on Field's declaration; hover shows it.
+        let directory = temp_directory("member_usage_same_unit");
+        std::fs::write(
+            directory.join("Same.pas"),
+            "unit Same;\ninterface\n\
+             type TThing = class\n  Field: Integer;\nend;\n\
+             implementation\n\
+             procedure Run;\nvar Local: TThing;\nbegin\n  Local.Field := 1;\nend;\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("Same.pas")).unwrap();
+        let key = session.context.intern_key("SAME");
+        let meta = session.meta_of(key).unwrap();
+        let file = meta.usages.first().unwrap().location.file;
+
+        // The `Field` occurrence in `Local.Field`.
+        let position = position_at_last(&session, file, "Field :");
+        let target = session.symbol_at(key, position).expect("member target");
+        assert_eq!(target.kind, TargetKind::Member, "member usage kind");
+        assert_eq!(
+            target.owner_type,
+            Some(session.context.intern_key("TThing")),
+            "receiver typed to TThing"
+        );
+
+        // go-to lands on TThing.Field's declaration.
+        let field_location = meta
+            .interface()
+            .find(session.context.intern_key("TThing"))
+            .unwrap()
+            .find_member(session.context.intern_key("Field"))
+            .unwrap()
+            .location;
+        assert_eq!(
+            session.definition_at(key, position),
+            vec![field_location],
+            "go-to on Local.Field lands on Field's declaration"
+        );
+
+        // hover reports the member facts.
+        let hover = session.hover_info(key, position).expect("member hover");
+        assert_eq!(hover.type_key, Some(session.context.intern_key("Integer")));
+    }
+
+    #[test]
+    fn member_usage_goto_cross_unit_receiver_type() {
+        // Part 1 cross-unit: TThing lives in an imported unit.
+        let directory = temp_directory("member_usage_cross_unit");
+        std::fs::write(
+            directory.join("Things.pas"),
+            "unit Things;\ninterface\n\
+             type TThing = class\n  Field: Integer;\nend;\n\
+             implementation\nend.",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("User.pas"),
+            "unit User;\ninterface\nuses Things;\n\
+             implementation\n\
+             procedure Run;\nvar Local: TThing;\nbegin\n  Local.Field := 1;\nend;\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("User.pas")).unwrap();
+        let key = session.context.intern_key("USER");
+        let meta = session.meta_of(key).unwrap();
+        let file = meta.usages.first().unwrap().location.file;
+        let position = position_at_last(&session, file, "Field :");
+
+        // Resolve first (this loads + caches the imported Things unit via the
+        // loader), then read the expected declaration from the now-cached base.
+        let definition = session.definition_at(key, position);
+        let things_key = session.context.intern_key("THINGS");
+        let field_location = session
+            .meta_of(things_key)
+            .unwrap()
+            .interface()
+            .find(session.context.intern_key("TThing"))
+            .unwrap()
+            .find_member(session.context.intern_key("Field"))
+            .unwrap()
+            .location;
+        assert_eq!(
+            definition,
+            vec![field_location],
+            "cross-unit go-to on Local.Field lands in Things.pas"
+        );
+    }
+
+    #[test]
+    fn member_usage_goto_inherited_member() {
+        // Part 2: `C.BaseMethod` where C: TChild, TChild = class(TBase),
+        // BaseMethod on TBase → go-to lands on TBase's BaseMethod (same unit).
+        let directory = temp_directory("member_usage_inherited");
+        std::fs::write(
+            directory.join("Inh.pas"),
+            "unit Inh;\ninterface\n\
+             type\n  TBase = class\n    procedure BaseMethod;\n  end;\n\
+             \n  TChild = class(TBase)\n    procedure ChildMethod;\n  end;\n\
+             implementation\n\
+             procedure Use;\nvar C: TChild;\nbegin\n  C.BaseMethod;\nend;\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("Inh.pas")).unwrap();
+        let key = session.context.intern_key("INH");
+        let meta = session.meta_of(key).unwrap();
+        let file = meta.usages.first().unwrap().location.file;
+        let position = position_at_last(&session, file, "BaseMethod;");
+
+        let base_method_location = meta
+            .interface()
+            .find(session.context.intern_key("TBase"))
+            .unwrap()
+            .find_member(session.context.intern_key("BaseMethod"))
+            .unwrap()
+            .location;
+        assert_eq!(
+            session.definition_at(key, position),
+            vec![base_method_location],
+            "go-to on inherited C.BaseMethod lands in TBase"
+        );
+    }
+
+    #[test]
+    fn member_usage_goto_inherited_member_cross_unit() {
+        // Part 2 cross-unit: the base lives in an imported unit.
+        let directory = temp_directory("member_usage_inherited_cross");
+        std::fs::write(
+            directory.join("BaseU.pas"),
+            "unit BaseU;\ninterface\n\
+             type TBase = class\n  procedure BaseMethod;\nend;\n\
+             implementation\nend.",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("ChildU.pas"),
+            "unit ChildU;\ninterface\nuses BaseU;\n\
+             type TChild = class(TBase)\n  procedure ChildMethod;\nend;\n\
+             implementation\n\
+             procedure Use;\nvar C: TChild;\nbegin\n  C.BaseMethod;\nend;\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("ChildU.pas")).unwrap();
+        let key = session.context.intern_key("CHILDU");
+        let meta = session.meta_of(key).unwrap();
+        let file = meta.usages.first().unwrap().location.file;
+        let position = position_at_last(&session, file, "BaseMethod;");
+
+        // Resolve first (loads + caches the imported BaseU unit), then read the
+        // expected declaration from the now-cached base.
+        let definition = session.definition_at(key, position);
+        let base_method_location = session
+            .meta_of(session.context.intern_key("BASEU"))
+            .unwrap()
+            .interface()
+            .find(session.context.intern_key("TBase"))
+            .unwrap()
+            .find_member(session.context.intern_key("BaseMethod"))
+            .unwrap()
+            .location;
+        assert_eq!(
+            definition,
+            vec![base_method_location],
+            "cross-unit go-to on inherited C.BaseMethod lands in BaseU"
+        );
+    }
+
+    #[test]
+    fn member_usage_goto_chain() {
+        // Part 3: A.B.C — each a field whose type has the next member. go-to on
+        // C resolves through the chain (A: TA, TA.B: TB, TB.C: Integer).
+        let directory = temp_directory("member_usage_chain");
+        std::fs::write(
+            directory.join("Chain.pas"),
+            "unit Chain;\ninterface\n\
+             type\n  TB = class\n    C: Integer;\n  end;\n\
+             \n  TA = class\n    B: TB;\n  end;\n\
+             implementation\n\
+             procedure Run;\nvar A: TA;\nbegin\n  A.B.C := 1;\nend;\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("Chain.pas")).unwrap();
+        let key = session.context.intern_key("CHAIN");
+        let meta = session.meta_of(key).unwrap();
+        let file = meta.usages.first().unwrap().location.file;
+        let position = position_at_last(&session, file, "C :");
+
+        let target = session.symbol_at(key, position).expect("chain member target");
+        assert_eq!(
+            target.owner_type,
+            Some(session.context.intern_key("TB")),
+            "A.B types to TB so C is TB's member"
+        );
+        let c_location = meta
+            .interface()
+            .find(session.context.intern_key("TB"))
+            .unwrap()
+            .find_member(session.context.intern_key("C"))
+            .unwrap()
+            .location;
+        assert_eq!(
+            session.definition_at(key, position),
+            vec![c_location],
+            "go-to on A.B.C resolves through the chain to TB.C"
+        );
+    }
+
+    #[test]
+    fn member_usage_goto_via_cast() {
+        // Part 4: `(x as TFoo).Bar` — go-to on Bar resolves via the cast type.
+        let directory = temp_directory("member_usage_cast");
+        std::fs::write(
+            directory.join("Cast.pas"),
+            "unit Cast;\ninterface\n\
+             type TFoo = class\n  Bar: Integer;\nend;\n\
+             implementation\n\
+             procedure Run;\nvar x: TObject;\nbegin\n  (x as TFoo).Bar := 1;\nend;\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("Cast.pas")).unwrap();
+        let key = session.context.intern_key("CAST");
+        let meta = session.meta_of(key).unwrap();
+        let file = meta.usages.first().unwrap().location.file;
+        let position = position_at_last(&session, file, "Bar :");
+
+        let target = session.symbol_at(key, position).expect("cast member target");
+        assert_eq!(
+            target.owner_type,
+            Some(session.context.intern_key("TFoo")),
+            "cast type TFoo owns Bar"
+        );
+        let bar_location = meta
+            .interface()
+            .find(session.context.intern_key("TFoo"))
+            .unwrap()
+            .find_member(session.context.intern_key("Bar"))
+            .unwrap()
+            .location;
+        assert_eq!(
+            session.definition_at(key, position),
+            vec![bar_location],
+            "go-to on (x as TFoo).Bar resolves via the cast type"
+        );
+    }
+
+    #[test]
+    fn member_usage_never_wrong_when_receiver_untyped() {
+        // Part 5 NEVER-WRONG: `Unrelated.Member` where the receiver does not
+        // type → null (no wrong jump). A same-named top-level `Bar` must NOT be
+        // returned for `obj.Bar` when obj's type lacks (or is unknown for) Bar.
+        let directory = temp_directory("member_usage_never_wrong");
+        std::fs::write(
+            directory.join("NW.pas"),
+            "unit NW;\ninterface\n\
+             const Bar = 7;\n\
+             type TThing = class\n  Field: Integer;\nend;\n\
+             implementation\n\
+             procedure Run;\nvar Local: TThing;\nbegin\n  Unrelated.Bar := 1;\n  Local.Bar := 2;\nend;\nend.",
+        )
+        .unwrap();
+
+        let mut session = query_session(&directory);
+        session.parse_source_file(directory.join("NW.pas")).unwrap();
+        let key = session.context.intern_key("NW");
+        let meta = session.meta_of(key).unwrap();
+        let file = meta.usages.first().unwrap().location.file;
+
+        // `Unrelated.Bar`: receiver `Unrelated` does not type → no member target.
+        let content = session.arena.content(file).unwrap();
+        let unrelated_bar = content.find("Unrelated.Bar").unwrap();
+        let bar_in_unrelated = (unrelated_bar + "Unrelated.".len()) as u32;
+        let target = session.symbol_at(key, bar_in_unrelated);
+        // Must NOT be a Member target with an owner (no wrong owner), and the
+        // definition must not jump to the top-level const Bar via a member path.
+        if let Some(target) = &target {
+            assert_ne!(
+                target.kind,
+                TargetKind::Member,
+                "untyped receiver must not yield a member target"
+            );
+        }
+
+        // `Local.Bar`: receiver types to TThing, but TThing has NO `Bar` → the
+        // member does not resolve, and go-to must NOT fall back to the top-level
+        // const Bar. member_definition returns empty for a member absent on the
+        // owner surface.
+        let local_bar = content.find("Local.Bar").unwrap();
+        let bar_in_local = (local_bar + "Local.".len()) as u32;
+        let definition = session.definition_at(key, bar_in_local);
+        assert!(
+            definition.is_empty(),
+            "Local.Bar: TThing lacks Bar → no jump, never the top-level const Bar"
         );
     }
 }

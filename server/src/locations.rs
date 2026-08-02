@@ -390,6 +390,83 @@ mod tests {
         assert_eq!(location.range.start.line, 6); // "  Name: string;" in Models
     }
 
+    /// LIVE LSP-boundary check for member-usage go-to (ledger #41): a cursor on
+    /// the `Name` part of `LocalUser.Name` inside a method body resolves — through
+    /// the SAME `resolve_definition_locations` the server handler calls — to
+    /// `TUser.Name`'s declaration in Models.pas. Without the member-usage wiring
+    /// in `symbol_at`, this returned `None` (or a wrong jump to a top-level
+    /// same-named symbol).
+    #[test]
+    fn definition_member_usage_in_body_resolves_cross_unit() {
+        let directory = std::env::temp_dir()
+            .join("ddk-server-locations")
+            .join("def_member_usage");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("Models.pas"),
+            "unit Models;\ninterface\n\n\n\ntype TUser = class\n  Name: string;\nend;\nimplementation\nend.",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("Client.pas"),
+            "unit Client;\ninterface\nuses Models;\nimplementation\n\
+             procedure Run;\nvar LocalUser: TUser;\nbegin\n  LocalUser.Name := '';\nend;\nend.",
+        )
+        .unwrap();
+
+        use delphi_parser::cache_store::{CacheIdentity, CacheStore};
+        use delphi_parser::context::{DefineSet, ProjectContext, SwitchState, TargetPlatform};
+        use delphi_parser::unit_cache::UnitCache;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let context = ProjectContext {
+            configuration: "Debug".to_string(),
+            platform_name: "Win32".to_string(),
+            platform: TargetPlatform::Win32,
+            compiler_version: 36.0,
+            rtl_version: 36.0,
+            base_defines: DefineSet::default(),
+            search_paths: vec![directory.clone()],
+            include_paths: Vec::new(),
+            namespaces: Vec::new(),
+            unit_aliases: HashMap::new(),
+            default_switches: SwitchState::default(),
+            unit_cache: UnitCache::default(),
+        };
+        let identity = CacheIdentity {
+            project_path: &directory.join("proj.dproj"),
+            configuration: "Debug",
+            platform: "Win32",
+            compiler_version: 36.0,
+        };
+        std::fs::write(directory.join("proj.dproj"), b"<Project/>").unwrap();
+        let store = CacheStore::in_directory(&directory, &identity).unwrap();
+        let mut session =
+            ProjectSession::from_parts(Arc::new(context), store, Duration::from_secs(300));
+        session.parse_source_file(directory.join("Client.pas")).unwrap();
+
+        let client_key = session.context().intern_key("CLIENT");
+        let client_src = std::fs::read_to_string(directory.join("Client.pas")).unwrap();
+        // Cursor on the `Name` of `LocalUser.Name`.
+        let dotted = client_src.find("LocalUser.Name").unwrap();
+        let offset = (dotted + "LocalUser.".len()) as u32;
+
+        let locations =
+            resolve_definition_locations(&session, client_key, offset).expect("member usage resolves");
+        assert_eq!(locations.len(), 1);
+        assert!(
+            locations[0].uri.to_file_path().unwrap().ends_with("Models.pas"),
+            "member usage go-to lands in Models.pas: {:?}",
+            locations[0].uri
+        );
+        assert_eq!(
+            locations[0].range.start.line, 6,
+            "lands on `  Name: string;` (line 6) in Models"
+        );
+    }
+
     /// A cursor on whitespace/an unknown identifier → `None`, never a wrong jump.
     #[test]
     fn definition_on_whitespace_is_none() {
