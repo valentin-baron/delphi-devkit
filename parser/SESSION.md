@@ -1090,14 +1090,30 @@ real-code probe → commit.
 Real code: 98.4% reliable, 0 parse-failed, 17745 routines, 18270 scopes, ~760k
 statement/expr nodes. 310 parser + 118 server tests green.
 
+FEATURES LANDED ON THE AST (2026-08-02, same day):
+- **Typed-receiver + inheritance-flattened member resolution** (commit 82be367).
+  `member_receiver_at` types a LOCAL/param receiver via its `impl_scopes` type_key;
+  `InterfaceSymbol` gains ancestor keys (derived, no format bump); `flattened_
+  members` BFS-walks ancestors own→imports, most-derived-wins, cycle-safe, unresolved
+  ancestor → member absent (#19/#35). Completion/go-to/hover now see INHERITED
+  members and complete through typed locals. LIVE: `Local.` → `Value`.
+- **Member-usage go-to-definition + hover (#41 CLOSED)** (commit <this-1>). `symbol_at`
+  types the receiver of a body `receiver.Member` access via the Expression tree
+  (`type_of_expression`: Identifier/Member-chain/Cast/Parenthesized/Call) and returns
+  a Member target with the resolved owner → routes through the flattened member
+  paths. LIVE: `obj.Member` jumps to the member decl. Never a top-level fallback.
+- **`inherited` navigation + interface↔impl jump (#40 CLOSED)** (commit <this>; format
+  v15→v16, `Expression::Inherited.keyword_location`). Bare/named `inherited` → the
+  overridden method in the nearest ancestor (ancestors-only BFS, no self-loop,
+  cycle-safe, cross-unit). Impl header `TFoo.Bar` ↔ interface decl both directions.
+
 REMAINING for the semantic layer:
-- **S3b** (optional, memory): lazily-loaded body segment (see above).
-- **S4** — rewire queries onto the body's scope tree + richer occurrences: local/
-  param/nested/anon/method-scope jump+hover directly from the tree; owner-qualified
-  member usages (closes #41). Then the feature slices that BUILD on the AST:
-  completion via receiver typing + cross-unit inheritance flattening (#19/#35),
-  `inherited` navigation + interface↔impl method sync (#40), exact references (#41)
-  → rename (#42).
+- **S3b** (optional, memory): lazily-loaded body segment (cross-unit interface loads
+  don't pay for bodies; ~22% resident savings).
+- Exact `references` (candidate set → resolved set) then `rename` (#42), building on
+  the now-owner-qualified member usages.
+- Optional query polish: chain typing for `Call`/`Index` receivers; hover on
+  `inherited`.
 
 ## Next iteration start here
 
