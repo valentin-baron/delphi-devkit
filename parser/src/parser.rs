@@ -5825,6 +5825,37 @@ mod tests {
         parse_file_full(&arena, context, file, None).unwrap()
     }
 
+    /// A leading BOM (`\u{FEFF}`) in an EDITOR BUFFER (already-decoded text, so
+    /// the disk `source::decode` BOM-strip never ran) must NOT fail the parse —
+    /// the lexer skips it as trivia. Before the fix this returned a hard
+    /// `Cursor(Lex(..))` at offset 0 and `parse_outcome`'s `unwrap` panicked,
+    /// failing the WHOLE unit (nothing resolves). Every real Delphi file carries a
+    /// UTF-8 BOM, so this is the difference between "works" and "nothing works".
+    #[test]
+    fn leading_bom_in_buffer_parses_and_preserves_offsets() {
+        let source =
+            "\u{FEFF}unit Foo;\ninterface\ntype TThing = class end;\nimplementation\nend.";
+        let outcome = parse_outcome(source); // panics on a hard parse failure
+        let names = outcome_declaration_names(&outcome);
+        assert!(
+            names.iter().any(|name| name == "TThing"),
+            "a BOM-prefixed buffer must still parse its declarations: {names:?}"
+        );
+        // Offsets are preserved (the BOM occupies its bytes, subsequent spans are
+        // unshifted): `TThing` sits where it does in the with-BOM text, so a
+        // byte-offset query against the same text resolves it.
+        let Some(Source::Unit(unit)) = outcome.source.present() else {
+            panic!("expected a unit");
+        };
+        let thing = unit
+            .interface_declarations
+            .iter()
+            .find(|declaration| crate::globals::resolve(declaration.name.name) == "TThing")
+            .expect("TThing declared");
+        let start = thing.name.location.span.start as usize;
+        assert_eq!(&source[start..start + 6], "TThing", "span must be unshifted");
+    }
+
     /// The interface declaration display names of a parsed outcome's unit.
     fn outcome_declaration_names(outcome: &ParseOutcome) -> Vec<String> {
         let Some(Source::Unit(unit)) = outcome.source.present() else {

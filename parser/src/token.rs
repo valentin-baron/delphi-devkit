@@ -19,7 +19,14 @@ use logos::Logos;
 #[logos(error = LexError)]
 pub enum Token {
     // -- Trivia -------------------------------------------------------------
-    #[regex(r"[ \t]+")]
+    // `\u{FEFF}` (BOM / zero-width no-break space) is skipped as whitespace: the
+    // disk-read path strips a leading BOM (`source::decode`), but an EDITOR
+    // BUFFER arrives already-decoded and may still carry it (VS Code can send the
+    // BOM in the document text). Treating it as trivia — rather than a hard lex
+    // error that fails the WHOLE unit — keeps byte offsets intact (the server's
+    // LineIndex is built from the same buffer text), so a BOM-prefixed buffer
+    // parses identically to a stripped one. Harmless anywhere (zero-width).
+    #[regex(r"[ \t\u{FEFF}]+")]
     Whitespace,
     #[regex(r"\r\n|\r|\n")]
     Newline,
