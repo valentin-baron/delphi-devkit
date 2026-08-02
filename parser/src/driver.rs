@@ -106,8 +106,8 @@ pub struct SessionOptions {
     /// Start the OS file watcher. Off for one-shot batch parses.
     pub watch: bool,
     /// Compiler standard-unit source directories (RTL/VCL), appended to the
-    /// project search paths at open. Devkit obtains them via
-    /// `ddk::standard_source_directories`.
+    /// project search paths at open. The devkit server computes these from the
+    /// active compiler's installation path (see `server::session`).
     pub standard_source_paths: Vec<PathBuf>,
 }
 

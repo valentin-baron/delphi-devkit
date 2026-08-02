@@ -699,21 +699,51 @@ fn fallback_inputs() -> ProjectInputs {
 }
 
 /// The standard-unit source directories under a compiler installation
-/// (`<install>\source\...` dirs containing `.pas`). Empty on any failure — a
-/// missing RTL source tree degrades to "RTL units unresolved", never a crash.
+/// (`<install>\source\...` dirs that directly contain `.pas` files — the RTL/VCL
+/// search-path extension for System.SysUtils, Vcl.Forms, …). Empty on any failure
+/// — a missing RTL source tree degrades to "RTL units unresolved", never a crash.
+///
+/// This is a plain filesystem walk of a Delphi installation's on-disk layout; it
+/// has nothing to do with the parser library, so it lives here in the server's
+/// session layer (formerly `delphi_parser::ddk`, now removed).
 fn standard_source_paths(installation_path: &str) -> Vec<PathBuf> {
-    use delphi_parser::ddk::{standard_source_directories, CompilerInstallation};
     if installation_path.trim().is_empty() {
         return Vec::new();
     }
-    let installation = CompilerInstallation {
-        key: String::new(),
-        product_name: String::new(),
-        product_version: 0.0,
-        compiler_version: 36.0,
-        installation_path: PathBuf::from(installation_path),
+    let root = PathBuf::from(installation_path).join("source");
+    if !root.is_dir() {
+        // Broken/absent installation source tree → no standard search paths.
+        return Vec::new();
+    }
+    let mut directories = Vec::new();
+    collect_pas_directories(&root, &mut directories);
+    directories.sort();
+    directories
+}
+
+/// Recursively collect every directory at or below `directory` that DIRECTLY
+/// contains at least one `.pas` file. Unreadable subdirectories are silently
+/// skipped (a partial tree still yields the readable dirs).
+fn collect_pas_directories(directory: &Path, found: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
     };
-    standard_source_directories(&installation).unwrap_or_default()
+    let mut contains_pas = false;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_pas_directories(&path, found);
+        } else if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("pas"))
+        {
+            contains_pas = true;
+        }
+    }
+    if contains_pas {
+        found.push(directory.to_path_buf());
+    }
 }
 
 /// A `file://` URL → local filesystem path. Returns `None` for a non-file URL.

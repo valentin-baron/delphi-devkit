@@ -16,7 +16,6 @@ pub mod ast;
 pub mod ast_impl;
 pub mod cache_store;
 pub mod context;
-pub mod ddk;
 pub mod dfm;
 pub mod dfm_link;
 pub mod driver;
