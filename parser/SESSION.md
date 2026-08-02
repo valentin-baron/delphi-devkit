@@ -992,6 +992,71 @@ functionality works, not even same-unit variable jump", (b) `.unit` files ~1.5MB
   present; needs a live project run to confirm). Task #22 RTL/System bootstrap
   remains an explicit deferred decision.
 
+## Home + scope correction (2026-08-02)
+
+- **Canonical home is `delphi-devkit/parser`** (this crate, a workspace library
+  consumed by `ddk-server`). The old standalone `C:\workspaces\delphi-parser`
+  binary-crate dev repo is RETIRED — it was strictly behind this copy (format
+  v11 vs v14, no LSP integration) and its history is disposable by design.
+- **Scope correction (important):** earlier notes implied "the whole AST is
+  implemented + serialized." That is TRUE ONLY for the INTERFACE section. `ast::
+  Unit` is interface-only (`// todo: implementation index`); there are NO
+  `Statement`/`Expression` AST types anywhere; every expression in a type is a
+  source SPAN, not a tree. The it.15 `impl_scopes` is a LOSSY scope side-table
+  (routine headers + body span + local/param names + a trivial `type_key`), not
+  an implementation AST. The next phase replaces both with a real semantic model.
+
+## Roadmap: implementation-section semantic layer (agreed scope, 2026-08-02)
+
+GOAL (deliberately pragmatic — NOT a full statement/expression compiler): model
+enough of the implementation section to power **completion**, **go-to-definition
+/ hover with type info on locals**, and **`inherited` navigation**. "We do not
+require a detailed AST spouting every scenario" (user) — statements are modeled
+SHALLOWLY (scope regions + declarations + expression positions), not as a
+control-flow tree.
+
+Pieces (each serializes via the same transparent-serde path; format bump travels
+with it; NEVER-WRONG throughout — unresolved → Unknown/None, never a wrong member
+or jump):
+
+1. **Expression AST** — the receiver-shaped constructs completion resolves
+   against: identifiers, member access chains (`a.b.c`), calls (`f(x).`),
+   indexing (`items[i].`), casts (`x as T`, `(x).`), `inherited`, `@`/`^`,
+   anonymous-method literals. Replaces "expressions are spans" for BODIES.
+2. **Scope tree** — nested routines, anonymous methods (closures), class/record
+   METHOD scope (enclosing type → `Self`, bare field/method names), `with`-block
+   scope, override methods. A proper nested version of it.15 `impl_scopes`.
+3. **Symbol table / local binding** — every body identifier → its declaration
+   (local / param / field-via-`Self` / imported symbol). Powers jump + hover
+   typeinfo; the prerequisite the ledger already flags for exact references
+   (#41) and rename (#42).
+4. **Type resolution** — infer a receiver chain's type for completion; reuse the
+   existing `Declared(A.B)` own+imported member walk and `member_completions`.
+5. **Inheritance resolution across units (MANDATORY for completion)** — walk
+   ancestors own→imported, flatten the inherited member surface. Today member
+   lookup sees only DIRECT members (deliberately Unknown for inherited, ledger
+   #19/#35), so completion on any `TForm`/`TComponent` var is near-empty and
+   `inherited` has nothing to resolve. This is a first-class requirement, not a
+   nicety.
+
+Slices, in dependency order:
+- **A** — Expression AST + receiver-chain typing + inheritance-flattened member
+  completion. Makes `Obj.` / `Self.` / `expr.member` completion + go-to work on
+  REAL (inherited-member) objects. Self-contained, immediately visible.
+- **B** — nested / anonymous / method scope tree + local symbol table (jump +
+  hover typeinfo on locals/params, all function-scope kinds).
+- **C** — `inherited` navigation (both directions) + interface↔implementation
+  method sync (#40: map `procedure TFoo.Bar` impl header ↔ its interface decl;
+  flag orphans / signature mismatch).
+- **D** — sharpen `references` from candidate set to exact set (#41), then
+  `rename` (#42) once bindings are exact.
+
+Reused as-is: it.15 `impl_scopes` skeleton (routine owner-type + typed locals +
+body spans), the interface index (member `type_key`, `ancestors`, `has_ancestors`),
+the `Declared(A.B)` own+imported walk, `member_completions` / `member_receiver_at`.
+Genuinely NEW: the expression parser, the cross-unit inheritance walk, and typing
+local-variable receivers.
+
 ## Next iteration start here
 
 ~~Deep type parse~~ DONE (it. 7). ~~Member symbols v5~~ DONE (it. 7).
