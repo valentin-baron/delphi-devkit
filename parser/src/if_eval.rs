@@ -532,6 +532,7 @@ enum Token {
     Str(String),
     LParen,
     RParen,
+    Comma,
     Eq,
     Ne,
     Lt,
@@ -582,6 +583,13 @@ fn tokenize(source: &str) -> Result<Vec<(Token, usize)>, EvalError> {
             }
             b')' => {
                 tokens.push((Token::RParen, start));
+                i += 1;
+            }
+            b',' => {
+                // Only meaningful inside a function-call argument list
+                // (`Foo(a, b)`); the parser consumes it there and rejects a
+                // stray comma elsewhere as a syntax error.
+                tokens.push((Token::Comma, start));
                 i += 1;
             }
             b'+' => {
@@ -1021,8 +1029,51 @@ impl Parser<'_> {
             });
         }
 
+        // A general function call in a condition that is NOT one of the three
+        // special forms above — `Length(X)`, `Ord(c)`, `High(T)`, `Low(T)`,
+        // `Assigned(P)`, etc. dcc can evaluate several of these at compile time
+        // (System.pas guards a body with `{$IF Length(RegisteredTypeInfoTable)
+        // = 1}`), but doing so needs semantic information this evaluator does
+        // not have. The correct degradation is Unknown (never a wrong guess) —
+        // but we MUST still consume the `(...)` call syntax so the directive
+        // stays well-formed. Leaving it unconsumed turned the whole unit into a
+        // HARD parse failure (`CursorError::Condition` Syntax "unexpected
+        // trailing tokens"), which skipped the unit entirely; Unknown instead
+        // lets the cursor pick a branch under its AssumeFalse/True policy with a
+        // diagnostic. See SESSION.md ledger #43.
+        if matches!(self.peek(), Some(Token::LParen)) {
+            self.consume_call_arguments()?;
+            return Ok(None);
+        }
+
         // bare (possibly dotted) identifier: constant lookup
         Ok(self.resolver.const_value(identifier))
+    }
+
+    /// Consume a balanced, comma-separated `(...)` argument list, evaluating and
+    /// discarding each argument (its value may be Unknown — irrelevant, the
+    /// enclosing call is Unknown regardless). Reuses [`Self::expression`] so
+    /// nested calls, parentheses, and operators inside arguments are handled by
+    /// the same grammar. The opening `(` is the current token on entry.
+    fn consume_call_arguments(&mut self) -> Result<(), EvalError> {
+        match self.advance() {
+            Some(Token::LParen) => {}
+            _ => return Err(self.syntax("expected '('")),
+        }
+        // Empty argument list: `Foo()`.
+        if matches!(self.peek(), Some(Token::RParen)) {
+            self.advance();
+            return Ok(());
+        }
+        loop {
+            let _ = self.expression()?;
+            match self.advance() {
+                Some(Token::RParen) => break,
+                Some(Token::Comma) => continue,
+                _ => return Err(self.syntax("expected ',' or ')' in call arguments")),
+            }
+        }
+        Ok(())
     }
 
     fn function_argument(&mut self) -> Result<String, EvalError> {
@@ -1448,6 +1499,30 @@ mod tests {
         assert_eq!(eval("#65 = 'A'"), Ok(Condition::True));
         assert_eq!(eval("#$41 = 'A'"), Ok(Condition::True));
         assert!(matches!(eval("%"), Err(EvalError::Syntax { .. })));
+    }
+
+    #[test]
+    fn general_function_call_is_unknown_not_error() {
+        // Ledger #43: a directive that calls a function OTHER than
+        // Defined/Declared/SizeOf — System.pas guards a body with
+        // `{$IF Length(RegisteredTypeInfoTable) = 1}`. We cannot evaluate it,
+        // but it must degrade to Unknown, NOT a hard Syntax error that fails
+        // the whole unit (which was skipping System.pas from the RTL bootstrap).
+        assert_eq!(eval("Length(RegisteredTypeInfoTable) = 1"), Ok(Condition::Unknown));
+        // bare call in boolean position
+        assert_eq!(eval("Assigned(SomePointer)"), Ok(Condition::Unknown));
+        // Kleene rescue still works around an unknown call
+        assert_eq!(eval("Defined(MISSING) and (Length(X) = 1)"), Ok(Condition::False));
+        assert_eq!(eval("Defined(FOO) or (Length(X) = 1)"), Ok(Condition::True));
+        // empty and multi-argument calls (the tokenizer now knows ',')
+        assert_eq!(eval("Foo() = 1"), Ok(Condition::Unknown));
+        assert_eq!(eval("Max(A, B) > 0"), Ok(Condition::Unknown));
+        // nested calls / parenthesised arguments consume correctly
+        assert_eq!(eval("Length(Copy(S, 1, 2)) = 0"), Ok(Condition::Unknown));
+        // an unterminated call is still a Syntax error (never silently accepted)
+        assert!(matches!(eval("Length(X = 1"), Err(EvalError::Syntax { .. })));
+        // a stray comma OUTSIDE a call is a Syntax error, not a swallowed token
+        assert!(matches!(eval("1, 2"), Err(EvalError::Syntax { .. })));
     }
 
     #[test]
