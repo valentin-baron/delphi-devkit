@@ -27,6 +27,14 @@ use tower_lsp::lsp_types::*;
 use documents::DocumentStore;
 use session::SessionManager;
 
+/// Runaway-memory backstop: track live allocation and, at the ceiling (default
+/// 10 GiB, override with `DDK_MEM_LIMIT_GB`), write a minidump + report and abort
+/// rather than take the machine down via OOM. Must be the process
+/// `#[global_allocator]` for the tracking to see anything; armed in `main`.
+#[global_allocator]
+static GLOBAL_ALLOCATOR: delphi_parser::mem_guard::TrackingAllocator =
+    delphi_parser::mem_guard::TrackingAllocator;
+
 use ddk_core::lsp_types::*;
 use ddk_core::projects::*;
 use ddk_core::state::*;
@@ -2036,6 +2044,11 @@ impl LanguageServer for DelphiLsp {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Arm the runaway-memory guard before any real work. Dumps land in a
+    // dedicated subdir of the system temp dir; the limit is 10 GiB unless
+    // `DDK_MEM_LIMIT_GB` overrides it (`0` disables tripping).
+    delphi_parser::mem_guard::install(delphi_parser::mem_guard::GuardConfig::default());
+
     let (service, socket) = LspService::build(|client| {
         let watcher_client = client.clone();
         tokio::spawn(async move {

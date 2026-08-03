@@ -22,6 +22,7 @@ pub mod driver;
 pub mod globals;
 pub mod if_eval;
 pub mod layout;
+pub mod mem_guard;
 pub mod meta;
 pub mod parse_state;
 pub mod parser;
