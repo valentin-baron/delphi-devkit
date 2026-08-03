@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import { promises as fs } from 'fs';
 import { basename, dirname, join } from 'path';
 import { ConfigurationTarget, languages, Uri, window, workspace } from 'vscode';
@@ -5,7 +6,7 @@ import { Runtime } from '../runtime';
 import { Entities } from '../projects/entities';
 import { DELPHILSP } from '../constants';
 import { Option } from '../types';
-import { basenameNoExt } from '../utils';
+import { basenameNoExt, fileExists } from '../utils';
 
 /**
  * Keeps DelphiLSP's active `settingsFile` pointed at DDK's active project.
@@ -20,10 +21,6 @@ export namespace DelphiLspAutoSync {
   // so the very first project selection after activation still triggers a sync.
   let lastSyncedProjectId: Option<number> = undefined;
 
-  function isAutoSyncEnabled(): boolean {
-    return workspace.getConfiguration(DELPHILSP.CONFIG.KEY).get<boolean>(DELPHILSP.CONFIG.AUTO_SYNC, true);
-  }
-
   /** `<dir>\<stem>.delphilsp.json` next to the project's `.dpr`/`.dpk` main
    *  source — replicates `delphilsp::default_out_path` in `core`. Deliberately
    *  keyed off the main source's own directory rather than `project.directory`,
@@ -34,36 +31,39 @@ export namespace DelphiLspAutoSync {
     return join(dirname(mainSource), `${basenameNoExt(mainSource)}.delphilsp.json`);
   }
 
-  /** Non-blocking existence check — `existsSync` would stall the extension
-   *  host on slow or network filesystems during every project switch. */
-  async function fileExists(filePath: string): Promise<boolean> {
-    try {
-      await fs.access(filePath);
-      return true;
-    } catch {
-      return false;
-    }
+  interface SettingsFileMarkers {
+    generatedBy?: string;
+    dprojHash?: string;
   }
 
-  async function readGeneratedByMarker(filePath: string): Promise<Option<string>> {
+  async function readSettingsFileMarkers(filePath: string): Promise<SettingsFileMarkers> {
     try {
       const content = await fs.readFile(filePath, 'utf8');
       const parsed = JSON.parse(content);
-      return typeof parsed?.generatedBy === 'string' ? parsed.generatedBy : undefined;
+      return {
+        generatedBy: typeof parsed?.generatedBy === 'string' ? parsed.generatedBy : undefined,
+        dprojHash: typeof parsed?.dprojHash === 'string' ? parsed.dprojHash : undefined,
+      };
     } catch {
       // Unreadable or not valid JSON — treat as "not ours", same as an IDE-generated file.
-      return undefined;
+      return {};
     }
   }
 
-  /** A DDK-owned settings file is stale once it is older than the `.dproj` it
-   *  was derived from. Projects with no `.dproj` (bare `.dpr`/`.dpk`) have
-   *  nothing to compare against, so an existing file is always kept. */
-  async function isStale(filePath: string, project: Entities.Project): Promise<boolean> {
+  /** A DDK-owned settings file is stale once the `.dproj` it was derived from
+   *  has different content: its stored `dprojHash` (SHA-256 of the dproj
+   *  bytes, written by the generator in `core`) no longer matches. Content is
+   *  compared instead of timestamps because mtimes are unreliable on Windows
+   *  and a rewritten-but-identical `.dproj` must not trigger a regeneration.
+   *  A DDK file without the hash predates it — regenerate once to stamp it.
+   *  Projects with no `.dproj` (bare `.dpr`/`.dpk`) have nothing to compare
+   *  against, so an existing file is always kept. */
+  async function isStale(markers: SettingsFileMarkers, project: Entities.Project): Promise<boolean> {
     if (!project.dproj) return false;
+    if (!markers.dprojHash) return true;
     try {
-      const [settingsStat, dprojStat] = await Promise.all([fs.stat(filePath), fs.stat(project.dproj)]);
-      return settingsStat.mtimeMs < dprojStat.mtimeMs;
+      const dprojBytes = await fs.readFile(project.dproj);
+      return createHash('sha256').update(dprojBytes).digest('hex') !== markers.dprojHash;
     } catch {
       return false;
     }
@@ -78,9 +78,9 @@ export namespace DelphiLspAutoSync {
 
     let needsGeneration = !(await fileExists(filePath));
     if (!needsGeneration) {
-      const marker = await readGeneratedByMarker(filePath);
-      if (marker === DELPHILSP.GENERATED_BY_MARKER)
-        needsGeneration = await isStale(filePath, project);
+      const markers = await readSettingsFileMarkers(filePath);
+      if (markers.generatedBy === DELPHILSP.GENERATED_BY_MARKER)
+        needsGeneration = await isStale(markers, project);
       // Existing file without our marker was produced by the RAD Studio IDE — leave it untouched.
     }
     if (!needsGeneration) return filePath;
@@ -169,12 +169,12 @@ export namespace DelphiLspAutoSync {
   }
 
   export async function onProjectsUpdated(): Promise<void> {
-    if (!Runtime.delphilsp?.isAvailable) return;
+    if (!Runtime.delphilsp?.canAutoGenerate) return;
 
     const activeId = Runtime.projectsData?.active_project_id ?? undefined;
     if (activeId === lastSyncedProjectId) return;
     lastSyncedProjectId = activeId;
-    if (!activeId || !isAutoSyncEnabled()) return;
+    if (!activeId) return;
 
     const project = Runtime.projectsData?.projects.find((p) => p.id === activeId);
     if (!project) return;

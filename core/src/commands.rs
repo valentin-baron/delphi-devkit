@@ -8,7 +8,9 @@ use anyhow::{Context, Result, bail};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::path::PathBuf;
 
+use crate::files::dproj::{find_dproj_file, get_main_source};
 use crate::lsp_types::{CompileProjectParams, CompilerProgress, CompilerProgressParams};
 use crate::projects::*;
 use crate::state::*;
@@ -1651,8 +1653,6 @@ async fn delphilsp_request_for_project(
     project_id: usize,
     out: Option<String>,
 ) -> Result<crate::delphilsp::GenerationRequest> {
-    use std::path::PathBuf;
-
     let data = PROJECTS_DATA.read().await;
     let project = match data.get_project(project_id) {
         Some(p) => p,
@@ -1685,6 +1685,7 @@ async fn delphilsp_request_for_project(
         configuration: project.active_configuration.clone(),
         platform: project.active_platform.clone(),
         installation_path: PathBuf::from(&compiler.installation_path),
+        bds_version: format!("{}.0", compiler.product_version),
         compiler_name: compiler.product_name.clone(),
         out_path: out.map(PathBuf::from),
     })
@@ -1698,9 +1699,6 @@ async fn delphilsp_request_for_path(
     compiler: Option<String>,
     out: Option<String>,
 ) -> Result<crate::delphilsp::GenerationRequest> {
-    use crate::files::dproj::{find_dproj_file, get_main_source};
-    use std::path::PathBuf;
-
     let path = normalize_path(file_path);
     if !path.exists() {
         bail!("File not found: {file_path}");
@@ -1728,6 +1726,7 @@ async fn delphilsp_request_for_path(
         configuration: None,
         platform: None,
         installation_path: PathBuf::from(&config.installation_path),
+        bds_version: format!("{}.0", config.product_version),
         compiler_name: config.product_name.clone(),
         out_path: out.map(PathBuf::from),
     })

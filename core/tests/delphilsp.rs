@@ -58,6 +58,7 @@ fn fixture(configuration: Option<&str>, platform: Option<&str>) -> Fixture {
             configuration: configuration.map(|s| s.to_string()),
             platform: platform.map(|s| s.to_string()),
             installation_path: installation,
+            bds_version: "23.0".to_string(),
             compiler_name: "Delphi 12.0 Athens".to_string(),
             out_path: Some(out_path.clone()),
         },
@@ -133,9 +134,14 @@ fn stamps_the_ownership_marker_next_to_settings() {
     );
     assert_eq!(
         file.as_object().unwrap().len(),
-        2,
-        "expected exactly `settings` and `generatedBy`: {file}"
+        3,
+        "expected exactly `settings`, `generatedBy` and `dprojHash`: {file}"
     );
+
+    // The staleness fingerprint: SHA-256 of the dproj bytes, lowercase hex.
+    let hash = file["dprojHash"].as_str().expect("dprojHash missing");
+    assert_eq!(hash.len(), 64, "{hash}");
+    assert!(hash.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()), "{hash}");
 }
 
 #[test]

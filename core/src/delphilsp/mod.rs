@@ -16,12 +16,15 @@
 //! code insight — it never drives a real build — so switches that cannot be
 //! derived faithfully fall back to sane defaults.
 
-use std::collections::HashMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use sha2::{Digest, Sha256};
+
+use crate::projects::MacroMap;
+use crate::utils::{dir_to_file_uri, path_to_file_uri, trim_trailing_separator};
 
 mod registry;
 pub use registry::IdeLibrarySettings;
@@ -42,142 +45,19 @@ pub const GENERATED_BY_MARKER: &str = "delphi-devkit";
 
 /// Unit aliases the RAD Studio IDE emits when a project defines none of its
 /// own. Observed verbatim in IDE-generated `.delphilsp.json` files.
-pub const DEFAULT_UNIT_ALIASES: &str = "Generics.Collections=System.Generics.Collections;\
-Generics.Defaults=System.Generics.Defaults;\
-WinTypes=Winapi.Windows;\
-WinProcs=Winapi.Windows;\
-DbiTypes=BDE;\
-DbiProcs=BDE;\
-DbiErrs=BDE";
-
-// ---------------------------------------------------------------------------
-// Macro expansion
-// ---------------------------------------------------------------------------
-
-/// A case-insensitive `$(NAME)` variable map (Windows environment semantics).
-///
-/// Names are also kept in their original spelling because `dproj-rs` resolves
-/// `$(NAME)` through a **case-sensitive** map: seeding it needs the exact
-/// casing the `.dproj` files use (`DCC_UnitSearchPath`, not `DCC_UNITSEARCHPATH`).
-#[derive(Debug, Clone, Default)]
-pub struct MacroMap {
-    /// Upper-cased keys — the lookup used by [`MacroMap::expand`].
-    vars: HashMap<String, String>,
-    /// The same entries under their original spelling.
-    original_case: HashMap<String, String>,
-}
-
-impl MacroMap {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Insert a variable, overwriting any previous value.
-    pub fn set(&mut self, key: impl AsRef<str>, value: impl Into<String>) {
-        let key = key.as_ref();
-        let value = value.into();
-        self.vars.insert(key.to_ascii_uppercase(), value.clone());
-        self.original_case.insert(key.to_string(), value);
-    }
-
-    /// Insert a variable only when that name is not already defined.
-    pub fn set_default(&mut self, key: impl AsRef<str>, value: impl Into<String>) {
-        if self.get(key.as_ref()).is_none() {
-            self.set(key, value);
-        }
-    }
-
-    /// Forget a variable, whatever casing it was defined with.
-    pub fn remove(&mut self, key: &str) {
-        let upper = key.to_ascii_uppercase();
-        self.vars.remove(&upper);
-        self.original_case.retain(|k, _| k.to_ascii_uppercase() != upper);
-    }
-
-    pub fn get(&self, key: &str) -> Option<&String> {
-        self.vars.get(&key.to_ascii_uppercase())
-    }
-
-    pub fn extend<I, K, V>(&mut self, entries: I)
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: AsRef<str>,
-        V: Into<String>,
-    {
-        for (k, v) in entries {
-            self.set(k, v);
-        }
-    }
-
-    /// Expand every `$(NAME)` reference. Unknown names are left **verbatim**
-    /// so callers can detect (and report) unresolved macros — this is the one
-    /// behavioural difference from MSBuild, which expands them to nothing.
-    ///
-    /// Expansion is iterative (a resolved value may itself contain macros) and
-    /// bounded so a self-referential definition cannot loop forever.
-    pub fn expand(&self, value: &str) -> String {
-        const MAX_PASSES: usize = 8;
-        let mut current = value.to_string();
-        for _ in 0..MAX_PASSES {
-            if !current.contains("$(") {
-                break;
-            }
-            let next = self.expand_once(&current);
-            if next == current {
-                break;
-            }
-            current = next;
-        }
-        current
-    }
-
-    fn expand_once(&self, value: &str) -> String {
-        let mut out = String::with_capacity(value.len());
-        let bytes: Vec<char> = value.chars().collect();
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == '$' && i + 1 < bytes.len() && bytes[i + 1] == '(' {
-                if let Some(close) = (i + 2..bytes.len()).find(|&j| bytes[j] == ')') {
-                    let name: String = bytes[i + 2..close].iter().collect();
-                    match self.get(&name) {
-                        Some(resolved) => out.push_str(resolved),
-                        // Unknown: keep the token so the caller can warn.
-                        _ => out.push_str(&format!("$({name})")),
-                    }
-                    i = close + 1;
-                    continue;
-                }
-            }
-            out.push(bytes[i]);
-            i += 1;
-        }
-        out
-    }
-
-    /// Seed environment for `dproj-rs` property-group evaluation. Every entry
-    /// appears both upper-cased and in its original spelling, because that
-    /// lookup is case-sensitive.
-    pub fn as_env(&self) -> HashMap<String, String> {
-        let mut env = self.vars.clone();
-        env.extend(self.original_case.iter().map(|(k, v)| (k.clone(), v.clone())));
-        env
-    }
-}
+pub const DEFAULT_UNIT_ALIASES: &str = concat!(
+    "Generics.Collections=System.Generics.Collections;",
+    "Generics.Defaults=System.Generics.Defaults;",
+    "WinTypes=Winapi.Windows;",
+    "WinProcs=Winapi.Windows;",
+    "DbiTypes=BDE;",
+    "DbiProcs=BDE;",
+    "DbiErrs=BDE",
+);
 
 // ---------------------------------------------------------------------------
 // Path list helpers
 // ---------------------------------------------------------------------------
-
-/// Strip trailing path separators (`c:\foo\` → `c:\foo`) without eating a
-/// drive root (`c:\` stays `c:\`).
-fn trim_trailing_separator(path: &str) -> &str {
-    let trimmed = path.trim_end_matches(['\\', '/']);
-    if trimmed.is_empty() || trimmed.ends_with(':') {
-        path
-    } else {
-        trimmed
-    }
-}
 
 /// Split a `;`-separated path list, expand its macros, and drop entries that
 /// still contain an unresolved `$(NAME)` (collecting a warning for each).
@@ -216,41 +96,6 @@ fn quote_if_needed(value: &str) -> String {
 /// spaces double-quoted individually.
 fn join_paths(paths: &[String]) -> String {
     paths.iter().map(|p| quote_if_needed(p)).collect::<Vec<_>>().join(";")
-}
-
-// ---------------------------------------------------------------------------
-// File URI
-// ---------------------------------------------------------------------------
-
-/// Percent-encode a Windows path into the `file:///C%3A/dir/file.dpk` form the
-/// IDE writes: backslashes become forward slashes and everything outside the
-/// unreserved URI set is percent-encoded — including `:`, spaces, `(`, `)` and
-/// `+`, all observed encoded in IDE-generated files.
-pub fn path_to_file_uri(path: &Path) -> String {
-    const SAFE: &str = "-._~/";
-    let normalized = path.to_string_lossy().replace('\\', "/");
-    let mut encoded = String::with_capacity(normalized.len() + 8);
-    for byte in normalized.as_bytes() {
-        let ch = *byte as char;
-        if ch.is_ascii_alphanumeric() || SAFE.contains(ch) {
-            encoded.push(ch);
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    if normalized.starts_with("//") {
-        // UNC path: \\server\share\file → file://server/share/file (the
-        // server is the URI authority, so exactly two slashes after `file:`).
-        return format!("file:{encoded}");
-    }
-    format!("file:///{}", encoded.trim_start_matches('/'))
-}
-
-/// Like [`path_to_file_uri`] but for a directory: the IDE always terminates
-/// those URIs with a slash.
-pub fn dir_to_file_uri(path: &Path) -> String {
-    let uri = path_to_file_uri(path);
-    if uri.ends_with('/') { uri } else { format!("{uri}/") }
 }
 
 // ---------------------------------------------------------------------------
@@ -420,6 +265,13 @@ struct DelphiLspFile {
     /// Absent on IDE-generated files — see [`GENERATED_BY_MARKER`].
     #[serde(rename = "generatedBy", skip_serializing_if = "Option::is_none")]
     generated_by: Option<String>,
+    /// SHA-256 (lowercase hex) of the `.dproj` bytes the settings were derived
+    /// from. The VS Code auto-sync compares it against the current `.dproj` to
+    /// decide staleness — timestamps are unreliable on Windows, and an
+    /// untouched-content `.dproj` with a fresh mtime must not trigger a
+    /// regeneration. Absent on IDE files and for bare `.dpr`/`.dpk` projects.
+    #[serde(rename = "dprojHash", skip_serializing_if = "Option::is_none")]
+    dproj_hash: Option<String>,
 }
 
 /// Outcome of generating a `.delphilsp.json` file.
@@ -479,6 +331,10 @@ pub struct GenerationRequest {
     pub platform: Option<String>,
     /// Root of the Delphi installation (the folder containing `bin`).
     pub installation_path: PathBuf,
+    /// BDS version of the compiler configuration, e.g. `"23.0"` for Delphi 12
+    /// (`CompilerConfiguration::product_version` + `.0`) — selects the
+    /// registry hive and the IDE data directories.
+    pub bds_version: String,
     /// Human-readable compiler name, echoed back in the result.
     pub compiler_name: String,
     /// Where to write the file; `None` writes `<main source>.delphilsp.json`
@@ -498,7 +354,7 @@ pub fn generate(request: &GenerationRequest) -> Result<DelphiLspConfigResult> {
     let rsvars = dproj_rs::rsvars::parse_rsvars_file(&rsvars_path)
         .with_context(|| format!("Failed to parse {}", rsvars_path.display()))?;
 
-    let bds_version = bds_version_from_installation(installation);
+    let bds_version = request.bds_version.clone();
 
     // ── Build the macro map ────────────────────────────────────────────────
     let mut macros = MacroMap::new();
@@ -514,6 +370,9 @@ pub fn generate(request: &GenerationRequest) -> Result<DelphiLspConfigResult> {
     macros.set_default("BDSINCLUDE", format!("{bds}\\include"));
     if let Some(user_dir) = bds_user_dir(&bds_version) {
         macros.set_default("BDSUSERDIR", user_dir);
+    }
+    if let Some(common_dir) = bds_common_dir(&bds_version) {
+        macros.set_default("BDSCOMMONDIR", common_dir);
     }
     // The IDE's own "Environment Variables" overrides win over rsvars/process env.
     macros.extend(registry::read_ide_environment_variables(&bds_version));
@@ -722,6 +581,7 @@ pub fn generate(request: &GenerationRequest) -> Result<DelphiLspConfigResult> {
             templates,
         },
         generated_by: Some(GENERATED_BY_MARKER.to_string()),
+        dproj_hash: request.dproj_path.as_deref().and_then(dproj_content_hash),
     };
     let out_path = match &request.out_path {
         Some(path) => path.clone(),
@@ -754,6 +614,14 @@ pub fn generate(request: &GenerationRequest) -> Result<DelphiLspConfigResult> {
         define_count,
         warnings,
     })
+}
+
+/// SHA-256 of the `.dproj` bytes, lowercase hex — the staleness fingerprint
+/// stored as `dprojHash`. The VS Code auto-sync computes the same digest
+/// (`node:crypto`), so the two must never diverge.
+fn dproj_content_hash(dproj_path: &Path) -> Option<String> {
+    let bytes = std::fs::read(dproj_path).ok()?;
+    Some(format!("{:x}", Sha256::digest(&bytes)))
 }
 
 /// `<dir>\<stem>.delphilsp.json` next to the main source — the location the
@@ -794,21 +662,39 @@ fn collect_required_packages(dproj: &dproj_rs::Dproj) -> Vec<String> {
         .collect()
 }
 
-/// `C:\…\Studio\23.0` → `23.0`. Falls back to the folder name as-is.
-pub fn bds_version_from_installation(installation: &Path) -> String {
-    installation
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default()
+/// The IDE data folder name under a Documents root: `RAD Studio` for the
+/// D2007–D2010 era (BDS 5.0–7.0), `Embarcadero\Studio` from XE (8.0) on.
+fn bds_documents_subpath(bds_version: &str) -> PathBuf {
+    let major: usize = bds_version.split('.').next().and_then(|n| n.parse().ok()).unwrap_or(0);
+    if major <= 7 {
+        PathBuf::from("RAD Studio")
+    } else {
+        Path::new("Embarcadero").join("Studio")
+    }
 }
 
-/// `<Documents>\Embarcadero\Studio\<version>` — the IDE's `$(BDSUSERDIR)`.
+/// `<Documents>\Embarcadero\Studio\<version>` (or `<Documents>\RAD Studio\<version>`
+/// for pre-XE versions) — the IDE's `$(BDSUSERDIR)`.
 fn bds_user_dir(bds_version: &str) -> Option<String> {
     let documents = dirs::document_dir()?;
     Some(
         documents
-            .join("Embarcadero")
-            .join("Studio")
+            .join(bds_documents_subpath(bds_version))
+            .join(bds_version)
+            .to_string_lossy()
+            .to_string(),
+    )
+}
+
+/// The Public Documents counterpart of [`bds_user_dir`] — the IDE's
+/// `$(BDSCOMMONDIR)`. Only a fallback: `rsvars.bat` normally defines the
+/// variable and wins.
+fn bds_common_dir(bds_version: &str) -> Option<String> {
+    let public = std::env::var_os("PUBLIC")?;
+    Some(
+        Path::new(&public)
+            .join("Documents")
+            .join(bds_documents_subpath(bds_version))
             .join(bds_version)
             .to_string_lossy()
             .to_string(),

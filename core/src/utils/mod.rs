@@ -95,6 +95,48 @@ pub fn ide_environment_overrides() -> Vec<(String, String)> {
     Vec::new()
 }
 
+/// Strip trailing path separators (`c:\foo\` → `c:\foo`) without eating a
+/// drive root (`c:\` stays `c:\`).
+pub fn trim_trailing_separator(path: &str) -> &str {
+    let trimmed = path.trim_end_matches(['\\', '/']);
+    if trimmed.is_empty() || trimmed.ends_with(':') {
+        path
+    } else {
+        trimmed
+    }
+}
+
+/// Percent-encode a Windows path into the `file:///C%3A/dir/file.dpk` form the
+/// RAD Studio IDE writes: backslashes become forward slashes and everything
+/// outside the unreserved URI set is percent-encoded — including `:`, spaces,
+/// `(`, `)` and `+`, all observed encoded in IDE-generated files.
+pub fn path_to_file_uri(path: &Path) -> String {
+    const SAFE: &str = "-._~/";
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    let mut encoded = String::with_capacity(normalized.len() + 8);
+    for byte in normalized.as_bytes() {
+        let ch = *byte as char;
+        if ch.is_ascii_alphanumeric() || SAFE.contains(ch) {
+            encoded.push(ch);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    if normalized.starts_with("//") {
+        // UNC path: \\server\share\file → file://server/share/file (the
+        // server is the URI authority, so exactly two slashes after `file:`).
+        return format!("file:{encoded}");
+    }
+    format!("file:///{}", encoded.trim_start_matches('/'))
+}
+
+/// Like [`path_to_file_uri`] but for a directory: the IDE always terminates
+/// those URIs with a slash.
+pub fn dir_to_file_uri(path: &Path) -> String {
+    let uri = path_to_file_uri(path);
+    if uri.ends_with('/') { uri } else { format!("{uri}/") }
+}
+
 /// Normalise a path by:
 ///   1. Resolving `.` and `..` segments purely (without touching the filesystem).
 ///   2. Stripping the Windows extended-length prefix (`\\?\`) if present.

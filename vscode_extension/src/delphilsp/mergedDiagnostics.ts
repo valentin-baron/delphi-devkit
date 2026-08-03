@@ -50,7 +50,7 @@ export namespace MergedDiagnostics {
   }
 
   function isMergeEnabled(): boolean {
-    if (!Runtime.delphilsp?.isAvailable) return false;
+    if (!Runtime.delphilsp?.isDelphiLspExtensionAvailable) return false;
     return workspace.getConfiguration(DELPHILSP.CONFIG.KEY).get<boolean>(DELPHILSP.CONFIG.MERGE_DIAGNOSTICS, true);
   }
 

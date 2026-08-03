@@ -1,4 +1,4 @@
-import { extensions } from 'vscode';
+import { extensions, workspace } from 'vscode';
 import { Feature } from '../types';
 import { Runtime } from '../runtime';
 import { DELPHILSP } from '../constants';
@@ -19,10 +19,21 @@ import { MergedDiagnostics } from './mergedDiagnostics';
  * without DelphiLSP).
  */
 export class DelphiLspFeature implements Feature {
-  private _available = false;
+  private extensionAvailable = false;
 
-  public get isAvailable(): boolean {
-    return this._available;
+  /** The DelphiLSP extension is installed. Mirrored into the
+   *  `ddk:delphiLspAvailable` context key, which gates the commands'
+   *  `when`/`enablement` clauses. */
+  public get isDelphiLspExtensionAvailable(): boolean {
+    return this.extensionAvailable;
+  }
+
+  /** Whether the auto-sync may generate settings files and repoint
+   *  DelphiLSP: the extension must be installed AND the user opted in via
+   *  the `autoSync` setting. */
+  public get canAutoGenerate(): boolean {
+    if (!this.extensionAvailable) return false;
+    return workspace.getConfiguration(DELPHILSP.CONFIG.KEY).get<boolean>(DELPHILSP.CONFIG.AUTO_SYNC, true);
   }
 
   public async initialize(): Promise<void> {
@@ -46,8 +57,8 @@ export class DelphiLspFeature implements Feature {
 
   private updateAvailability(): void {
     const available = !!extensions.getExtension(DELPHILSP.EXTENSION_ID);
-    if (available === this._available) return;
-    this._available = available;
+    if (available === this.extensionAvailable) return;
+    this.extensionAvailable = available;
     Runtime.setContext(DELPHILSP.CONTEXT.AVAILABLE, available);
   }
 }
