@@ -151,7 +151,21 @@ fn write_ast_json_dump(
         meta,
         implementation_body: &meta.implementation_body,
     };
-    let json = serde_json::to_string_pretty(&dump)
+    let mut value = serde_json::to_value(&dump)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    // Elide the redundant `file` on every span that belongs to the unit's OWN
+    // file — which is nearly all of them — leaving it only where it differs (an
+    // `{$I}` include). The unit's own path is still present once at the root
+    // (`source_path`), and the location's `file` is computed from the SAME
+    // transparent serde as every nested span, so the comparison is exact. This
+    // is the bulk of the dump's size (the full path repeated per span).
+    if let Ok(self_location) = serde_json::to_value(meta.ast.name.location) {
+        if let Some(self_file) = self_location.get("file").and_then(|file| file.as_str()) {
+            let self_file = self_file.to_string();
+            elide_own_file_in_locations(&mut value, &self_file);
+        }
+    }
+    let json = serde_json::to_string_pretty(&value)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     // File name = the unit's resolved name, sanitized to a safe filename. The
     // resolver turns the interned `Identifier` back into its source text.
@@ -182,6 +196,34 @@ fn sanitize_ast_dump_filename(name: &str) -> String {
         "unit".to_string()
     } else {
         sanitized
+    }
+}
+
+/// Recursively strip the `file` field from every `CodeLocation`-shaped object
+/// (`{ "file": <path>, "span": {...} }`) whose `file` equals `self_file` — the
+/// unit's OWN source file. Nearly every span in a unit is in its own file, so
+/// repeating the full path per span is the bulk of the dump; a span with NO
+/// `file` is read as "the unit's own file", and only an `{$I}` include's span
+/// (a different path) keeps its `file`. Purely cosmetic/size — never changes the
+/// `.unit` cache format.
+fn elide_own_file_in_locations(value: &mut serde_json::Value, self_file: &str) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if map.contains_key("span")
+                && map.get("file").and_then(|file| file.as_str()) == Some(self_file)
+            {
+                map.remove("file");
+            }
+            for child in map.values_mut() {
+                elide_own_file_in_locations(child, self_file);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                elide_own_file_in_locations(item, self_file);
+            }
+        }
+        _ => {}
     }
 }
 
