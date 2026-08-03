@@ -382,14 +382,184 @@ struct AstYamlDump<'meta> {
     source_path: &'meta Path,
     /// The interface AST (unit header, uses clauses, interface declarations).
     ast: &'meta Unit,
-    /// The whole implementation-section semantic AST. Populated only for the
-    /// ACTIVE editor unit; an indexed/imported meta carries an empty body.
-    implementation_body: &'meta crate::ast_impl::ImplementationBody,
+    /// The whole implementation-section semantic AST, RECONSTRUCTED into a
+    /// readable nested tree from the flat expression arena (see
+    /// [`impl_body_to_value`]). The durable in-RAM form is the flat arena
+    /// ([`crate::ast_impl::ImplementationBody::expression_arena`]); only this dump
+    /// rebuilds the nested shape so `ExprId` integers never leak into the YAML.
+    /// Populated only for the ACTIVE editor unit; an indexed/imported meta
+    /// carries an empty body.
+    implementation_body: serde_json::Value,
     /// The unit's compile dependencies — useful context, kept.
     dependencies: &'meta [Dependency],
     /// Implementation-side identifier occurrences (find-references source).
     /// Included for completeness; can be noisy for large units.
     usages: &'meta [Usage],
+}
+
+// ─── YAML-dump reconstruction of the flattened expression tree ───────────────
+//
+// The implementation body stores its whole expression tree in ONE flat arena and
+// references children by `ExprId` index (see `crate::ast_impl`). A naive derive
+// would serialize that arena as a flat list plus integer child ids — unreadable.
+// The functions below walk from each root `ExprId` back through the arena and
+// rebuild the NESTED `serde_json::Value` tree the pre-flattening derive produced,
+// so the dump stays a readable expression tree. Nothing here is durable — it runs
+// only inside `dump_ast_yaml`, under the unit's self-file location context so the
+// nested `CodeLocation`s self-elide exactly as before.
+
+use crate::ast_impl::{Expression, ImplementationBody, Scope, Statement};
+use serde_json::{json, Map, Value};
+
+/// Serialize a value via `serde_json`, mapping any error to `null` (a dump is a
+/// best-effort debug view; an unserializable leaf degrades to `null`, which
+/// `prune_null_fields` then drops — never a hard failure).
+fn to_value_or_null<T: Serialize>(value: &T) -> Value {
+    serde_json::to_value(value).unwrap_or(Value::Null)
+}
+
+/// Reconstruct one expression subtree (rooted at `id`) as a nested `Value`,
+/// resolving `ExprId` children through `arena`. The variant/field names mirror
+/// the `Expression` enum's derived serde shape (externally-tagged), so the dump
+/// reads exactly like the pre-flattening tree.
+fn expr_to_value(arena: &[Expression], id: crate::ast_impl::ExprId) -> Value {
+    match &arena[id.0 as usize] {
+        Expression::Identifier(name) => json!({ "Identifier": to_value_or_null(name) }),
+        Expression::Member { receiver, member } => json!({
+            "Member": {
+                "receiver": expr_to_value(arena, *receiver),
+                "member": to_value_or_null(member),
+            }
+        }),
+        Expression::Call { callee, arguments, arguments_span } => json!({
+            "Call": {
+                "callee": expr_to_value(arena, *callee),
+                "arguments": arguments.iter().map(|a| expr_to_value(arena, *a)).collect::<Vec<_>>(),
+                "arguments_span": to_value_or_null(arguments_span),
+            }
+        }),
+        Expression::Index { base, indices } => json!({
+            "Index": {
+                "base": expr_to_value(arena, *base),
+                "indices": indices.iter().map(|i| expr_to_value(arena, *i)).collect::<Vec<_>>(),
+            }
+        }),
+        Expression::Cast { type_name, operand } => json!({
+            "Cast": {
+                "type_name": to_value_or_null(type_name),
+                "operand": expr_to_value(arena, *operand),
+            }
+        }),
+        Expression::Inherited { method, keyword_location } => json!({
+            "Inherited": {
+                "method": to_value_or_null(method),
+                "keyword_location": to_value_or_null(keyword_location),
+            }
+        }),
+        Expression::Unary { operator, operand } => json!({
+            "Unary": {
+                "operator": to_value_or_null(operator),
+                "operand": expr_to_value(arena, *operand),
+            }
+        }),
+        Expression::Binary { operator, left, right } => json!({
+            "Binary": {
+                "operator": to_value_or_null(operator),
+                "left": expr_to_value(arena, *left),
+                "right": expr_to_value(arena, *right),
+            }
+        }),
+        Expression::AnonymousMethod(scope) => {
+            json!({ "AnonymousMethod": scope_to_value(arena, scope) })
+        }
+        Expression::SetOrArrayLiteral(location) => {
+            json!({ "SetOrArrayLiteral": to_value_or_null(location) })
+        }
+        Expression::Literal(location) => json!({ "Literal": to_value_or_null(location) }),
+        Expression::Parenthesized(inner) => {
+            json!({ "Parenthesized": expr_to_value(arena, *inner) })
+        }
+    }
+}
+
+/// Reconstruct one statement as a nested `Value`, resolving expression `ExprId`s
+/// through `arena` and recursing into child statement lists / scopes.
+fn stmt_to_value(arena: &[Expression], statement: &Statement) -> Value {
+    match statement {
+        Statement::Expression(expression) => {
+            json!({ "Expression": expr_to_value(arena, *expression) })
+        }
+        Statement::Assignment { target, value } => json!({
+            "Assignment": {
+                "target": expr_to_value(arena, *target),
+                "value": expr_to_value(arena, *value),
+            }
+        }),
+        Statement::LocalVar(symbol, initializer) => json!({
+            "LocalVar": [
+                to_value_or_null(symbol),
+                initializer.map(|id| expr_to_value(arena, id)).unwrap_or(Value::Null),
+            ]
+        }),
+        Statement::With { items, body } => json!({
+            "With": {
+                "items": items.iter().map(|i| expr_to_value(arena, *i)).collect::<Vec<_>>(),
+                "body": body.iter().map(|s| stmt_to_value(arena, s)).collect::<Vec<_>>(),
+            }
+        }),
+        Statement::ChildScope(scope) => json!({ "ChildScope": scope_to_value(arena, scope) }),
+        Statement::Group(inner) => json!({
+            "Group": inner.iter().map(|s| stmt_to_value(arena, s)).collect::<Vec<_>>()
+        }),
+        Statement::Opaque(location) => json!({ "Opaque": to_value_or_null(location) }),
+    }
+}
+
+/// Reconstruct one scope as a nested `Value` (its metadata plus its recursively
+/// rebuilt statement list).
+fn scope_to_value(arena: &[Expression], scope: &Scope) -> Value {
+    json!({
+        "kind": to_value_or_null(&scope.kind),
+        "span": to_value_or_null(&scope.span),
+        "self_type_key": to_value_or_null(&scope.self_type_key),
+        "declarations": to_value_or_null(&scope.declarations),
+        "statements": scope.statements.iter().map(|s| stmt_to_value(arena, s)).collect::<Vec<_>>(),
+    })
+}
+
+/// Reconstruct the whole implementation body as a readable nested `Value` (the
+/// flat `expression_arena` is walked, never emitted). Field names mirror the
+/// `ImplementationBody` derive so the dump shape is unchanged EXCEPT that the
+/// arena is unfolded back into the nested tree and no `expression_arena` list
+/// appears.
+fn impl_body_to_value(body: &ImplementationBody) -> Value {
+    let arena = &body.expression_arena;
+    let routines = body
+        .routines
+        .iter()
+        .map(|routine| {
+            json!({
+                "name": to_value_or_null(&routine.name),
+                "owner_type_key": to_value_or_null(&routine.owner_type_key),
+                "kind": to_value_or_null(&routine.kind),
+                "scope": scope_to_value(arena, &routine.scope),
+            })
+        })
+        .collect::<Vec<_>>();
+    let statement_list = |list: &Option<crate::ast_impl::StatementList>| -> Value {
+        match list {
+            Some(statements) => Value::Array(
+                statements.iter().map(|s| stmt_to_value(arena, s)).collect(),
+            ),
+            None => Value::Null,
+        }
+    };
+    let mut map = Map::new();
+    map.insert("routines".to_string(), Value::Array(routines));
+    map.insert("initialization".to_string(), statement_list(&body.initialization));
+    map.insert("finalization".to_string(), statement_list(&body.finalization));
+    map.insert("reliable".to_string(), Value::Bool(body.reliable));
+    Value::Object(map)
 }
 
 /// Serialize `meta` to a READABLE YAML string for an on-demand debug dump.
@@ -412,14 +582,16 @@ struct AstYamlDump<'meta> {
 /// context so the elision applies to the `Value` build (where the nested
 /// `CodeLocation`s actually serialize).
 pub fn dump_ast_yaml(meta: &UnitMeta) -> Result<String, String> {
-    let dump = AstYamlDump {
-        source_path: &meta.source_path,
-        ast: &meta.ast,
-        implementation_body: &meta.implementation_body,
-        dependencies: &meta.dependencies,
-        usages: &meta.usages,
-    };
     crate::meta::with_self_file_context(meta.ast.name.location.file, || {
+        // Reconstruct the nested body tree INSIDE the self-file context so its
+        // `CodeLocation`s self-elide exactly like the rest of the projection.
+        let dump = AstYamlDump {
+            source_path: &meta.source_path,
+            ast: &meta.ast,
+            implementation_body: impl_body_to_value(&meta.implementation_body),
+            dependencies: &meta.dependencies,
+            usages: &meta.usages,
+        };
         let mut value = serde_json::to_value(&dump).map_err(|error| error.to_string())?;
         // Drop `null` fields (an absent `Option`) — a dump full of
         // `source_file: null` / `initialization: null` is noise. `serde_json`'s

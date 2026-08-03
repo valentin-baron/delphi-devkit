@@ -201,6 +201,7 @@ pub fn parse_file_full(
         pending_attributes: Vec::new(),
         recovered: false,
         block_nesting: 0,
+        expression_arena: Vec::new(),
     };
     let source = parser.parse_source()?;
     let recovered = parser.recovered;
@@ -256,6 +257,13 @@ pub(crate) struct UnitParser<'arena> {
     /// the count of still-open bodies. [`Self::recover_from_interface_error`]
     /// uses it to seed the nesting-aware resync and then resets it to 0.
     block_nesting: usize,
+    /// The implementation-body expression arena being built (the flat slab). Every
+    /// expression-producing method allocates its node here via
+    /// [`Self::alloc_expression`] and returns its [`crate::ast_impl::ExprId`]; a
+    /// parent allocs its children first, then itself. Moved into the constructed
+    /// [`crate::ast_impl::ImplementationBody`] when the impl section is assembled
+    /// (see [`Self::parse_implementation_body`]). Empty for a non-unit source.
+    expression_arena: Vec<crate::ast_impl::Expression>,
 }
 
 impl UnitParser<'_> {
@@ -273,6 +281,26 @@ impl UnitParser<'_> {
 
     fn exit_depth(&mut self) {
         self.depth -= 1;
+    }
+
+    /// Push one [`crate::ast_impl::Expression`] into the body arena and return its
+    /// [`crate::ast_impl::ExprId`]. Children are allocated BEFORE their parent, so
+    /// a parent's id is always the largest in its subtree — but the walk order is
+    /// irrelevant to correctness: only the recorded ids matter.
+    fn alloc_expression(
+        &mut self,
+        expression: crate::ast_impl::Expression,
+    ) -> crate::ast_impl::ExprId {
+        let id = crate::ast_impl::ExprId(self.expression_arena.len() as u32);
+        self.expression_arena.push(expression);
+        id
+    }
+
+    /// Take the accumulated expression arena, leaving an empty one behind. Called
+    /// once when the implementation body is assembled so the arena is moved into
+    /// the [`crate::ast_impl::ImplementationBody`] (its single owner).
+    fn take_expression_arena(&mut self) -> Vec<crate::ast_impl::Expression> {
+        std::mem::take(&mut self.expression_arena)
     }
 
     fn parse_source(&mut self) -> Result<Source, ParseError> {
@@ -403,7 +431,9 @@ impl UnitParser<'_> {
                 // whatever the routine parses left it — a routine may have
                 // degraded locally without a hard stop, so read the live flag.
                 let reliable = self.cursor.state().impl_scopes_reliable();
+                let expression_arena = self.take_expression_arena();
                 return Ok(ImplementationBody {
+                    expression_arena,
                     routines,
                     initialization,
                     finalization,
@@ -499,7 +529,9 @@ impl UnitParser<'_> {
                     // is consumed by the driver's remainder flat-scan below.
                     self.flush_impl_usages()?;
                     let reliable = self.cursor.state().impl_scopes_reliable();
+                    let expression_arena = self.take_expression_arena();
                     return Ok(ImplementationBody {
+                        expression_arena,
                         routines,
                         initialization,
                         finalization,
@@ -512,7 +544,9 @@ impl UnitParser<'_> {
                 _ => {
                     self.flush_impl_usages()?;
                     let reliable = self.cursor.state().impl_scopes_reliable();
+                    let expression_arena = self.take_expression_arena();
                     return Ok(ImplementationBody {
+                        expression_arena,
                         routines,
                         initialization,
                         finalization,
@@ -526,12 +560,14 @@ impl UnitParser<'_> {
     /// Build a `reliable = false` [`ImplementationBody`] after a hard degrade in
     /// the top-level loop (the reliability flag is already cleared in state).
     fn degraded_body(
-        &self,
+        &mut self,
         routines: Vec<crate::ast_impl::RoutineImplementation>,
         initialization: Option<crate::ast_impl::StatementList>,
         finalization: Option<crate::ast_impl::StatementList>,
     ) -> crate::ast_impl::ImplementationBody {
+        let expression_arena = self.take_expression_arena();
         crate::ast_impl::ImplementationBody {
+            expression_arena,
             routines,
             initialization,
             finalization,
@@ -5195,17 +5231,18 @@ impl UnitParser<'_> {
 
     /// Parse a whole expression at the loosest precedence. The public S1 entry
     /// point (statement/scope parsing in S2 will call this per operand position).
-    pub(crate) fn parse_expression(&mut self) -> Result<Expression, ParseError> {
+    pub(crate) fn parse_expression(&mut self) -> Result<crate::ast_impl::ExprId, ParseError> {
         self.parse_binary_expression(1)
     }
 
     /// Precedence-climbing core: parse a unary/primary operand, then fold in
     /// binary operators whose binding power is `>= minimum_power`. Left-assoc:
-    /// the right operand is parsed at `power + 1`.
+    /// the right operand is parsed at `power + 1`. Returns the [`ExprId`] of the
+    /// (possibly folded) result node in the body arena.
     fn parse_binary_expression(
         &mut self,
         minimum_power: u8,
-    ) -> Result<Expression, ParseError> {
+    ) -> Result<crate::ast_impl::ExprId, ParseError> {
         self.enter_depth()?;
         let result = (|| {
             let mut left = self.parse_unary_expression()?;
@@ -5221,20 +5258,20 @@ impl UnitParser<'_> {
                 if token == Token::As {
                     self.cursor.advance()?; // 'as'
                     let type_name = self.parse_type_reference_name()?;
-                    left = Expression::Cast {
+                    left = self.alloc_expression(Expression::Cast {
                         type_name,
-                        operand: Box::new(left),
-                    };
+                        operand: left,
+                    });
                     continue;
                 }
                 self.cursor.advance()?; // the operator
                 let operator = Self::binary_operator_of(token);
                 let right = self.parse_binary_expression(power + 1)?;
-                left = Expression::Binary {
+                left = self.alloc_expression(Expression::Binary {
                     operator,
-                    left: Box::new(left),
-                    right: Box::new(right),
-                };
+                    left,
+                    right,
+                });
             }
             Ok(left)
         })();
@@ -5245,7 +5282,7 @@ impl UnitParser<'_> {
     /// Parse a prefix-unary operator chain (`@ not - +`) then a primary with its
     /// postfix chain. Prefix operators bind looser than postfixes, so `@a.b` is
     /// `@(a.b)` (the postfix `.b` attaches to `a` first, matching Delphi).
-    fn parse_unary_expression(&mut self) -> Result<Expression, ParseError> {
+    fn parse_unary_expression(&mut self) -> Result<crate::ast_impl::ExprId, ParseError> {
         let operator = match self.peek_token()? {
             Some(Token::At_) => Some(UnaryOperator::AddressOf),
             Some(Token::Not) => Some(UnaryOperator::Not),
@@ -5256,10 +5293,10 @@ impl UnitParser<'_> {
         if let Some(operator) = operator {
             self.cursor.advance()?; // the prefix operator
             let operand = self.parse_unary_expression()?;
-            return Ok(Expression::Unary {
+            return Ok(self.alloc_expression(Expression::Unary {
                 operator,
-                operand: Box::new(operand),
-            });
+                operand,
+            }));
         }
         self.parse_postfix_expression()
     }
@@ -5267,7 +5304,7 @@ impl UnitParser<'_> {
     /// Parse a primary then apply postfix operators (`.member`, `(args)`,
     /// `[indices]`, `^` deref) in a loop until none applies. This is what builds
     /// `a.b(c)[d].e` as a correctly-nested receiver chain.
-    fn parse_postfix_expression(&mut self) -> Result<Expression, ParseError> {
+    fn parse_postfix_expression(&mut self) -> Result<crate::ast_impl::ExprId, ParseError> {
         let mut expression = self.parse_primary_expression()?;
         loop {
             match self.peek_token()? {
@@ -5275,10 +5312,10 @@ impl UnitParser<'_> {
                     self.cursor.advance()?; // '.'
                     match self.take_name_occurrence()? {
                         Some(member) => {
-                            expression = Expression::Member {
-                                receiver: Box::new(expression),
+                            expression = self.alloc_expression(Expression::Member {
+                                receiver: expression,
                                 member,
-                            };
+                            });
                         }
                         // Malformed `a . <non-name>`: degrade locally — keep the
                         // receiver, stop the chain. The offending `.` is already
@@ -5288,25 +5325,25 @@ impl UnitParser<'_> {
                 }
                 Some(Token::LParen) => {
                     let (arguments, arguments_span) = self.parse_argument_list()?;
-                    expression = Expression::Call {
-                        callee: Box::new(expression),
+                    expression = self.alloc_expression(Expression::Call {
+                        callee: expression,
                         arguments,
                         arguments_span,
-                    };
+                    });
                 }
                 Some(Token::LBracket) => {
                     let indices = self.parse_index_list()?;
-                    expression = Expression::Index {
-                        base: Box::new(expression),
+                    expression = self.alloc_expression(Expression::Index {
+                        base: expression,
                         indices,
-                    };
+                    });
                 }
                 Some(Token::Caret) => {
                     self.cursor.advance()?; // '^'
-                    expression = Expression::Unary {
+                    expression = self.alloc_expression(Expression::Unary {
                         operator: UnaryOperator::Dereference,
-                        operand: Box::new(expression),
-                    };
+                        operand: expression,
+                    });
                 }
                 _ => break,
             }
@@ -5316,11 +5353,12 @@ impl UnitParser<'_> {
 
     /// Parse a primary expression: a literal, `nil`, `(expr)`, `[set/array]`, an
     /// identifier, `inherited [name]`, or an anonymous-method opener.
-    fn parse_primary_expression(&mut self) -> Result<Expression, ParseError> {
+    fn parse_primary_expression(&mut self) -> Result<crate::ast_impl::ExprId, ParseError> {
         let Some(lexeme) = self.cursor.peek()? else {
             // EOF where an operand is required: best-effort empty-span literal so
             // the caller resyncs rather than the whole parse aborting.
-            return Ok(Expression::Literal(self.cursor.last_location()));
+            let literal = Expression::Literal(self.cursor.last_location());
+            return Ok(self.alloc_expression(literal));
         };
         match lexeme.token {
             // A Delphi string constant is a run of ADJACENT string / character
@@ -5337,17 +5375,18 @@ impl UnitParser<'_> {
                 ) {
                     end = self.cursor.advance()?.expect("peeked literal").location;
                 }
-                Ok(Expression::Literal(Self::span_between(
+                let literal = Expression::Literal(Self::span_between(
                     first.location.file,
                     first.location.span.start,
                     end,
-                )))
+                ));
+                Ok(self.alloc_expression(literal))
             }
             // Opaque numeric / keyword literal leaves.
             Token::IntLiteral | Token::FloatLiteral | Token::Nil | Token::True
             | Token::False => {
                 self.cursor.advance()?;
-                Ok(Expression::Literal(lexeme.location))
+                Ok(self.alloc_expression(Expression::Literal(lexeme.location)))
             }
             // Parenthesized sub-expression.
             Token::LParen => {
@@ -5358,7 +5397,7 @@ impl UnitParser<'_> {
                 if self.peek_token()? == Some(Token::RParen) {
                     self.cursor.advance()?;
                 }
-                Ok(Expression::Parenthesized(Box::new(inner)))
+                Ok(self.alloc_expression(Expression::Parenthesized(inner)))
             }
             // Set / array-constructor literal: capture the balanced bracket span,
             // still emitting identifier occurrences inside for the reference index.
@@ -5370,7 +5409,7 @@ impl UnitParser<'_> {
                 let keyword_location = lexeme.location;
                 self.cursor.advance()?; // 'inherited'
                 let method = self.take_name_occurrence()?;
-                Ok(Expression::Inherited { method, keyword_location })
+                Ok(self.alloc_expression(Expression::Inherited { method, keyword_location }))
             }
             // Anonymous-method opener in expression position.
             Token::Procedure | Token::Function | Token::Reference => {
@@ -5385,7 +5424,7 @@ impl UnitParser<'_> {
             {
                 self.cursor.advance()?;
                 let name = self.name_from_lexeme(lexeme);
-                Ok(Expression::Identifier(name))
+                Ok(self.alloc_expression(Expression::Identifier(name)))
             }
             // Unexpected token where a primary is required.
             //
@@ -5401,17 +5440,17 @@ impl UnitParser<'_> {
             // expressions guard against the resulting zero-token sub-parse.
             token if !Self::can_start_expression(token) => {
                 let start = lexeme.location.span.start;
-                Ok(Expression::Literal(CodeLocation {
+                Ok(self.alloc_expression(Expression::Literal(CodeLocation {
                     file: lexeme.location.file,
                     span: Span { start, end: start },
-                }))
+                })))
             }
             // A token that CAN start an expression but wasn't matched above
             // (should not normally happen). Consume exactly one token to
             // guarantee forward progress (never loop forever).
             _ => {
                 self.cursor.advance()?;
-                Ok(Expression::Literal(lexeme.location))
+                Ok(self.alloc_expression(Expression::Literal(lexeme.location)))
             }
         }
     }
@@ -5496,7 +5535,7 @@ impl UnitParser<'_> {
     /// a missing `)` (degrades at EOF).
     fn parse_argument_list(
         &mut self,
-    ) -> Result<(Vec<Expression>, CodeLocation), ParseError> {
+    ) -> Result<(Vec<crate::ast_impl::ExprId>, CodeLocation), ParseError> {
         let open = self.cursor.advance()?.expect("peeked '('");
         let file = open.location.file;
         let start = open.location.span.start;
@@ -5537,7 +5576,7 @@ impl UnitParser<'_> {
 
     /// Parse a `[...]` index list (the `[` at the cursor). Returns the index
     /// expressions (`a[i, j]` → two). Tolerant of a missing `]`.
-    fn parse_index_list(&mut self) -> Result<Vec<Expression>, ParseError> {
+    fn parse_index_list(&mut self) -> Result<Vec<crate::ast_impl::ExprId>, ParseError> {
         self.cursor.advance()?; // '['
         let mut indices = Vec::new();
         if self.peek_token()? == Some(Token::RBracket) {
@@ -5563,7 +5602,7 @@ impl UnitParser<'_> {
     /// Capture a `[...]` set/array-constructor literal as one balanced-bracket
     /// span, still emitting an occurrence for every identifier-like token inside
     /// (so the reference index stays complete). The `[` is at the cursor.
-    fn parse_set_or_array_literal(&mut self) -> Result<Expression, ParseError> {
+    fn parse_set_or_array_literal(&mut self) -> Result<crate::ast_impl::ExprId, ParseError> {
         let open = self.cursor.advance()?.expect("peeked '['");
         let file = open.location.file;
         let start = open.location.span.start;
@@ -5583,11 +5622,11 @@ impl UnitParser<'_> {
                 _ => {}
             }
         }
-        Ok(Expression::SetOrArrayLiteral(Self::span_between(
+        Ok(self.alloc_expression(Expression::SetOrArrayLiteral(Self::span_between(
             file,
             start,
             end_location,
-        )))
+        ))))
     }
 
     /// Parse an anonymous-method opener (`procedure`/`function`, optionally
@@ -5600,7 +5639,7 @@ impl UnitParser<'_> {
     /// [`Self::parse_statement_list_capturing_end`], which consumes exactly the
     /// matching `end`; on `asm`/EOF it degrades (reliability flips) and the scope
     /// carries an `Opaque` statement rather than a wrong span.
-    fn parse_anonymous_method_opaque(&mut self) -> Result<Expression, ParseError> {
+    fn parse_anonymous_method_opaque(&mut self) -> Result<crate::ast_impl::ExprId, ParseError> {
         use crate::ast_impl::{Scope, ScopeKind, Statement};
         let opener = self.cursor.advance()?.expect("peeked opener");
         let start = opener.location.span.start;
@@ -5622,13 +5661,13 @@ impl UnitParser<'_> {
                     end = part.location;
                 }
                 let span = Self::span_between(opener.location.file, start, end);
-                return Ok(Expression::AnonymousMethod(Box::new(Scope {
+                return Ok(self.alloc_expression(Expression::AnonymousMethod(Box::new(Scope {
                     kind: ScopeKind::Anonymous,
                     span: span.span,
                     self_type_key: None,
                     declarations: Vec::new(),
                     statements: Vec::new(),
-                })));
+                }))));
             }
             self.cursor.advance()?; // 'procedure'/'function'
         }
@@ -5645,13 +5684,13 @@ impl UnitParser<'_> {
                     start,
                     self.cursor.last_location(),
                 );
-                return Ok(Expression::AnonymousMethod(Box::new(Scope {
+                return Ok(self.alloc_expression(Expression::AnonymousMethod(Box::new(Scope {
                     kind: ScopeKind::Anonymous,
                     span: span.span,
                     self_type_key: None,
                     declarations: declarations.iter().map(Self::local_symbol_of).collect(),
                     statements: Vec::new(),
-                })));
+                }))));
             }
         }
 
@@ -5685,13 +5724,13 @@ impl UnitParser<'_> {
                         start,
                         self.cursor.last_location(),
                     );
-                    return Ok(Expression::AnonymousMethod(Box::new(Scope {
+                    return Ok(self.alloc_expression(Expression::AnonymousMethod(Box::new(Scope {
                         kind: ScopeKind::Anonymous,
                         span: span.span,
                         self_type_key: None,
                         declarations: declarations.iter().map(Self::local_symbol_of).collect(),
                         statements: child_scopes,
-                    })));
+                    }))));
                 }
                 _ => {
                     // Return type / directive tokens: step over emitting usages.
@@ -5717,13 +5756,13 @@ impl UnitParser<'_> {
             }
         };
         let span = Span::new(start as usize, end_offset as usize);
-        Ok(Expression::AnonymousMethod(Box::new(Scope {
+        Ok(self.alloc_expression(Expression::AnonymousMethod(Box::new(Scope {
             kind: ScopeKind::Anonymous,
             span,
             self_type_key: None,
             declarations: declarations.iter().map(Self::local_symbol_of).collect(),
             statements,
-        })))
+        }))))
     }
 
     /// A `CodeLocation` spanning from byte `start` (in `file`) through the end of
@@ -5742,9 +5781,12 @@ impl UnitParser<'_> {
 
     /// Test-only entry point: build a `UnitParser` over a virtual source snippet
     /// and parse a single expression from it. Mirrors the cursor construction the
-    /// other parser tests use.
+    /// other parser tests use. Returns the flat expression arena plus the root
+    /// [`crate::ast_impl::ExprId`]; children are resolved via `arena[id.0]`.
     #[cfg(test)]
-    pub(crate) fn parse_expression_for_test(source: &str) -> Expression {
+    pub(crate) fn parse_expression_for_test(
+        source: &str,
+    ) -> (Vec<crate::ast_impl::Expression>, crate::ast_impl::ExprId) {
         use crate::context::{DefineSet, SwitchState, TargetPlatform};
         use crate::unit_cache::UnitCache;
         use std::collections::HashMap;
@@ -5773,10 +5815,12 @@ impl UnitParser<'_> {
             pending_attributes: Vec::new(),
             recovered: false,
             block_nesting: 0,
+            expression_arena: Vec::new(),
         };
-        parser
+        let root = parser
             .parse_expression()
-            .expect("expression parse must not hard-fail (error-tolerant)")
+            .expect("expression parse must not hard-fail (error-tolerant)");
+        (parser.expression_arena, root)
     }
 }
 
@@ -6923,75 +6967,99 @@ mod tests {
         // Recursively count scopes (every routine + nested + anonymous + method +
         // with) and statements+expressions captured in an ImplementationBody, so
         // the probe reports S2 coverage, not just the flat routine count.
-        use crate::ast_impl::{Expression, ImplementationBody, Scope, Statement};
-        fn count_expression(expression: &Expression, scopes: &mut usize, nodes: &mut usize) {
+        use crate::ast_impl::{Expression, ExprId, ImplementationBody, Scope, Statement};
+        fn count_expression(
+            id: ExprId,
+            arena: &[Expression],
+            scopes: &mut usize,
+            nodes: &mut usize,
+        ) {
             *nodes += 1;
-            match expression {
-                Expression::Member { receiver, .. } => count_expression(receiver, scopes, nodes),
+            match &arena[id.0 as usize] {
+                Expression::Member { receiver, .. } => {
+                    count_expression(*receiver, arena, scopes, nodes)
+                }
                 Expression::Call { callee, arguments, .. } => {
-                    count_expression(callee, scopes, nodes);
+                    count_expression(*callee, arena, scopes, nodes);
                     for argument in arguments {
-                        count_expression(argument, scopes, nodes);
+                        count_expression(*argument, arena, scopes, nodes);
                     }
                 }
                 Expression::Index { base, indices } => {
-                    count_expression(base, scopes, nodes);
+                    count_expression(*base, arena, scopes, nodes);
                     for index in indices {
-                        count_expression(index, scopes, nodes);
+                        count_expression(*index, arena, scopes, nodes);
                     }
                 }
-                Expression::Cast { operand, .. } => count_expression(operand, scopes, nodes),
-                Expression::Unary { operand, .. } => count_expression(operand, scopes, nodes),
-                Expression::Binary { left, right, .. } => {
-                    count_expression(left, scopes, nodes);
-                    count_expression(right, scopes, nodes);
+                Expression::Cast { operand, .. } => {
+                    count_expression(*operand, arena, scopes, nodes)
                 }
-                Expression::Parenthesized(inner) => count_expression(inner, scopes, nodes),
-                Expression::AnonymousMethod(scope) => count_scope(scope, scopes, nodes),
+                Expression::Unary { operand, .. } => {
+                    count_expression(*operand, arena, scopes, nodes)
+                }
+                Expression::Binary { left, right, .. } => {
+                    count_expression(*left, arena, scopes, nodes);
+                    count_expression(*right, arena, scopes, nodes);
+                }
+                Expression::Parenthesized(inner) => {
+                    count_expression(*inner, arena, scopes, nodes)
+                }
+                Expression::AnonymousMethod(scope) => count_scope(scope, arena, scopes, nodes),
                 _ => {}
             }
         }
-        fn count_statements(statements: &[Statement], scopes: &mut usize, nodes: &mut usize) {
+        fn count_statements(
+            statements: &[Statement],
+            arena: &[Expression],
+            scopes: &mut usize,
+            nodes: &mut usize,
+        ) {
             for statement in statements {
                 *nodes += 1;
                 match statement {
                     Statement::Expression(expression) => {
-                        count_expression(expression, scopes, nodes)
+                        count_expression(*expression, arena, scopes, nodes)
                     }
                     Statement::Assignment { target, value } => {
-                        count_expression(target, scopes, nodes);
-                        count_expression(value, scopes, nodes);
+                        count_expression(*target, arena, scopes, nodes);
+                        count_expression(*value, arena, scopes, nodes);
                     }
                     Statement::LocalVar(_, Some(expression)) => {
-                        count_expression(expression, scopes, nodes)
+                        count_expression(*expression, arena, scopes, nodes)
                     }
                     Statement::LocalVar(_, None) => {}
                     Statement::With { items, body } => {
                         *scopes += 1; // a with-block opens a member scope
                         for item in items {
-                            count_expression(item, scopes, nodes);
+                            count_expression(*item, arena, scopes, nodes);
                         }
-                        count_statements(body, scopes, nodes);
+                        count_statements(body, arena, scopes, nodes);
                     }
-                    Statement::ChildScope(scope) => count_scope(scope, scopes, nodes),
-                    Statement::Group(inner) => count_statements(inner, scopes, nodes),
+                    Statement::ChildScope(scope) => count_scope(scope, arena, scopes, nodes),
+                    Statement::Group(inner) => count_statements(inner, arena, scopes, nodes),
                     Statement::Opaque(_) => {}
                 }
             }
         }
-        fn count_scope(scope: &Scope, scopes: &mut usize, nodes: &mut usize) {
+        fn count_scope(
+            scope: &Scope,
+            arena: &[Expression],
+            scopes: &mut usize,
+            nodes: &mut usize,
+        ) {
             *scopes += 1;
-            count_statements(&scope.statements, scopes, nodes);
+            count_statements(&scope.statements, arena, scopes, nodes);
         }
         fn count_body(body: &ImplementationBody, scopes: &mut usize, nodes: &mut usize) {
+            let arena = &body.expression_arena;
             for routine in &body.routines {
-                count_scope(&routine.scope, scopes, nodes);
+                count_scope(&routine.scope, arena, scopes, nodes);
             }
             if let Some(init) = &body.initialization {
-                count_statements(init, scopes, nodes);
+                count_statements(init, arena, scopes, nodes);
             }
             if let Some(fin) = &body.finalization {
-                count_statements(fin, scopes, nodes);
+                count_statements(fin, arena, scopes, nodes);
             }
         }
 
@@ -8284,53 +8352,58 @@ mod tests {
     use crate::ast_impl::{Expression, Scope, ScopeKind, Statement};
 
     /// Count all scopes reachable from a statement list (child scopes + anon
-    /// method scopes + with-blocks), recursively.
-    fn count_child_scopes(statements: &[Statement]) -> usize {
-        fn walk_expression(expression: &Expression, total: &mut usize) {
-            match expression {
+    /// method scopes + with-blocks), recursively. `arena` is the owning body's
+    /// expression arena — expression children are resolved by [`Expression`] id.
+    fn count_child_scopes(statements: &[Statement], arena: &[Expression]) -> usize {
+        fn walk_expression(id: crate::ast_impl::ExprId, arena: &[Expression], total: &mut usize) {
+            match &arena[id.0 as usize] {
                 Expression::AnonymousMethod(scope) => {
                     *total += 1;
                     for statement in &scope.statements {
-                        walk_statement(statement, total);
+                        walk_statement(statement, arena, total);
                     }
                 }
-                Expression::Member { receiver, .. } => walk_expression(receiver, total),
+                Expression::Member { receiver, .. } => walk_expression(*receiver, arena, total),
                 Expression::Call { callee, arguments, .. } => {
-                    walk_expression(callee, total);
-                    arguments.iter().for_each(|a| walk_expression(a, total));
+                    walk_expression(*callee, arena, total);
+                    arguments.iter().for_each(|a| walk_expression(*a, arena, total));
                 }
                 Expression::Index { base, indices } => {
-                    walk_expression(base, total);
-                    indices.iter().for_each(|i| walk_expression(i, total));
+                    walk_expression(*base, arena, total);
+                    indices.iter().for_each(|i| walk_expression(*i, arena, total));
                 }
-                Expression::Unary { operand, .. } => walk_expression(operand, total),
+                Expression::Unary { operand, .. } => walk_expression(*operand, arena, total),
                 Expression::Binary { left, right, .. } => {
-                    walk_expression(left, total);
-                    walk_expression(right, total);
+                    walk_expression(*left, arena, total);
+                    walk_expression(*right, arena, total);
                 }
-                Expression::Parenthesized(inner) => walk_expression(inner, total),
+                Expression::Parenthesized(inner) => walk_expression(*inner, arena, total),
                 _ => {}
             }
         }
-        fn walk_statement(statement: &Statement, total: &mut usize) {
+        fn walk_statement(statement: &Statement, arena: &[Expression], total: &mut usize) {
             match statement {
                 Statement::ChildScope(_) => *total += 1,
                 Statement::With { body, .. } => {
                     *total += 1;
-                    body.iter().for_each(|s| walk_statement(s, total));
+                    body.iter().for_each(|s| walk_statement(s, arena, total));
                 }
-                Statement::Group(inner) => inner.iter().for_each(|s| walk_statement(s, total)),
-                Statement::Expression(expression) => walk_expression(expression, total),
+                Statement::Group(inner) => {
+                    inner.iter().for_each(|s| walk_statement(s, arena, total))
+                }
+                Statement::Expression(expression) => walk_expression(*expression, arena, total),
                 Statement::Assignment { target, value } => {
-                    walk_expression(target, total);
-                    walk_expression(value, total);
+                    walk_expression(*target, arena, total);
+                    walk_expression(*value, arena, total);
                 }
-                Statement::LocalVar(_, Some(expression)) => walk_expression(expression, total),
+                Statement::LocalVar(_, Some(expression)) => {
+                    walk_expression(*expression, arena, total)
+                }
                 _ => {}
             }
         }
         let mut total = 0;
-        statements.iter().for_each(|s| walk_statement(s, &mut total));
+        statements.iter().for_each(|s| walk_statement(s, arena, &mut total));
         total
     }
 
@@ -8418,8 +8491,9 @@ mod tests {
              procedure Host;\nbegin\n  Run(procedure(X: Integer) begin DoIt(X); end);\nend;\nend.";
         let outcome = parse_outcome(source);
         assert!(outcome.impl_scopes_reliable, "a modelled closure stays reliable");
-        let routine = &outcome.implementation_body.routines[0];
-        let anon_scopes = count_child_scopes(&routine.scope.statements);
+        let body = &outcome.implementation_body;
+        let routine = &body.routines[0];
+        let anon_scopes = count_child_scopes(&routine.scope.statements, &body.expression_arena);
         assert!(anon_scopes >= 1, "the closure opens a child scope");
     }
 
@@ -8514,12 +8588,16 @@ mod tests {
         let source = "unit U;\ninterface\nimplementation\n\
              procedure P;\nvar X: Integer;\nbegin\n  X := 42;\nend;\nend.";
         let outcome = parse_outcome(source);
-        let routine = &outcome.implementation_body.routines[0];
+        let body = &outcome.implementation_body;
+        let routine = &body.routines[0];
         let assignment = routine.scope.statements.iter().find_map(|s| match s {
-            Statement::Assignment { target, .. } => Some(target),
+            Statement::Assignment { target, .. } => Some(*target),
             _ => None,
         });
-        let Some(Expression::Identifier(target_name)) = assignment else {
+        let Some(target) = assignment else {
+            panic!("expected an assignment statement");
+        };
+        let Expression::Identifier(target_name) = body.expression(target) else {
             panic!("expected an assignment with an identifier target");
         };
         assert_eq!(target_name.key, key("X"));

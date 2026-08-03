@@ -1550,21 +1550,22 @@ impl ProjectSession {
     /// keeps the TIGHTEST covering member occurrence, so a chain `A.B.C` with
     /// the cursor on `C` returns `(A.B, C)` — the outermost `Member` whose own
     /// `member` span is the one under the cursor.
-    fn member_occurrence_at<'a>(
+    fn member_occurrence_at(
         &self,
-        meta: &'a UnitMeta,
+        meta: &UnitMeta,
         position: u32,
-    ) -> Option<(&'a crate::ast_impl::Expression, Identifier, CodeLocation)> {
+    ) -> Option<(crate::ast_impl::ExprId, Identifier, CodeLocation)> {
         let body = &meta.implementation_body;
-        let mut best: Option<(&crate::ast_impl::Expression, Identifier, CodeLocation)> = None;
+        let arena = &body.expression_arena;
+        let mut best: Option<(crate::ast_impl::ExprId, Identifier, CodeLocation)> = None;
         for routine in &body.routines {
-            find_member_occurrence_in_scope(&routine.scope, position, &mut best);
+            find_member_occurrence_in_scope(&routine.scope, arena, position, &mut best);
         }
         if let Some(initialization) = &body.initialization {
-            find_member_occurrence_in_statements(initialization, position, &mut best);
+            find_member_occurrence_in_statements(initialization, arena, position, &mut best);
         }
         if let Some(finalization) = &body.finalization {
-            find_member_occurrence_in_statements(finalization, position, &mut best);
+            find_member_occurrence_in_statements(finalization, arena, position, &mut best);
         }
         best
     }
@@ -1623,6 +1624,7 @@ impl ProjectSession {
         let mut occurrence: Option<(Identifier, CodeLocation)> = None;
         find_inherited_occurrence_in_scope(
             &routine.scope,
+            &body.expression_arena,
             position,
             routine.name.key,
             &mut occurrence,
@@ -1771,10 +1773,10 @@ impl ProjectSession {
         &self,
         meta: &UnitMeta,
         position_for_scope: u32,
-        expression: &crate::ast_impl::Expression,
+        expression: crate::ast_impl::ExprId,
     ) -> Option<Identifier> {
         use crate::ast_impl::Expression;
-        match expression {
+        match meta.implementation_body.expression(expression) {
             // A bare (possibly dotted) name. Mirror `member_receiver_at`'s
             // branches (a)–(d): a body local/param, an own type or typed
             // var/const/field, or an imported type.
@@ -1818,23 +1820,24 @@ impl ProjectSession {
             // OWN declared type on that owner's flattened (inheritance-aware)
             // surface. This gives chain support (`A.B.C`).
             Expression::Member { receiver, member } => {
+                let (receiver, member_key) = (*receiver, member.key);
                 let owner_type = self.type_of_expression(meta, position_for_scope, receiver)?;
                 self.flattened_members(meta, owner_type)
                     .iter()
-                    .find(|(_, resolved)| resolved.key == member.key)
+                    .find(|(_, resolved)| resolved.key == member_key)
                     .and_then(|(_, resolved)| resolved.type_key)
             }
             // `operand as type_name` — the cast type is the receiver type.
             Expression::Cast { type_name, .. } => Some(type_name.key),
             // `(inner)` — grouping is transparent.
             Expression::Parenthesized(inner) => {
-                self.type_of_expression(meta, position_for_scope, inner)
+                self.type_of_expression(meta, position_for_scope, *inner)
             }
             // `callee(args)` — a call yields the callee's declared type. When
             // `callee` is a `Member`, typing it already resolves that member's
             // declared type (methods carry their return type as `type_key`).
             Expression::Call { callee, .. } => {
-                self.type_of_expression(meta, position_for_scope, callee)
+                self.type_of_expression(meta, position_for_scope, *callee)
             }
             // Array-element typing is a later refinement — never a wrong answer.
             Expression::Index { .. } => None,
@@ -2437,60 +2440,67 @@ fn span_covers(location: CodeLocation, position: u32) -> bool {
 // cursor lands on exactly one member span; nested `Member`s do not overlap on
 // their own member spans, but keeping the shortest is a robust tiebreak).
 
-type MemberOccurrence<'a> = (&'a crate::ast_impl::Expression, Identifier, CodeLocation);
+type MemberOccurrence = (crate::ast_impl::ExprId, Identifier, CodeLocation);
 
-fn find_member_occurrence_in_scope<'a>(
-    scope: &'a crate::ast_impl::Scope,
+fn find_member_occurrence_in_scope(
+    scope: &crate::ast_impl::Scope,
+    arena: &[crate::ast_impl::Expression],
     position: u32,
-    best: &mut Option<MemberOccurrence<'a>>,
+    best: &mut Option<MemberOccurrence>,
 ) {
-    find_member_occurrence_in_statements(&scope.statements, position, best);
+    find_member_occurrence_in_statements(&scope.statements, arena, position, best);
 }
 
-fn find_member_occurrence_in_statements<'a>(
-    statements: &'a [crate::ast_impl::Statement],
+fn find_member_occurrence_in_statements(
+    statements: &[crate::ast_impl::Statement],
+    arena: &[crate::ast_impl::Expression],
     position: u32,
-    best: &mut Option<MemberOccurrence<'a>>,
+    best: &mut Option<MemberOccurrence>,
 ) {
     use crate::ast_impl::Statement;
     for statement in statements {
         match statement {
             Statement::Expression(expression) => {
-                find_member_occurrence_in_expression(expression, position, best)
+                find_member_occurrence_in_expression(*expression, arena, position, best)
             }
             Statement::Assignment { target, value } => {
-                find_member_occurrence_in_expression(target, position, best);
-                find_member_occurrence_in_expression(value, position, best);
+                find_member_occurrence_in_expression(*target, arena, position, best);
+                find_member_occurrence_in_expression(*value, arena, position, best);
             }
             Statement::LocalVar(_, Some(expression)) => {
-                find_member_occurrence_in_expression(expression, position, best)
+                find_member_occurrence_in_expression(*expression, arena, position, best)
             }
             Statement::LocalVar(_, None) | Statement::Opaque(_) => {}
             Statement::With { items, body } => {
                 for item in items {
-                    find_member_occurrence_in_expression(item, position, best);
+                    find_member_occurrence_in_expression(*item, arena, position, best);
                 }
-                find_member_occurrence_in_statements(body, position, best);
+                find_member_occurrence_in_statements(body, arena, position, best);
             }
-            Statement::ChildScope(scope) => find_member_occurrence_in_scope(scope, position, best),
-            Statement::Group(inner) => find_member_occurrence_in_statements(inner, position, best),
+            Statement::ChildScope(scope) => {
+                find_member_occurrence_in_scope(scope, arena, position, best)
+            }
+            Statement::Group(inner) => {
+                find_member_occurrence_in_statements(inner, arena, position, best)
+            }
         }
     }
 }
 
-fn find_member_occurrence_in_expression<'a>(
-    expression: &'a crate::ast_impl::Expression,
+fn find_member_occurrence_in_expression(
+    expression: crate::ast_impl::ExprId,
+    arena: &[crate::ast_impl::Expression],
     position: u32,
-    best: &mut Option<MemberOccurrence<'a>>,
+    best: &mut Option<MemberOccurrence>,
 ) {
     use crate::ast_impl::Expression;
-    match expression {
+    match &arena[expression.0 as usize] {
         Expression::Member { receiver, member } => {
             // First recurse into the receiver (a nested member `A.B` under a
             // `A.B.C` still has its own coverable member spans).
-            find_member_occurrence_in_expression(receiver, position, best);
+            find_member_occurrence_in_expression(*receiver, arena, position, best);
             if span_covers(member.location, position) {
-                let candidate: MemberOccurrence<'a> = (receiver, member.key, member.location);
+                let candidate: MemberOccurrence = (*receiver, member.key, member.location);
                 let is_tighter = best
                     .as_ref()
                     .map(|(_, _, existing)| {
@@ -2503,32 +2513,32 @@ fn find_member_occurrence_in_expression<'a>(
             }
         }
         Expression::Call { callee, arguments, .. } => {
-            find_member_occurrence_in_expression(callee, position, best);
+            find_member_occurrence_in_expression(*callee, arena, position, best);
             for argument in arguments {
-                find_member_occurrence_in_expression(argument, position, best);
+                find_member_occurrence_in_expression(*argument, arena, position, best);
             }
         }
         Expression::Index { base, indices } => {
-            find_member_occurrence_in_expression(base, position, best);
+            find_member_occurrence_in_expression(*base, arena, position, best);
             for index in indices {
-                find_member_occurrence_in_expression(index, position, best);
+                find_member_occurrence_in_expression(*index, arena, position, best);
             }
         }
         Expression::Cast { operand, .. } => {
-            find_member_occurrence_in_expression(operand, position, best)
+            find_member_occurrence_in_expression(*operand, arena, position, best)
         }
         Expression::Unary { operand, .. } => {
-            find_member_occurrence_in_expression(operand, position, best)
+            find_member_occurrence_in_expression(*operand, arena, position, best)
         }
         Expression::Binary { left, right, .. } => {
-            find_member_occurrence_in_expression(left, position, best);
-            find_member_occurrence_in_expression(right, position, best);
+            find_member_occurrence_in_expression(*left, arena, position, best);
+            find_member_occurrence_in_expression(*right, arena, position, best);
         }
         Expression::Parenthesized(inner) => {
-            find_member_occurrence_in_expression(inner, position, best)
+            find_member_occurrence_in_expression(*inner, arena, position, best)
         }
         Expression::AnonymousMethod(scope) => {
-            find_member_occurrence_in_scope(scope, position, best)
+            find_member_occurrence_in_scope(scope, arena, position, best)
         }
         Expression::Identifier(_)
         | Expression::Inherited { .. }
@@ -2555,15 +2565,23 @@ fn find_member_occurrence_in_expression<'a>(
 /// TIGHTEST covering occurrence.
 fn find_inherited_occurrence_in_scope(
     scope: &crate::ast_impl::Scope,
+    arena: &[crate::ast_impl::Expression],
     position: u32,
     enclosing_method_key: Identifier,
     best: &mut Option<(Identifier, CodeLocation)>,
 ) {
-    find_inherited_occurrence_in_statements(&scope.statements, position, enclosing_method_key, best);
+    find_inherited_occurrence_in_statements(
+        &scope.statements,
+        arena,
+        position,
+        enclosing_method_key,
+        best,
+    );
 }
 
 fn find_inherited_occurrence_in_statements(
     statements: &[crate::ast_impl::Statement],
+    arena: &[crate::ast_impl::Expression],
     position: u32,
     enclosing_method_key: Identifier,
     best: &mut Option<(Identifier, CodeLocation)>,
@@ -2572,45 +2590,52 @@ fn find_inherited_occurrence_in_statements(
     for statement in statements {
         match statement {
             Statement::Expression(expression) => find_inherited_occurrence_in_expression(
-                expression, position, enclosing_method_key, best,
+                *expression, arena, position, enclosing_method_key, best,
             ),
             Statement::Assignment { target, value } => {
-                find_inherited_occurrence_in_expression(target, position, enclosing_method_key, best);
-                find_inherited_occurrence_in_expression(value, position, enclosing_method_key, best);
+                find_inherited_occurrence_in_expression(
+                    *target, arena, position, enclosing_method_key, best,
+                );
+                find_inherited_occurrence_in_expression(
+                    *value, arena, position, enclosing_method_key, best,
+                );
             }
             Statement::LocalVar(_, Some(expression)) => find_inherited_occurrence_in_expression(
-                expression, position, enclosing_method_key, best,
+                *expression, arena, position, enclosing_method_key, best,
             ),
             Statement::LocalVar(_, None) | Statement::Opaque(_) => {}
             Statement::With { items, body } => {
                 for item in items {
                     find_inherited_occurrence_in_expression(
-                        item, position, enclosing_method_key, best,
+                        *item, arena, position, enclosing_method_key, best,
                     );
                 }
-                find_inherited_occurrence_in_statements(body, position, enclosing_method_key, best);
+                find_inherited_occurrence_in_statements(
+                    body, arena, position, enclosing_method_key, best,
+                );
             }
             // A nested/anonymous scope: an `inherited` there still refers to the
             // enclosing METHOD's owner (a closure has no method of its own), so
             // the enclosing method key threads through unchanged.
-            Statement::ChildScope(scope) => {
-                find_inherited_occurrence_in_scope(scope, position, enclosing_method_key, best)
-            }
-            Statement::Group(inner) => {
-                find_inherited_occurrence_in_statements(inner, position, enclosing_method_key, best)
-            }
+            Statement::ChildScope(scope) => find_inherited_occurrence_in_scope(
+                scope, arena, position, enclosing_method_key, best,
+            ),
+            Statement::Group(inner) => find_inherited_occurrence_in_statements(
+                inner, arena, position, enclosing_method_key, best,
+            ),
         }
     }
 }
 
 fn find_inherited_occurrence_in_expression(
-    expression: &crate::ast_impl::Expression,
+    expression: crate::ast_impl::ExprId,
+    arena: &[crate::ast_impl::Expression],
     position: u32,
     enclosing_method_key: Identifier,
     best: &mut Option<(Identifier, CodeLocation)>,
 ) {
     use crate::ast_impl::Expression;
-    match expression {
+    match &arena[expression.0 as usize] {
         Expression::Inherited { method, keyword_location } => {
             // The covering occurrence is either the `method` name span
             // (`inherited Bar`) or the bare `inherited` keyword span. Prefer the
@@ -2635,38 +2660,48 @@ fn find_inherited_occurrence_in_expression(
                 *best = Some((target_key, occurrence));
             }
         }
-        Expression::Member { receiver, .. } => {
-            find_inherited_occurrence_in_expression(receiver, position, enclosing_method_key, best)
-        }
+        Expression::Member { receiver, .. } => find_inherited_occurrence_in_expression(
+            *receiver, arena, position, enclosing_method_key, best,
+        ),
         Expression::Call { callee, arguments, .. } => {
-            find_inherited_occurrence_in_expression(callee, position, enclosing_method_key, best);
+            find_inherited_occurrence_in_expression(
+                *callee, arena, position, enclosing_method_key, best,
+            );
             for argument in arguments {
                 find_inherited_occurrence_in_expression(
-                    argument, position, enclosing_method_key, best,
+                    *argument, arena, position, enclosing_method_key, best,
                 );
             }
         }
         Expression::Index { base, indices } => {
-            find_inherited_occurrence_in_expression(base, position, enclosing_method_key, best);
+            find_inherited_occurrence_in_expression(
+                *base, arena, position, enclosing_method_key, best,
+            );
             for index in indices {
-                find_inherited_occurrence_in_expression(index, position, enclosing_method_key, best);
+                find_inherited_occurrence_in_expression(
+                    *index, arena, position, enclosing_method_key, best,
+                );
             }
         }
-        Expression::Cast { operand, .. } => {
-            find_inherited_occurrence_in_expression(operand, position, enclosing_method_key, best)
-        }
-        Expression::Unary { operand, .. } => {
-            find_inherited_occurrence_in_expression(operand, position, enclosing_method_key, best)
-        }
+        Expression::Cast { operand, .. } => find_inherited_occurrence_in_expression(
+            *operand, arena, position, enclosing_method_key, best,
+        ),
+        Expression::Unary { operand, .. } => find_inherited_occurrence_in_expression(
+            *operand, arena, position, enclosing_method_key, best,
+        ),
         Expression::Binary { left, right, .. } => {
-            find_inherited_occurrence_in_expression(left, position, enclosing_method_key, best);
-            find_inherited_occurrence_in_expression(right, position, enclosing_method_key, best);
+            find_inherited_occurrence_in_expression(
+                *left, arena, position, enclosing_method_key, best,
+            );
+            find_inherited_occurrence_in_expression(
+                *right, arena, position, enclosing_method_key, best,
+            );
         }
-        Expression::Parenthesized(inner) => {
-            find_inherited_occurrence_in_expression(inner, position, enclosing_method_key, best)
-        }
+        Expression::Parenthesized(inner) => find_inherited_occurrence_in_expression(
+            *inner, arena, position, enclosing_method_key, best,
+        ),
         Expression::AnonymousMethod(scope) => {
-            find_inherited_occurrence_in_scope(scope, position, enclosing_method_key, best)
+            find_inherited_occurrence_in_scope(scope, arena, position, enclosing_method_key, best)
         }
         Expression::Identifier(_)
         | Expression::SetOrArrayLiteral(_)
