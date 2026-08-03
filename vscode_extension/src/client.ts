@@ -145,7 +145,7 @@ export class DDK_Client {
             ],
             initializationOptions: {
                 encoding: workspace.getConfiguration(PROJECTS.SETTINGS.SECTION).get<string>(PROJECTS.SETTINGS.COMPILER_ENCODING, 'oem'),
-                debugAstJsonDir: workspace.getConfiguration(PROJECTS.SETTINGS.SECTION).get<string>(PROJECTS.SETTINGS.DEBUG_AST_JSON_DIR, '')
+                debugDirectory: workspace.getConfiguration(PROJECTS.SETTINGS.SECTION).get<string>(PROJECTS.SETTINGS.PARSER_DEBUG_DIRECTORY, '')
             }
         };
         clientOptions.outputChannelName = 'DDK Server';
@@ -233,10 +233,10 @@ export class DDK_Client {
                         .get<string>(PROJECTS.SETTINGS.COMPILER_ENCODING, 'oem');
                     this.client.sendNotification('notifications/settings/encoding', { encoding });
                 }
-                if (e.affectsConfiguration(`${PROJECTS.SETTINGS.SECTION}.${PROJECTS.SETTINGS.DEBUG_AST_JSON_DIR}`)) {
-                    const debugAstJsonDir = workspace.getConfiguration(PROJECTS.SETTINGS.SECTION)
-                        .get<string>(PROJECTS.SETTINGS.DEBUG_AST_JSON_DIR, '');
-                    this.client.sendNotification('notifications/settings/debugAstJsonDir', { debugAstJsonDir });
+                if (e.affectsConfiguration(`${PROJECTS.SETTINGS.SECTION}.${PROJECTS.SETTINGS.PARSER_DEBUG_DIRECTORY}`)) {
+                    const debugDirectory = workspace.getConfiguration(PROJECTS.SETTINGS.SECTION)
+                        .get<string>(PROJECTS.SETTINGS.PARSER_DEBUG_DIRECTORY, '');
+                    this.client.sendNotification('notifications/settings/debugDirectory', { debugDirectory });
                 }
             })
         );
@@ -251,6 +251,15 @@ export class DDK_Client {
         } catch (e) {
             window.showErrorMessage(`Failed to fetch configuration from DDK Server: ${e}`);
         }
+    }
+
+    /**
+     * Request the server dump the AST of the unit at `uri` as a readable YAML
+     * file. Resolves to the written file path; rejects (the underlying
+     * `sendRequest` throws a JSON-RPC error) when the unit cannot be resolved.
+     */
+    public async dumpAstYaml(uri: string): Promise<{ path: string }> {
+        return await this.client.sendRequest('ddk/dumpAstYaml', { uri });
     }
 
     private createFormattingProvider(): Disposable[] {

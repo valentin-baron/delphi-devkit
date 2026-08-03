@@ -15,14 +15,118 @@ pub enum Source {
 
 /// A possibly dotted name (`Winapi.Windows`) as one symbol. The location
 /// spans all parts.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+///
+/// INVARIANT: `key` is ALWAYS `globals::intern_key(globals::resolve(name))` —
+/// the parser builds `name = intern(text)` and `key = intern_key(text)`, and
+/// `intern_key` folds through the deterministic [`crate::globals::fold_identifier`].
+/// So `key` is a pure function of `name`; it is NOT serialized (see the custom
+/// serde below) and is re-derived on load. This halves the identifier count on
+/// the wire for every qualified name in the persisted AST.
+#[derive(Debug, Clone, Copy)]
 pub struct QualifiedName {
     /// Display track: spelled exactly as in source.
     pub name: Identifier,
     /// Lookup track: case-folded — use for every comparison, cache key and
-    /// symbol-table access.
+    /// symbol-table access. DERIVED from `name` (never serialized).
     pub key: Identifier,
     pub location: CodeLocation,
+}
+
+/// Serialize ONLY `name` + `location`. `key` is a deterministic fold of `name`
+/// (the type invariant), so writing it would be redundant — it is re-derived on
+/// deserialize. Named-field struct form (not a tuple) so bincode's layout is
+/// stable and self-documenting.
+impl Serialize for QualifiedName {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("QualifiedName", 2)?;
+        state.serialize_field("name", &self.name)?;
+        state.serialize_field("location", &self.location)?;
+        state.end()
+    }
+}
+
+/// Deserialize `name` + `location`, then RE-DERIVE `key` from `name` by
+/// fold-interning its display string through [`crate::globals::intern_key`].
+/// Because `fold_identifier` is deterministic, this reproduces the EXACT key the
+/// parser originally interned — the invariant `key == intern_key(resolve(name))`
+/// is restored byte-for-byte.
+impl<'de> Deserialize<'de> for QualifiedName {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(field_identifier, rename_all = "lowercase")]
+        enum Field {
+            Name,
+            Location,
+        }
+
+        struct QualifiedNameVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for QualifiedNameVisitor {
+            type Value = QualifiedName;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("struct QualifiedName")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let name: Identifier = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let location: CodeLocation = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                Ok(QualifiedName::rederive(name, location))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut name: Option<Identifier> = None;
+                let mut location: Option<CodeLocation> = None;
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        Field::Name => {
+                            if name.is_some() {
+                                return Err(serde::de::Error::duplicate_field("name"));
+                            }
+                            name = Some(map.next_value()?);
+                        }
+                        Field::Location => {
+                            if location.is_some() {
+                                return Err(serde::de::Error::duplicate_field("location"));
+                            }
+                            location = Some(map.next_value()?);
+                        }
+                    }
+                }
+                let name = name.ok_or_else(|| serde::de::Error::missing_field("name"))?;
+                let location =
+                    location.ok_or_else(|| serde::de::Error::missing_field("location"))?;
+                Ok(QualifiedName::rederive(name, location))
+            }
+        }
+
+        deserializer.deserialize_struct(
+            "QualifiedName",
+            &["name", "location"],
+            QualifiedNameVisitor,
+        )
+    }
+}
+
+impl QualifiedName {
+    /// Reconstruct with `key` re-derived from `name`'s display string via the
+    /// deterministic fold-intern — the single place the load path restores the
+    /// `key == intern_key(resolve(name))` invariant.
+    fn rederive(name: Identifier, location: CodeLocation) -> Self {
+        let key = crate::globals::intern_key(crate::globals::resolve(name));
+        Self { name, key, location }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

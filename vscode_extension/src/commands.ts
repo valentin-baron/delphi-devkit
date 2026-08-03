@@ -16,8 +16,36 @@ export class GeneralCommands {
       commands.registerCommand(COMMANDS.EDIT_COMPILER_CONFIGURATIONS, this.editCompilerConfigurations.bind(this)),
       commands.registerCommand(COMMANDS.RESET_COMPILER_CONFIGURATIONS, this.resetCompilerConfigurations.bind(this)),
       commands.registerCommand(COMMANDS.EDIT_PROJECTS_DATA, this.editProjectsData.bind(this)),
-      commands.registerCommand(COMMANDS.QUICK_PICK_PROJECT, () => pickAndSelectProject())
+      commands.registerCommand(COMMANDS.QUICK_PICK_PROJECT, () => pickAndSelectProject()),
+      commands.registerCommand(COMMANDS.DUMP_AST_YAML, this.dumpAstYaml.bind(this))
     ];
+  }
+
+  // ─── AST YAML dump ─────────────────────────────────────────────────────
+
+  /**
+   * Dump the AST of the current unit as YAML and open it. Sends the active
+   * editor's document URI to the server via the `ddk/dumpAstYaml` request; on
+   * success opens the written `.ast.yaml` file, on failure shows the error.
+   */
+  private static async dumpAstYaml(): Promise<void> {
+    const editor = window.activeTextEditor;
+    if (!editor) {
+      window.showInformationMessage('Open a Delphi unit (.pas) to dump its AST.');
+      return;
+    }
+    const document = editor.document;
+    if (!document.fileName.toLowerCase().endsWith('.pas')) {
+      window.showInformationMessage('The active file is not a Delphi unit (.pas).');
+      return;
+    }
+    try {
+      const { path } = await Runtime.client.dumpAstYaml(document.uri.toString());
+      const opened = await workspace.openTextDocument(Uri.file(path));
+      await window.showTextDocument(opened);
+    } catch (error) {
+      window.showErrorMessage(`Failed to dump AST as YAML: ${error}`);
+    }
   }
 
   private static get ddkDir(): string {

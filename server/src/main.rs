@@ -101,15 +101,16 @@ struct DelphiLsp {
     /// kick. Guarded by an async mutex; the critical section is a cheap
     /// compare-and-set, never held across the pass. See [`run_bootstrap_pass`].
     bootstrapped_identity: Arc<Mutex<Option<Vec<PathBuf>>>>,
-    /// Debug-only: if `Some(directory)`, every parsed unit's AST is dumped as a
-    /// pretty-printed JSON file (`<UnitName>.json`) into that directory. `None`
-    /// (the default) disables it entirely — zero behaviour change, one branch on
-    /// the parse path. Set from `initializationOptions.debugAstJsonDir` at
-    /// `initialize` and updated live via `notifications/settings/debugAstJsonDir`.
-    /// A `std::sync::RwLock` (not the tokio one) so it can be read cheaply from
-    /// inside `spawn_blocking` without an `.await`; the write side (config change)
-    /// is rare and never held across a file write. See [`Self::dump_ast_json`].
-    debug_ast_json_dir: Arc<std::sync::RwLock<Option<std::path::PathBuf>>>,
+    /// Debug output directory (`ddk.parser.debugDirectory`): where the on-demand
+    /// `ddk/dumpAstYaml` command writes its `<UnitName>.ast.yaml` file. `None`
+    /// (the default, empty setting) means the system temp directory is used at
+    /// dump time — so a dump ALWAYS lands somewhere. There is NO automatic
+    /// dumping any more: this directory is consulted ONLY by the explicit dump
+    /// command. Set from `initializationOptions.debugDirectory` at `initialize`
+    /// and updated live via `notifications/settings/debugDirectory`. A
+    /// `std::sync::RwLock` (not the tokio one) so the dump handler can read it
+    /// without an `.await`; the write side (config change) is rare.
+    debug_directory: Arc<std::sync::RwLock<Option<std::path::PathBuf>>>,
 }
 
 /// The monotonic publish-slot decision, extracted so the out-of-order race is
@@ -127,52 +128,31 @@ fn claim_publish_slot(published: &mut HashMap<Url, i32>, uri: &Url, version: i32
     }
 }
 
-/// Serialize `meta`'s FULL AST (including the `#[serde(skip)]`
-/// `implementation_body`) to a pretty-printed JSON file `<UnitName>.json` in
-/// `directory`. Returns the path written on success. Extracted from
-/// [`DelphiLsp::dump_ast_json`] so the serialize+write is unit-testable without a
-/// live LSP `Client`.
+/// Serialize `meta` to a READABLE YAML dump and write it to
+/// `<directory>/<UnitName>.ast.yaml`, creating `directory` if needed. Returns the
+/// path written on success. Extracted so the serialize+write is unit-testable
+/// without a live LSP `Client`.
 ///
-/// The `AstJsonDump` wrapper is what re-includes the implementation body: a plain
-/// serialize of `meta` OMITS it (`#[serde(skip)]`), so the wrapper `flatten`s the
-/// meta and appends `implementation_body` as its own field for the debug dump.
-fn write_ast_json_dump(
+/// The readable projection is produced by
+/// [`delphi_parser::unit_meta::dump_ast_yaml`], which serializes a struct that
+/// BORROWS the readable fields (interface AST + implementation body + deps +
+/// usages) instead of the bincode-envelope `UnitMeta` serde — under the unit's
+/// self-file location context so own-file spans elide their path (present once,
+/// in `source_path`). Only the ACTIVE unit's meta carries a populated
+/// `implementation_body`; an indexed/imported meta would dump an empty body.
+fn write_ast_yaml_dump(
     directory: &std::path::Path,
     meta: &delphi_parser::unit_meta::UnitMeta,
 ) -> std::io::Result<std::path::PathBuf> {
-    #[derive(serde::Serialize)]
-    struct AstJsonDump<'a> {
-        #[serde(flatten)]
-        meta: &'a delphi_parser::unit_meta::UnitMeta,
-        implementation_body: &'a delphi_parser::ast_impl::ImplementationBody,
-    }
-
-    let dump = AstJsonDump {
-        meta,
-        implementation_body: &meta.implementation_body,
-    };
-    let mut value = serde_json::to_value(&dump)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    // Elide the redundant `file` on every span that belongs to the unit's OWN
-    // file — which is nearly all of them — leaving it only where it differs (an
-    // `{$I}` include). The unit's own path is still present once at the root
-    // (`source_path`), and the location's `file` is computed from the SAME
-    // transparent serde as every nested span, so the comparison is exact. This
-    // is the bulk of the dump's size (the full path repeated per span).
-    if let Ok(self_location) = serde_json::to_value(meta.ast.name.location) {
-        if let Some(self_file) = self_location.get("file").and_then(|file| file.as_str()) {
-            let self_file = self_file.to_string();
-            elide_own_file_in_locations(&mut value, &self_file);
-        }
-    }
-    let json = serde_json::to_string_pretty(&value)
+    let yaml = delphi_parser::unit_meta::dump_ast_yaml(meta)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     // File name = the unit's resolved name, sanitized to a safe filename. The
     // resolver turns the interned `Identifier` back into its source text.
     let unit_name = delphi_parser::globals::resolve(meta.name());
-    let file_name = format!("{}.json", sanitize_ast_dump_filename(unit_name));
+    let file_name = format!("{}.ast.yaml", sanitize_ast_dump_filename(unit_name));
+    std::fs::create_dir_all(directory)?;
     let file_path = directory.join(file_name);
-    std::fs::write(&file_path, json)?;
+    std::fs::write(&file_path, yaml)?;
     Ok(file_path)
 }
 
@@ -199,34 +179,6 @@ fn sanitize_ast_dump_filename(name: &str) -> String {
     }
 }
 
-/// Recursively strip the `file` field from every `CodeLocation`-shaped object
-/// (`{ "file": <path>, "span": {...} }`) whose `file` equals `self_file` — the
-/// unit's OWN source file. Nearly every span in a unit is in its own file, so
-/// repeating the full path per span is the bulk of the dump; a span with NO
-/// `file` is read as "the unit's own file", and only an `{$I}` include's span
-/// (a different path) keeps its `file`. Purely cosmetic/size — never changes the
-/// `.unit` cache format.
-fn elide_own_file_in_locations(value: &mut serde_json::Value, self_file: &str) {
-    match value {
-        serde_json::Value::Object(map) => {
-            if map.contains_key("span")
-                && map.get("file").and_then(|file| file.as_str()) == Some(self_file)
-            {
-                map.remove("file");
-            }
-            for child in map.values_mut() {
-                elide_own_file_in_locations(child, self_file);
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items.iter_mut() {
-                elide_own_file_in_locations(item, self_file);
-            }
-        }
-        _ => {}
-    }
-}
-
 /// The bootstrap gate decision (Task 22), extracted so the once-per-installation
 /// guard is unit-testable without a live session. Returns `true` (and records
 /// `identity` as the newly-claimed bootstrap identity) iff `identity` differs
@@ -242,6 +194,19 @@ fn claim_bootstrap_slot(claimed: &mut Option<Vec<PathBuf>>, identity: &[PathBuf]
         *claimed = Some(identity.to_vec());
         true
     }
+}
+
+/// Params for the on-demand `ddk/dumpAstYaml` request: the URI of the document
+/// (open editor buffer) whose AST should be dumped.
+#[derive(serde::Deserialize)]
+struct DumpAstYamlParams {
+    uri: String,
+}
+
+/// Response for `ddk/dumpAstYaml`: the path of the written `<UnitName>.ast.yaml`.
+#[derive(serde::Serialize)]
+struct DumpAstYamlResponse {
+    path: String,
 }
 
 /// The result of the blocking parse+diagnostics work in [`DelphiLsp::analyze`],
@@ -282,69 +247,36 @@ impl DelphiLsp {
             // Task 22: no bootstrap kicked yet — the first `spawn_idle_indexer`
             // one-shot fills it with the resolved installation identity.
             bootstrapped_identity: Arc::new(Mutex::new(None)),
-            // Debug AST JSON dump: off by default. Enabled only when the client
-            // sets `debugAstJsonDir` at initialize or pushes it live.
-            debug_ast_json_dir: Arc::new(std::sync::RwLock::new(None)),
+            // Debug output directory: `None` (system temp) by default. Set from
+            // `debugDirectory` at initialize or pushed live. Consulted only by the
+            // on-demand `ddk/dumpAstYaml` command — there is no automatic dumping.
+            debug_directory: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
-    /// Debug-only: dump `meta`'s full AST (INCLUDING the implementation body,
-    /// which `UnitMeta` marks `#[serde(skip)]`) as a pretty-printed JSON file into
-    /// the configured debug directory. A NO-OP when `debug_ast_json_dir` is `None`
-    /// (the default) — one lock read then an early return, so a disabled dump adds
-    /// no measurable cost to a parse.
-    ///
-    /// Entirely BEST-EFFORT: a serialization or write failure is logged and never
-    /// propagated, so a dump problem can never fail or corrupt a parse. The
-    /// directory path is snapshotted out of the `RwLock` first, so no lock is held
-    /// across the (blocking) file write.
-    ///
-    /// The wrapper below is why the implementation body appears in the JSON at all:
-    /// a plain `serde_json::to_string(meta)` would OMIT `implementation_body`
-    /// (it is `#[serde(skip)]`, WORKING-SET state never written to the durable
-    /// snapshot). `AstJsonDump` `#[serde(flatten)]`s the whole meta and then adds
-    /// `implementation_body` as its own field, re-including it for the debug dump
-    /// only — the snapshot format is untouched.
-    fn dump_ast_json(&self, meta: &delphi_parser::unit_meta::UnitMeta) {
-        // Snapshot the target directory out of the lock; drop the guard before any
-        // serialization or file IO so the write never holds the lock.
-        let directory = match self.debug_ast_json_dir.read() {
-            Ok(guard) => match guard.as_ref() {
-                Some(directory) => directory.clone(),
-                None => return, // disabled — the fast path, one branch.
-            },
-            // A poisoned lock (a panic while writing the setting) must not fail a
-            // parse — treat it as disabled.
-            Err(_) => return,
-        };
-
-        // The serialize + write is a pure function so it is unit-testable without a
-        // live LSP `Client`; `self` here only supplies logging on failure.
-        if let Err(error) = write_ast_json_dump(&directory, meta) {
-            lsp_error!(self.client, "debug AST dump failed: {}", error);
+    /// The current debug output directory: the configured `debugDirectory` when
+    /// set to a non-empty path, else the system temp directory (so a dump always
+    /// lands somewhere). Snapshotted out of the `RwLock` so no lock is held across
+    /// the (blocking) file write; a poisoned lock falls back to temp.
+    fn resolve_debug_directory(&self) -> std::path::PathBuf {
+        match self.debug_directory.read() {
+            Ok(guard) => guard.as_ref().cloned(),
+            Err(_) => None,
         }
+        .unwrap_or_else(std::env::temp_dir)
     }
 
-    /// Apply a new `debugAstJsonDir` value (from `initialize` or a live push).
-    /// An empty/whitespace string DISABLES the dump (`None`); a non-empty path
-    /// enables it and `create_dir_all`s the directory best-effort (a create
-    /// failure is logged, the path still stored so a later manual mkdir works).
-    fn set_debug_ast_json_dir(&self, raw: &str) {
+    /// Apply a new `debugDirectory` value (from `initialize` or a live push).
+    /// An empty/whitespace string clears it to `None` (dumps fall back to the
+    /// system temp directory); a non-empty path is stored as-is (the directory is
+    /// created on demand at dump time, so a not-yet-existing path is fine).
+    fn set_debug_directory(&self, raw: &str) {
         let value = if raw.trim().is_empty() {
             None
         } else {
-            let directory = std::path::PathBuf::from(raw);
-            if let Err(error) = std::fs::create_dir_all(&directory) {
-                lsp_error!(
-                    self.client,
-                    "debug AST dump: could not create directory {}: {}",
-                    directory.display(),
-                    error
-                );
-            }
-            Some(directory)
+            Some(std::path::PathBuf::from(raw))
         };
-        if let Ok(mut guard) = self.debug_ast_json_dir.write() {
+        if let Ok(mut guard) = self.debug_directory.write() {
             *guard = value;
         }
     }
@@ -499,16 +431,6 @@ impl DelphiLsp {
             }
             if matches!(outcome, indexing::UnitIndexOutcome::Indexed) {
                 indexed += 1;
-                // Debug AST dump of the just-indexed unit (no-op when disabled).
-                // Indexed units are BODYLESS — the implementation body is not
-                // retained for indexed units (see `index_unit`) — so this dump
-                // shows an EMPTY `implementation_body`. That is correct and
-                // expected; only the OPEN unit (via `analyze`) dumps a full body.
-                if let Some(stem) = indexing::unit_stem(path) {
-                    if let Some(meta) = self.session.cached_meta_for_stem(&stem).await {
-                        self.dump_ast_json(&meta);
-                    }
-                }
             }
 
             // Progress: "N/M — <unit-file>", percentage over the work list.
@@ -673,15 +595,6 @@ impl DelphiLsp {
             }
             if matches!(outcome, indexing::UnitIndexOutcome::Indexed) {
                 bootstrapped += 1;
-                // Debug AST dump of the just-bootstrapped RTL/VCL unit (no-op when
-                // disabled). Bootstrapped units are BODYLESS (see `index_unit`), so
-                // this dump shows an EMPTY `implementation_body` — correct and
-                // expected for an indexed unit.
-                if let Some(stem) = indexing::unit_stem(path) {
-                    if let Some(meta) = self.session.cached_meta_for_stem(&stem).await {
-                        self.dump_ast_json(&meta);
-                    }
-                }
             }
 
             // Progress: "N/M — <unit-file>", percentage over the work list.
@@ -972,11 +885,6 @@ impl DelphiLsp {
         // Parse the buffer and collect LSP diagnostics on a blocking thread.
         let session_handle = self.session.handle();
         let parse_path = session::document_path(&path);
-        // Clone the server handle into the blocking task so it can dump the parsed
-        // AST (debug setting; a no-op when disabled). `DelphiLsp` is `Clone` (Arc
-        // fields), so this is cheap and the dump runs on the blocking thread where
-        // the `meta` is live — no need to carry the meta back to the async layer.
-        let dump_handle = self.clone();
         let result = tokio::task::spawn_blocking(move || {
             let index = positions::LineIndex::new(text);
             let mut guard = session_handle.blocking_lock();
@@ -992,11 +900,6 @@ impl DelphiLsp {
                 Ok((_, Some(meta))) => {
                     let unit_key = meta.name();
                     let buffer_file = meta.ast.name.location.file;
-                    // Debug AST dump of the OPEN unit — this meta carries the FULL
-                    // implementation body (the editor buffer's body is retained),
-                    // so its dump includes a populated `implementation_body`.
-                    // Best-effort and gated by the setting (no-op when disabled).
-                    dump_handle.dump_ast_json(&meta);
                     let unified = project_session.diagnostics(unit_key);
                     AnalyzeOutcome::Publish {
                         diagnostics: diagnostics::to_lsp_diagnostics(
@@ -1498,19 +1401,109 @@ impl DelphiLsp {
         Ok(())
     }
 
-    /// Live update of the debug AST JSON dump directory (mirrors
-    /// `settings_encoding`). The extension pushes
-    /// `{ "debugAstJsonDir": "<path>" }` on an `onDidChangeConfiguration` for the
-    /// `ddk` section. An empty string disables the dump.
-    async fn settings_debug_ast_json_dir(
+    /// Live update of the debug output directory (mirrors `settings_encoding`).
+    /// The extension pushes `{ "debugDirectory": "<path>" }` on an
+    /// `onDidChangeConfiguration` for the `ddk.parser` section. An empty string
+    /// clears it, so a dump falls back to the system temp directory.
+    async fn settings_debug_directory(
         &self,
         params: serde_json::Value,
     ) -> tower_lsp::jsonrpc::Result<()> {
-        if let Some(dir) = params.get("debugAstJsonDir").and_then(|v| v.as_str()) {
-            self.set_debug_ast_json_dir(dir);
-            lsp_info!(self.client, "Debug AST JSON dump directory set to: {:?}", dir);
+        if let Some(dir) = params.get("debugDirectory").and_then(|v| v.as_str()) {
+            self.set_debug_directory(dir);
+            lsp_info!(self.client, "Debug output directory set to: {:?}", dir);
         }
         Ok(())
+    }
+
+    /// On-demand `ddk/dumpAstYaml` REQUEST: serialize the AST of the unit named by
+    /// `params.uri` to a READABLE YAML file and return its path. Unlike the
+    /// `notifications/settings/*` handlers this RETURNS a value.
+    ///
+    /// Resolution: the URI is treated as an OPEN editor buffer — its current text
+    /// is parsed via `parse_buffer` (retaining the implementation body), so the
+    /// resulting meta is the ACTIVE unit and its dump carries a full
+    /// `implementation_body`. If the URI is not a real file path, is not open, or
+    /// does not parse into an importable unit, a JSON-RPC error is returned so the
+    /// client can show it. Never panics.
+    ///
+    /// The parse+dump runs on a blocking thread under the session lock (same
+    /// discipline as `analyze`); the write target is `<debug_directory or
+    /// temp>/<UnitName>.ast.yaml` (the directory is created on demand).
+    async fn dump_ast_yaml(
+        &self,
+        params: DumpAstYamlParams,
+    ) -> tower_lsp::jsonrpc::Result<DumpAstYamlResponse> {
+        let uri = Url::parse(&params.uri)
+            .map_err(|error| jsonrpc::Error::invalid_params(format!("invalid uri: {error}")))?;
+        let path = session::uri_to_path(&uri).ok_or_else(|| {
+            jsonrpc::Error::invalid_params(format!("uri is not a file path: {}", params.uri))
+        })?;
+
+        // Read the open buffer's current text (the active, unsaved content).
+        let text = {
+            let store = self.documents.lock().await;
+            match store.get(&uri) {
+                Some(document) => document.text().to_string(),
+                None => {
+                    return Err(jsonrpc::Error::invalid_params(format!(
+                        "document is not open: {}",
+                        params.uri
+                    )));
+                }
+            }
+        };
+
+        // Ensure the session is open for the active project (same inputs analyze
+        // uses), so the buffer parse has the right context.
+        let inputs = session::resolve_active_project_inputs().await;
+        self.session
+            .ensure_open(
+                inputs.dproj,
+                inputs.configuration,
+                inputs.platform,
+                inputs.profile,
+                inputs.standard_source_paths,
+            )
+            .await;
+
+        let session_handle = self.session.handle();
+        let parse_path = session::document_path(&path);
+        let debug_directory = self.resolve_debug_directory();
+
+        // Parse the buffer (body retained) and write the YAML dump on a blocking
+        // thread under the session lock — the same discipline as `analyze`. The
+        // whole closure is best-effort: any failure becomes an `Err(String)` the
+        // async layer maps to a JSON-RPC error; it never panics.
+        let written = tokio::task::spawn_blocking(move || -> Result<std::path::PathBuf, String> {
+            let mut guard = session_handle.blocking_lock();
+            let project_session = guard
+                .as_mut()
+                .ok_or_else(|| "no active project session".to_string())?;
+            let (_, meta) = project_session
+                .parse_buffer(&parse_path, &text)
+                .map_err(|error| format!("parse failed: {error:?}"))?;
+            let meta = meta.ok_or_else(|| {
+                "the document is not an importable unit (program/library/package?)".to_string()
+            })?;
+            write_ast_yaml_dump(&debug_directory, &meta)
+                .map_err(|error| format!("writing the dump failed: {error}"))
+        })
+        .await
+        .map_err(|error| jsonrpc::Error {
+            code: jsonrpc::ErrorCode::InternalError,
+            message: format!("dump task failed: {error}").into(),
+            data: None,
+        })?
+        .map_err(|message| jsonrpc::Error {
+            code: jsonrpc::ErrorCode::InternalError,
+            message: message.into(),
+            data: None,
+        })?;
+
+        Ok(DumpAstYamlResponse {
+            path: written.to_string_lossy().into_owned(),
+        })
     }
 
     async fn custom_document_format(
@@ -1643,10 +1636,10 @@ impl LanguageServer for DelphiLsp {
             if let Some(enc) = opts.get("encoding").and_then(|v| v.as_str()) {
                 ddk_core::encoding::set_encoding(enc);
             }
-            // Debug AST JSON dump directory (empty string ⇒ disabled). Stored in
-            // the RwLock and the directory created best-effort by the helper.
-            if let Some(dir) = opts.get("debugAstJsonDir").and_then(|v| v.as_str()) {
-                self.set_debug_ast_json_dir(dir);
+            // Debug output directory (empty string ⇒ system temp). Consulted only
+            // by the on-demand `ddk/dumpAstYaml` command; no automatic dumping.
+            if let Some(dir) = opts.get("debugDirectory").and_then(|v| v.as_str()) {
+                self.set_debug_directory(dir);
             }
         }
         // Record whether the CLIENT advertised support for handling progress
@@ -2062,9 +2055,13 @@ async fn main() -> Result<()> {
         .custom_method("custom/document/format", DelphiLsp::custom_document_format)
         .custom_method("notifications/settings/encoding", DelphiLsp::settings_encoding)
         .custom_method(
-            "notifications/settings/debugAstJsonDir",
-            DelphiLsp::settings_debug_ast_json_dir,
+            "notifications/settings/debugDirectory",
+            DelphiLsp::settings_debug_directory,
         )
+        // A custom REQUEST (returns a value), registered exactly like the
+        // notification methods above — `custom_method` handles both; the handler's
+        // `Result<T>` return type is what makes it a request rather than a notify.
+        .custom_method("ddk/dumpAstYaml", DelphiLsp::dump_ast_yaml)
         .custom_method("dproj/metadata", DelphiLsp::dproj_metadata)
         .finish();
 
@@ -2192,16 +2189,16 @@ mod bootstrap_gate_tests {
 }
 
 #[cfg(test)]
-mod ast_json_dump_tests {
-    //! Debug AST JSON dump (`ddk.debugAstJsonDir`). `write_ast_json_dump` is the
-    //! pure serialize+write extracted from `DelphiLsp::dump_ast_json` so it is
-    //! testable without a live LSP `Client`. The test parses a real unit via the
-    //! fallback session (so the meta carries a populated implementation body),
-    //! dumps it to a temp dir, and asserts the `<Name>.json` file appears and is
-    //! valid JSON that contains the unit name AND the `implementation_body` key
-    //! (proving the `#[serde(skip)]` body is re-included by the wrapper).
+mod ast_yaml_dump_tests {
+    //! On-demand AST YAML dump. `write_ast_yaml_dump` is the pure serialize+write
+    //! behind the `ddk/dumpAstYaml` request, testable without a live LSP `Client`.
+    //! The test parses a real unit via the fallback session (so the meta carries a
+    //! populated implementation body), dumps it to a temp dir, and asserts the
+    //! `<Name>.ast.yaml` file appears and is valid YAML that contains the unit
+    //! name AND the `implementation_body` key (the readable projection from
+    //! `delphi_parser::unit_meta::dump_ast_yaml`, not the bincode envelope).
 
-    use super::{sanitize_ast_dump_filename, write_ast_json_dump};
+    use super::{sanitize_ast_dump_filename, write_ast_yaml_dump};
 
     /// A fresh unique temp directory for this test.
     fn fresh_dir(tag: &str) -> std::path::PathBuf {
@@ -2217,7 +2214,7 @@ mod ast_json_dump_tests {
     }
 
     #[test]
-    fn dumps_unit_ast_json_with_implementation_body_key() {
+    fn dumps_unit_ast_yaml_with_implementation_body_key() {
         // Parse a real unit (with an implementation-section routine, so the body
         // is non-empty) through the fallback session — reuses the session test's
         // meta source, giving a full `Arc<UnitMeta>`.
@@ -2238,39 +2235,37 @@ mod ast_json_dump_tests {
             "the parsed unit has an implementation-section routine"
         );
 
-        let dump_dir = fresh_dir("dump");
-        let written = write_ast_json_dump(&dump_dir, &meta).expect("the dump writes");
-        // The file is named `<UnitName>.json`; the parser folds identifiers to a
-        // canonical (upper) case, so match case-insensitively on the stem.
-        let file_stem = written
+        // `write_ast_yaml_dump` creates the directory on demand — pass a not-yet
+        // existing path to also cover the `create_dir_all` behaviour.
+        let dump_dir = fresh_dir("dump").join("nested");
+        let written = write_ast_yaml_dump(&dump_dir, &meta).expect("the dump writes");
+        // The file is named `<UnitName>.ast.yaml`; the parser folds identifiers to
+        // a canonical (upper) case, so match case-insensitively on the name.
+        let file_name = written
             .file_name()
             .and_then(|name| name.to_str())
             .expect("the dump has a filename");
         assert!(
-            file_stem.eq_ignore_ascii_case("DumpMe.json"),
-            "the file is named after the resolved unit name (got {file_stem})"
+            file_name.eq_ignore_ascii_case("DumpMe.ast.yaml"),
+            "the file is named after the resolved unit name (got {file_name})"
         );
-        assert!(written.exists(), "the <Name>.json file appears in the dir");
+        assert!(written.exists(), "the <Name>.ast.yaml file appears in the dir");
 
-        // The file is valid JSON containing the unit name and an
-        // `implementation_body` key (the `#[serde(skip)]` body re-included).
+        // The file is valid YAML containing the unit name and an
+        // `implementation_body` key (the readable projection).
         let contents = std::fs::read_to_string(&written).expect("read the dump");
-        let value: serde_json::Value =
-            serde_json::from_str(&contents).expect("the dump is valid JSON");
+        let value: serde_yaml::Value =
+            serde_yaml::from_str(&contents).expect("the dump is valid YAML");
+        let map = value.as_mapping().expect("the dump is a YAML mapping");
         assert!(
-            value.get("implementation_body").is_some(),
-            "the dump includes the implementation_body key (re-included despite #[serde(skip)])"
+            map.contains_key(serde_yaml::Value::from("implementation_body")),
+            "the dump includes the implementation_body key"
         );
-        // The implementation body carries the routine we wrote (non-empty),
-        // proving the body was serialized, not just present-but-empty.
         assert!(
-            !value["implementation_body"]["routines"]
-                .as_array()
-                .expect("routines is an array")
-                .is_empty(),
-            "the serialized implementation_body carries the parsed routine"
+            map.contains_key(serde_yaml::Value::from("ast")),
+            "the dump includes the ast key"
         );
-        // The unit name appears somewhere in the JSON (case-insensitively — the
+        // The unit name appears somewhere in the YAML (case-insensitively — the
         // parser folds identifiers to a canonical case).
         assert!(
             contents.to_ascii_uppercase().contains("DUMPME"),

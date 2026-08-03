@@ -21,13 +21,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::ast::{ImplRoutine, Member, TypeExpression, Unit, VariantPart};
 use crate::context::Identifier;
+use crate::meta::{FileId, LocationContextGuard};
 use crate::unit_cache::{
     Dependency, InterfaceSymbol, MemberKind, MemberSymbol, SourceStamp, SymbolKind, UnitInterface,
     Usage,
 };
 
 /// Complete cached/persisted result of parsing one unit.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct UnitMeta {
     /// The unit AST root (the whole interface structure, uses clauses, …).
     pub ast: Unit,
@@ -69,7 +70,9 @@ pub struct UnitMeta {
     /// pressure would differ across sessions). `0` for a meta built through
     /// [`Self::new`] without a source length (older callers / tests); the
     /// weigher then falls back to a structural estimate.
-    #[serde(default)]
+    ///
+    /// Persisted via the custom `UnitMeta` serde (its payload struct marks this
+    /// `#[serde(default)]` so an older meta without the field still decodes).
     pub source_len: u32,
     /// The whole implementation-section semantic AST (Stage S3): the scope tree
     /// (routines, methods, nested + anonymous scopes, `with`-blocks), typed
@@ -90,19 +93,184 @@ pub struct UnitMeta {
     /// every indexed / bootstrapped / cross-unit-imported meta carries an EMPTY
     /// body (`impl_scopes()` then yields empty — local resolution is
     /// active-unit-only, never a wrong answer).
-    #[serde(skip)]
+    ///
+    /// NEVER SERIALIZED: the custom `UnitMeta` serde omits it entirely from the
+    /// payload; a reload always reconstructs it as `default()` (empty).
     pub implementation_body: crate::ast_impl::ImplementationBody,
     /// Derived interface surface (symbols + flattened members), built lazily
-    /// from `ast` and cached. Never serialized — rebuilt on demand.
-    #[serde(skip)]
+    /// from `ast` and cached. Never serialized (omitted by the custom serde) —
+    /// rebuilt on demand.
     interface_index: OnceCell<UnitInterface>,
     /// Derived flat implementation-routine table (params + locals + body span per
     /// routine body), rebuilt lazily from [`Self::implementation_body`] and cached
     /// — the single-source-of-truth replacement for the old separately-serialized
     /// `impl_scopes` field. Never serialized (mirrors `interface_index`): the body
     /// is persisted once and this flat view is rebuilt on first access.
-    #[serde(skip)]
+    /// Never serialized (omitted by the custom serde).
     impl_scopes_cache: OnceCell<Vec<ImplRoutine>>,
+}
+
+// ─── Custom serde: unit-self-file elision (format v18) ─────────────────────
+//
+// `UnitMeta` owns the whole AST plus side tables, holding thousands of
+// `CodeLocation`s — nearly all in the unit's OWN source file. Rather than repeat
+// that path on every span, (de)serialization installs a thread-local location
+// context ([`LocationContextGuard`]) so a self-file span serializes as a span
+// ONLY (no file), and a `{$I}`-include span references a small per-unit table of
+// distinct include paths by index.
+//
+// ORDER IS LOAD-BEARING. On the wire a `UnitMeta` is:
+//   1. `self_file: FileId`   — the unit's OWN file, serialized as its path. Read
+//      FIRST on load and registered so `CURRENT_SELF_FILE` is established BEFORE
+//      any nested `CodeLocation` (which may be a bare `SelfFile(span)`) decodes.
+//   2. `payload`             — every real field (ast, stamps, deps, usages, …).
+//      Nested `CodeLocation`s in here consult the active context; self-file spans
+//      elide the file, include spans push into the serialize-side table.
+//   3. `include_table: Vec<PathBuf>` — the distinct non-self include paths the
+//      payload referenced. On SERIALIZE this is emitted LAST (it is only fully
+//      populated after the payload has serialized).
+//
+// The load side cannot decode the payload before it has the include table (an
+// `Include{index}` location needs it), yet the table is written last. Bincode is
+// a sequential format, so we cannot read field 3 before field 2. The resolution:
+// the payload is serialized into an OWNED byte buffer while the guard is active,
+// THEN we emit `[self_file, include_table, payload_bytes]` in an order the load
+// side can consume — self_file, then table, then the payload bytes (decoded with
+// the context already fully established). This keeps a single guarded region on
+// each side and makes the self file + table available before the payload decodes.
+
+/// The self file's own `FileId` (→ path) plus the payload bytes and the include
+/// table, in load order. `self_file` first so the context is set before the
+/// payload decodes; `include_table` before `payload` so include indices resolve.
+#[derive(Serialize, Deserialize)]
+struct UnitMetaEnvelope {
+    /// The unit's own source file, serialized transparently as its path.
+    self_file: FileId,
+    /// Distinct non-self `{$I}` include paths the payload references, by index.
+    include_table: Vec<PathBuf>,
+    /// The bincoded payload (all real fields), (de)serialized under the active
+    /// location context so self-file spans elide the file.
+    payload: Vec<u8>,
+}
+
+/// Owning form of every real `UnitMeta` field — used on the DESERIALIZE side.
+/// The self-file elision happens inside the nested `CodeLocation` serde; this
+/// struct just orders the fields. `#[serde(default)]` mirrors the original
+/// derive so an older meta without `source_len` still decodes.
+#[derive(Deserialize)]
+struct UnitMetaPayloadOwned {
+    ast: Unit,
+    cycle_tainted: bool,
+    recovered: bool,
+    source_path: PathBuf,
+    source_hash: u64,
+    includes: Vec<SourceStamp>,
+    dependencies: Vec<Dependency>,
+    usages: Vec<Usage>,
+    dfm: Option<SourceStamp>,
+    #[serde(default)]
+    source_len: u32,
+}
+
+/// Borrowing form of the same fields — used on the SERIALIZE side so the whole
+/// (non-`Clone`) `Unit` AST is serialized in place with no deep copy. Field
+/// order MUST match [`UnitMetaPayloadOwned`] byte-for-byte (bincode is
+/// positional, not self-describing).
+#[derive(Serialize)]
+struct UnitMetaPayloadRef<'meta> {
+    ast: &'meta Unit,
+    cycle_tainted: bool,
+    recovered: bool,
+    source_path: &'meta PathBuf,
+    source_hash: u64,
+    includes: &'meta Vec<SourceStamp>,
+    dependencies: &'meta Vec<Dependency>,
+    usages: &'meta Vec<Usage>,
+    dfm: &'meta Option<SourceStamp>,
+    source_len: u32,
+}
+
+impl Serialize for UnitMeta {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // The unit's own file = the file its name location lives in. Establish it
+        // as the self file; every self-file span then serializes span-only.
+        let self_file = self.ast.name.location.file;
+        let payload = UnitMetaPayloadRef {
+            ast: &self.ast,
+            cycle_tainted: self.cycle_tainted,
+            recovered: self.recovered,
+            source_path: &self.source_path,
+            source_hash: self.source_hash,
+            includes: &self.includes,
+            dependencies: &self.dependencies,
+            usages: &self.usages,
+            dfm: &self.dfm,
+            source_len: self.source_len,
+        };
+
+        // Guard the context for the payload serialization. The include table is
+        // collected as nested CodeLocations serialize; taken AFTER, then dropped.
+        let (payload_bytes, include_table) = {
+            let _guard = LocationContextGuard::enter(self_file);
+            let payload_bytes = bincode::serialize(&payload)
+                .map_err(|error| serde::ser::Error::custom(error.to_string()))?;
+            let include_table = LocationContextGuard::take_serialize_table();
+            (payload_bytes, include_table)
+            // _guard drops here → context reset on every exit path
+        };
+
+        let envelope = UnitMetaEnvelope {
+            self_file,
+            include_table,
+            payload: payload_bytes,
+        };
+        envelope.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for UnitMeta {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let envelope = UnitMetaEnvelope::deserialize(deserializer)?;
+
+        // Register each include path → FileId (lazy, no read). An unregisterable
+        // include path (deleted between save and load) is a clean serde error →
+        // the segment counts unreadable, never a panic (M2, #21/#25).
+        let mut include_files: Vec<FileId> = Vec::with_capacity(envelope.include_table.len());
+        for path in &envelope.include_table {
+            let file = crate::globals::arena()
+                .register(path)
+                .map_err(|error| serde::de::Error::custom(error.message))?;
+            include_files.push(file);
+        }
+
+        // Establish the self file (already registered — `self_file` deserialized
+        // through the transparent FileId path serde) and install the include
+        // table BEFORE decoding the payload, so nested self-file/include
+        // CodeLocations resolve.
+        let payload: UnitMetaPayloadOwned = {
+            let _guard = LocationContextGuard::enter(envelope.self_file);
+            LocationContextGuard::set_deserialize_table(include_files);
+            bincode::deserialize(&envelope.payload)
+                .map_err(|error| serde::de::Error::custom(error.to_string()))?
+            // _guard drops here → context reset on every exit path
+        };
+
+        Ok(UnitMeta {
+            ast: payload.ast,
+            cycle_tainted: payload.cycle_tainted,
+            recovered: payload.recovered,
+            source_path: payload.source_path,
+            source_hash: payload.source_hash,
+            includes: payload.includes,
+            dependencies: payload.dependencies,
+            usages: payload.usages,
+            dfm: payload.dfm,
+            source_len: payload.source_len,
+            implementation_body: crate::ast_impl::ImplementationBody::default(),
+            interface_index: OnceCell::new(),
+            impl_scopes_cache: OnceCell::new(),
+        })
+    }
 }
 
 impl UnitMeta {
@@ -196,6 +364,68 @@ impl UnitMeta {
     pub fn name(&self) -> Identifier {
         self.ast.name.key
     }
+}
+
+/// A READABLE serde projection of a [`UnitMeta`] for an on-demand debug dump.
+///
+/// The `UnitMeta` `Serialize` impl emits the bincode-envelope form (an opaque
+/// `payload: Vec<u8>`), which is unreadable in YAML/JSON — so this struct BORROWS
+/// the readable fields directly and derives a plain `Serialize`. Serializing it
+/// under [`crate::meta::with_self_file_context`] makes every `CodeLocation` in the
+/// unit's OWN file elide its file (span only) while an `{$I}`-include span carries
+/// its path — readable either way, with the unit's own path present exactly once
+/// (`source_path`). `QualifiedName` already omits its interned `key`.
+#[derive(Serialize)]
+struct AstYamlDump<'meta> {
+    /// The unit's own source file path — present exactly once (self-file spans
+    /// below elide it).
+    source_path: &'meta Path,
+    /// The interface AST (unit header, uses clauses, interface declarations).
+    ast: &'meta Unit,
+    /// The whole implementation-section semantic AST. Populated only for the
+    /// ACTIVE editor unit; an indexed/imported meta carries an empty body.
+    implementation_body: &'meta crate::ast_impl::ImplementationBody,
+    /// The unit's compile dependencies — useful context, kept.
+    dependencies: &'meta [Dependency],
+    /// Implementation-side identifier occurrences (find-references source).
+    /// Included for completeness; can be noisy for large units.
+    usages: &'meta [Usage],
+}
+
+/// Serialize `meta` to a READABLE YAML string for an on-demand debug dump.
+///
+/// Unlike `serde_yaml::to_string(meta)` — which would emit the bincode-envelope
+/// (an opaque `payload` byte array) because `UnitMeta`'s `Serialize` is the
+/// durable-format impl — this serializes an [`AstYamlDump`] projection that
+/// borrows the readable fields (interface AST + implementation body + deps +
+/// usages). The serialize runs under the unit's self-file location context so
+/// `CodeLocation`s self-elide: own-file spans show only their `span`, include
+/// spans show their path. The unit's own path therefore appears exactly once, in
+/// `source_path`. Any serialization error is mapped to a `String`.
+///
+/// The projection is serialized to a `serde_json::Value` FIRST, then rendered to
+/// YAML from that value. `serde_yaml` 0.9 cannot serialize a Rust enum nested
+/// directly inside another enum variant (a shape the AST uses freely, e.g. a
+/// `TypeExpression` variant wrapping another enum), whereas `serde_json` can —
+/// and the resulting `Value` is a plain map/seq/scalar tree `serde_yaml` renders
+/// without hitting that limitation. Both steps run inside the same self-file
+/// context so the elision applies to the `Value` build (where the nested
+/// `CodeLocation`s actually serialize).
+pub fn dump_ast_yaml(meta: &UnitMeta) -> Result<String, String> {
+    let dump = AstYamlDump {
+        source_path: &meta.source_path,
+        ast: &meta.ast,
+        implementation_body: &meta.implementation_body,
+        dependencies: &meta.dependencies,
+        usages: &meta.usages,
+    };
+    crate::meta::with_self_file_context(meta.ast.name.location.file, || {
+        let value = serde_json::to_value(&dump).map_err(|error| error.to_string())?;
+        serde_yaml::to_string(&value).map_err(|error| error.to_string())
+    })
+}
+
+impl UnitMeta {
 
     /// The lazily-built, AST-derived interface surface. Idempotent: the first
     /// call flattens the interface declarations into symbols + members; later
@@ -918,6 +1148,85 @@ mod tests {
         assert_eq!(restored.source_hash, meta.source_hash);
     }
 
+    /// `dump_ast_yaml` produces a READABLE YAML projection (not the bincode
+    /// envelope): it parses as YAML, contains the unit name and the `ast` /
+    /// `implementation_body` keys, and self-elides the unit's own path — the full
+    /// source path appears AT MOST ONCE (in `source_path`), proving the self-file
+    /// location context ran and every own-file span emitted a span only.
+    #[test]
+    fn dump_ast_yaml_is_readable_and_self_elides_path() {
+        let directory = std::env::temp_dir().join("delphi_parser_unit_meta_yaml");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("Dumped.pas");
+        std::fs::write(
+            &path,
+            "unit Dumped;\ninterface\nprocedure Run;\nimplementation\n\
+             procedure Run;\nvar Local: Integer;\nbegin\n  Local := 1;\nend;\nend.",
+        )
+        .unwrap();
+
+        // Parse WITH the implementation body (reuse the same path as the memory
+        // tests) so the dump carries a populated `implementation_body`.
+        let arena = crate::globals::arena();
+        let context = test_context();
+        let file = arena.load(&path).unwrap();
+        let mut outcome = parse_file_full(arena, context, file, None).unwrap();
+        let Some(Source::Unit(unit)) = outcome.source.take() else {
+            panic!("expected unit");
+        };
+        let source_hash = crate::unit_cache::hash_file(&path).unwrap();
+        let meta = UnitMeta::new(
+            unit,
+            outcome.cycle_tainted,
+            path.to_path_buf(),
+            source_hash,
+            Vec::new(),
+            outcome.dependencies,
+            outcome.usages,
+        )
+        .with_implementation_body(outcome.implementation_body);
+        assert!(
+            !meta.implementation_body.routines.is_empty(),
+            "the parsed unit has an implementation-section routine"
+        );
+
+        let yaml = dump_ast_yaml(&meta).expect("the dump serializes to YAML");
+
+        // It is valid YAML.
+        let value: serde_yaml::Value =
+            serde_yaml::from_str(&yaml).expect("the dump is valid YAML");
+        let map = value.as_mapping().expect("the dump is a YAML mapping");
+        assert!(
+            map.contains_key(serde_yaml::Value::from("ast")),
+            "the dump has an `ast` key"
+        );
+        assert!(
+            map.contains_key(serde_yaml::Value::from("implementation_body")),
+            "the dump has an `implementation_body` key"
+        );
+        assert!(
+            map.contains_key(serde_yaml::Value::from("source_path")),
+            "the dump has a `source_path` key"
+        );
+
+        // The unit name appears (identifiers fold to a canonical upper case).
+        assert!(
+            yaml.to_ascii_uppercase().contains("DUMPED"),
+            "the dump contains the unit name"
+        );
+
+        // Self-elision: the full source path is present AT MOST ONCE (only in
+        // `source_path`). Every own-file span serialized as a span-only variant,
+        // so its path is not repeated. Compare on the canonical path string the
+        // dump would emit for `source_path`.
+        let source_path_string = path.to_string_lossy();
+        let occurrences = yaml.matches(source_path_string.as_ref()).count();
+        assert!(
+            occurrences <= 1,
+            "the self path must appear at most once (in source_path), found {occurrences}"
+        );
+    }
+
     /// L6: a `$FFFFFFFFFFFFFFFF` constant (above i64::MAX) is captured as
     /// `ConstantValue::UInt` — NOT dropped to None and NOT bit-cast to a
     /// negative i64 — and survives a serde round-trip under the bumped format.
@@ -1192,5 +1501,223 @@ mod tests {
             panic!("expected field");
         };
         assert_eq!(crate::globals::resolve(attributes[0].name.name), "Weak");
+    }
+
+    // ─── v18 slimmed-format round-trip correctness ─────────────────────────
+
+    /// Change 1: `QualifiedName.key` is NOT serialized; it is re-derived from
+    /// `name`'s display string on load via the deterministic fold-intern. After a
+    /// round-trip the key must equal the ORIGINAL key for BOTH an ASCII and a
+    /// mixed-case identifier — the invariant `key == intern_key(resolve(name))`
+    /// is restored byte-for-byte.
+    #[test]
+    fn qualified_name_key_rederives_across_round_trip() {
+        use crate::ast::QualifiedName;
+        use crate::meta::{CodeLocation, Span};
+
+        // Register a real file so the location's FileId round-trips.
+        let directory = std::env::temp_dir().join("delphi_parser_qn_key");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("QnKey.pas");
+        std::fs::write(&path, "unit QnKey;").unwrap();
+        let file = crate::globals::arena().register(&path).unwrap();
+        let location = CodeLocation { file, span: Span::new(0, 5) };
+
+        for text in ["System", "MixedCaseName"] {
+            let original = QualifiedName {
+                name: crate::globals::intern(text),
+                key: crate::globals::intern_key(text),
+                location,
+            };
+            // key is the fold of name (the type invariant)
+            assert_eq!(original.key, crate::globals::intern_key(text));
+
+            // A bare QualifiedName round-trips OUTSIDE a UnitMeta context
+            // (CodeLocation falls back to the Full form).
+            let bytes = bincode::serialize(&original).unwrap();
+            let restored: QualifiedName = bincode::deserialize(&bytes).unwrap();
+
+            assert_eq!(
+                restored.key, original.key,
+                "re-derived key must equal the original for {text:?}"
+            );
+            assert_eq!(restored.name, original.name);
+            assert_eq!(
+                crate::globals::resolve(restored.key),
+                crate::globals::fold_identifier(text)
+            );
+            assert_eq!(restored.location, original.location);
+        }
+    }
+
+    /// Collect every `CodeLocation` reachable from a meta that this format's
+    /// elision touches: the unit name, each interface declaration name (and its
+    /// members' locations via the derived interface), and each usage.
+    fn collect_locations(meta: &UnitMeta) -> Vec<crate::meta::CodeLocation> {
+        let mut locations = vec![meta.ast.name.location];
+        for declaration in &meta.ast.interface_declarations {
+            locations.push(declaration.name.location);
+        }
+        for symbol in &meta.interface().symbols {
+            locations.push(symbol.location);
+            for member in &symbol.members {
+                locations.push(member.location);
+            }
+        }
+        for usage in &meta.usages {
+            locations.push(usage.location);
+        }
+        locations
+    }
+
+    /// NEVER-WRONG round-trip: a self-only unit (no includes → EMPTY include
+    /// table). Through the REAL compressed segment path (`serialize_meta` →
+    /// `decode_segment`), every `CodeLocation`'s resolved file PATH and span must
+    /// be byte-identical before/after, and every `key` must match. The self file
+    /// is elided on the wire (span-only) yet resolves back to the SAME path.
+    #[test]
+    fn self_only_unit_round_trips_every_location() {
+        let directory = std::env::temp_dir().join("delphi_parser_v18_self_only");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("SelfOnly.pas");
+        std::fs::write(
+            &path,
+            "unit SelfOnly;\ninterface\n\
+             type TThing = class\n  FValue: Integer;\n  procedure Go;\nend;\n\
+             const MaxThings = 3;\n\
+             implementation\nend.",
+        )
+        .unwrap();
+
+        let meta = parse_meta(&path);
+
+        // Snapshot each location's resolved PATH + span + the name keys BEFORE.
+        let before: Vec<(std::path::PathBuf, crate::meta::Span)> = collect_locations(&meta)
+            .into_iter()
+            .map(|location| {
+                (
+                    crate::globals::arena().path(location.file).to_path_buf(),
+                    location.span,
+                )
+            })
+            .collect();
+        let name_key_before = meta.ast.name.key;
+        let decl_keys_before: Vec<_> = meta
+            .ast
+            .interface_declarations
+            .iter()
+            .map(|declaration| declaration.name.key)
+            .collect();
+
+        // Real segment round-trip.
+        let segment = crate::unit_cache::serialize_meta(&meta).unwrap();
+        let restored = crate::unit_cache::decode_segment_for_test(&segment)
+            .expect("segment decodes under v18");
+
+        let after: Vec<(std::path::PathBuf, crate::meta::Span)> = collect_locations(&restored)
+            .into_iter()
+            .map(|location| {
+                (
+                    crate::globals::arena().path(location.file).to_path_buf(),
+                    location.span,
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            before, after,
+            "every CodeLocation's resolved PATH + span must survive the round-trip byte-identical"
+        );
+        // Every location resolves to the SELF file (the unit's own path).
+        let self_path = crate::globals::arena().path(meta.ast.name.location.file).to_path_buf();
+        assert!(
+            after.iter().all(|(resolved, _)| resolved == &self_path),
+            "a self-only unit's locations must all resolve to its own file"
+        );
+        // keys re-derived correctly
+        assert_eq!(restored.ast.name.key, name_key_before);
+        let decl_keys_after: Vec<_> = restored
+            .ast
+            .interface_declarations
+            .iter()
+            .map(|declaration| declaration.name.key)
+            .collect();
+        assert_eq!(decl_keys_after, decl_keys_before);
+    }
+
+    /// NEVER-WRONG round-trip with an INCLUDE: a unit carrying a `CodeLocation`
+    /// in a DIFFERENT file (an `{$I}` include) — the include-table path. Through
+    /// the real segment path, the self-file locations must resolve back to the
+    /// unit's own file and the include-file location back to the INCLUDE's file,
+    /// each with its span intact. A location resolving to the WRONG file after
+    /// load is exactly the wrong go-to this guards against.
+    #[test]
+    fn with_include_unit_round_trips_self_and_include_locations() {
+        use crate::meta::{CodeLocation, Span};
+
+        let directory = std::env::temp_dir().join("delphi_parser_v18_with_include");
+        std::fs::create_dir_all(&directory).unwrap();
+        let unit_path = directory.join("WithInc.pas");
+        std::fs::write(
+            &unit_path,
+            "unit WithInc;\ninterface\nconst K = 1;\nimplementation\nend.",
+        )
+        .unwrap();
+        // A REAL include file so its FileId registers on load.
+        let include_path = directory.join("Shared.inc");
+        std::fs::write(&include_path, "const Shared = 42;").unwrap();
+
+        let mut meta = parse_meta(&unit_path);
+        let self_file = meta.ast.name.location.file;
+        let include_file = crate::globals::arena().register(&include_path).unwrap();
+        assert_ne!(self_file, include_file, "distinct files for the test");
+
+        // Inject a usage whose location is in the INCLUDE file, and one in self.
+        let include_span = Span::new(6, 12);
+        let self_span = Span::new(0, 4);
+        meta.usages = vec![
+            Usage {
+                symbol: crate::globals::intern_key("SelfSym"),
+                location: CodeLocation { file: self_file, span: self_span },
+            },
+            Usage {
+                symbol: crate::globals::intern_key("IncSym"),
+                location: CodeLocation { file: include_file, span: include_span },
+            },
+        ];
+
+        let self_path = crate::globals::arena().path(self_file).to_path_buf();
+        let include_resolved = crate::globals::arena().path(include_file).to_path_buf();
+
+        let segment = crate::unit_cache::serialize_meta(&meta).unwrap();
+        let restored = crate::unit_cache::decode_segment_for_test(&segment)
+            .expect("segment decodes under v18");
+
+        // The unit name (self) still resolves to the unit's own file.
+        assert_eq!(
+            crate::globals::arena().path(restored.ast.name.location.file),
+            self_path.as_path()
+        );
+
+        // Usages: the self usage resolves to the self file; the include usage
+        // resolves to the INCLUDE file — NOT the self file (the wrong-go-to bug).
+        let restored_self = &restored.usages[0];
+        assert_eq!(
+            crate::globals::arena().path(restored_self.location.file),
+            self_path.as_path()
+        );
+        assert_eq!(restored_self.location.span, self_span);
+
+        let restored_include = &restored.usages[1];
+        assert_eq!(
+            crate::globals::arena().path(restored_include.location.file),
+            include_resolved.as_path(),
+            "an include-file location MUST resolve back to the include file, never the self file"
+        );
+        assert_eq!(restored_include.location.span, include_span);
+        assert_ne!(
+            restored_include.location.file, restored_self.location.file,
+            "self and include files must stay distinct after load"
+        );
     }
 }

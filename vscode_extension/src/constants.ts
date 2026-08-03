@@ -23,7 +23,9 @@ export namespace PROJECTS {
     export const SECTION = 'ddk';
     export const COMPILER_ENCODING = 'compiler.encoding';
     export const COMPILER_RESULT_TIMEOUT = 'compiler.resultTimeout';
-    export const DEBUG_AST_JSON_DIR = 'debugAstJsonDir';
+    // Directory for DDK debug output (e.g. on-demand AST YAML dumps). Nested
+    // under the `ddk.parser` configuration section; empty ⇒ system temp folder.
+    export const PARSER_DEBUG_DIRECTORY = 'parser.debugDirectory';
   }
   export namespace COMMAND {
     export const ADD_WORKSPACE = `${PROJECTS.CONFIG.KEY}.addWorkspace`;
@@ -144,6 +146,8 @@ export namespace COMMANDS {
   export const RESET_COMPILER_CONFIGURATIONS = 'ddk.resetCompilerConfigurations';
   export const EDIT_PROJECTS_DATA = 'ddk.editProjectsData';
   export const QUICK_PICK_PROJECT = 'ddk.quickPickProject';
+  // On-demand: dump the current unit's AST as YAML and open it.
+  export const DUMP_AST_YAML = 'ddk.dumpAstYaml';
 }
 
 export namespace FORMAT {
