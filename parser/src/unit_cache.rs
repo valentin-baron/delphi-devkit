@@ -33,7 +33,12 @@ use crate::unit_meta::UnitMeta;
 // span only (no path), and `{$I}`-include locations index a small per-unit path
 // table. The wire layout changed on both counts, so a v17 segment must be
 // rejected rather than mis-decoded.
-const CACHE_FORMAT_VERSION: u32 = 18;
+// v19: `Member::Field`/`Member::NestedConst` boxed into `FieldDeclaration` /
+// `NestedConstDeclaration` newtype variants (shrinks `Member` 104 B → 16 B in
+// RAM). The bincode bytes are unchanged (newtype-of-struct serializes the same
+// as the old struct-variant, variant order preserved); the version is bumped
+// only so no stale segment is ever read against the new node layout.
+const CACHE_FORMAT_VERSION: u32 = 19;
 /// Default RAM cap for the in-memory AST cache. Lowered from 512MiB to 256MiB
 /// for an EDITOR workload (Task 16 D): the disk-backed cache means an evicted
 /// unit reloads cheaply from its per-unit file instead of re-parsing, so a
@@ -1060,12 +1065,11 @@ mod tests {
 
     #[test]
     fn old_version_snapshot_is_cleanly_rejected() {
-        // A snapshot written by a PRIOR format version (here v17, one behind the
-        // current v18) must be refused with a clean version-mismatch error — not
-        // a panic, not a partial/garbage load. Bincode is not self-describing,
-        // so an old snapshot's unit bytes may not even match the current
-        // `UnitMeta` layout; the version guard must reject BEFORE any unit
-        // segment is decoded.
+        // A snapshot written by a PRIOR format version (one behind the current)
+        // must be refused with a clean version-mismatch error — not a panic, not
+        // a partial/garbage load. Bincode is not self-describing, so an old
+        // snapshot's unit bytes may not even match the current `UnitMeta` layout;
+        // the version guard must reject BEFORE any unit segment is decoded.
         let directory = std::env::temp_dir().join("delphi_parser_old_version");
         std::fs::create_dir_all(&directory).unwrap();
         let snapshot = directory.join("cache.bin");
@@ -1074,9 +1078,9 @@ mod tests {
         // segment of bytes that would NOT decode under the current `UnitMeta`
         // layout. The version guard must reject before any segment is touched,
         // so these bytes are never even reached.
-        assert_eq!(CACHE_FORMAT_VERSION, 18, "update this test on a format bump");
+        let previous_version = CACHE_FORMAT_VERSION - 1;
         let stale = SavedCacheDisk {
-            version: 17,
+            version: previous_version,
             units: vec![vec![0xDE, 0xAD, 0xBE, 0xEF]],
         };
         std::fs::write(&snapshot, bincode::serialize(&stale).unwrap()).unwrap();
@@ -1086,8 +1090,10 @@ mod tests {
         let error = result.expect_err("an old-version snapshot must be rejected");
         // the message names both the found and expected versions
         assert!(
-            error.message.contains("17") && error.message.contains("18"),
-            "version-mismatch message must name found (17) and expected (18): {}",
+            error.message.contains(&previous_version.to_string())
+                && error.message.contains(&CACHE_FORMAT_VERSION.to_string()),
+            "version-mismatch message must name found ({previous_version}) and \
+             expected ({CACHE_FORMAT_VERSION}): {}",
             error.message
         );
     }

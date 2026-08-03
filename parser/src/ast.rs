@@ -315,22 +315,36 @@ pub struct VisibilitySection {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Member {
-    Field {
-        names: Vec<QualifiedName>,
-        field_type: TypeExpression,
-        is_class_var: bool,
-        /// `[Foo]` attributes preceding the field group, source order.
-        attributes: Vec<Attribute>,
-    },
+    /// A field group `A, B: T;`. Boxed so the fattest variant does not pad every
+    /// other (already-boxed) member to its size — a class member is one pointer
+    /// + tag (16 B) instead of 104 B (see the `size_probe` test rationale).
+    Field(Box<FieldDeclaration>),
     Method(Box<MethodDeclaration>),
     Property(Box<PropertyDeclaration>),
     NestedType(Box<InterfaceDeclaration>),
-    NestedConst {
-        name: QualifiedName,
-        constant_value: Option<crate::unit_cache::ConstantValue>,
-        /// `[Foo]` attributes preceding the nested const, source order.
-        attributes: Vec<Attribute>,
-    },
+    /// A class/record-level `const X = V;`. Boxed for the same reason as `Field`.
+    NestedConst(Box<NestedConstDeclaration>),
+}
+
+/// A field-group declaration `A, B: T;` inside a class/record. Extracted from
+/// [`Member::Field`] so the variant can be a single pointer (see that variant).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FieldDeclaration {
+    pub names: Vec<QualifiedName>,
+    pub field_type: TypeExpression,
+    pub is_class_var: bool,
+    /// `[Foo]` attributes preceding the field group, source order.
+    pub attributes: Vec<Attribute>,
+}
+
+/// A class/record-level constant `const X = V;`. Extracted from
+/// [`Member::NestedConst`] so the variant can be a single pointer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NestedConstDeclaration {
+    pub name: QualifiedName,
+    pub constant_value: Option<crate::unit_cache::ConstantValue>,
+    /// `[Foo]` attributes preceding the nested const, source order.
+    pub attributes: Vec<Attribute>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

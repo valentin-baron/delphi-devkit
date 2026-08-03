@@ -493,23 +493,17 @@ fn record_layout(
 
     for section in &structured.sections {
         for member in &section.members {
-            let Member::Field {
-                field_type,
-                is_class_var,
-                names,
-                ..
-            } = member
-            else {
+            let Member::Field(field) = member else {
                 continue; // methods/properties/nested types are not instance data
             };
-            if *is_class_var {
+            if field.is_class_var {
                 continue; // class var = static storage, not in the instance
             }
-            let field_layout = type_layout(field_type, switches, platform, resolver)?;
+            let field_layout = type_layout(&field.field_type, switches, platform, resolver)?;
             let field_alignment = field_layout.alignment.min(alignment_ceiling).max(1);
             record_alignment = record_alignment.max(field_alignment);
             // one placement per declared name (`A, B: Integer` = two fields)
-            for _ in names {
+            for _ in &field.names {
                 offset = align_up(offset, field_alignment)?;
                 offset = offset.checked_add(field_layout.size)?;
             }

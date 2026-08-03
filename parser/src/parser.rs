@@ -6,8 +6,9 @@
 use std::sync::Arc;
 
 use crate::ast::{
-    Ancestor, Attribute, ClassType, DeclarationKind, EnumerationMember, GenericParameter, InClause,
-    InterfaceDeclaration, InterfaceType, Library, Member, MethodDeclaration, Package, Parameter,
+    Ancestor, Attribute, ClassType, DeclarationKind, EnumerationMember, FieldDeclaration,
+    GenericParameter, InClause, InterfaceDeclaration, InterfaceType, Library, Member,
+    MethodDeclaration, NestedConstDeclaration, Package, Parameter,
     ParameterModifier, Program, PropertyDeclaration, QualifiedName, RoutineKind, RoutineType,
     Source, StructuredKind, StructuredType, TypeExpression, Unit, UsedUnit, UsesDeclarations,
     VariantArm, VariantPart, Visibility, VisibilitySection,
@@ -3990,11 +3991,11 @@ impl UnitParser<'_> {
             if !finished {
                 self.skip_declaration_tail(true)?;
             }
-            members.push(Member::NestedConst {
+            members.push(Member::NestedConst(Box::new(NestedConstDeclaration {
                 name,
                 constant_value,
                 attributes: Vec::new(),
-            });
+            })));
         }
         Ok(())
     }
@@ -4053,12 +4054,12 @@ impl UnitParser<'_> {
         if self.peek_token()? == Some(Token::Semicolon) {
             self.cursor.advance()?;
         }
-        members.push(Member::Field {
+        members.push(Member::Field(Box::new(FieldDeclaration {
             names,
             field_type,
             is_class_var,
             attributes: Vec::new(),
-        });
+        })));
         Ok(())
     }
 
@@ -4924,15 +4925,11 @@ impl UnitParser<'_> {
 /// carries its attributes on the inner `InterfaceDeclaration`.
 fn set_member_attributes(member: &mut Member, attributes: Vec<Attribute>) {
     match member {
-        Member::Field {
-            attributes: slot, ..
-        } => *slot = attributes,
+        Member::Field(field) => field.attributes = attributes,
         Member::Method(method) => method.attributes = attributes,
         Member::Property(property) => property.attributes = attributes,
         Member::NestedType(declaration) => declaration.attributes = attributes,
-        Member::NestedConst {
-            attributes: slot, ..
-        } => *slot = attributes,
+        Member::NestedConst(nested) => nested.attributes = attributes,
     }
 }
 
@@ -4987,11 +4984,9 @@ fn type_member_entries(
     fn from_members(source: &[Member], out: &mut Vec<(Identifier, Option<Identifier>)>) {
         for member in source {
             match member {
-                Member::Field {
-                    names, field_type, ..
-                } => {
-                    let type_key = simple_type_key(field_type);
-                    out.extend(names.iter().map(|name| (name.key, type_key)));
+                Member::Field(field) => {
+                    let type_key = simple_type_key(&field.field_type);
+                    out.extend(field.names.iter().map(|name| (name.key, type_key)));
                 }
                 Member::Method(method) => out.push((
                     method.name.key,
@@ -5002,7 +4997,7 @@ fn type_member_entries(
                     property.property_type.as_ref().and_then(simple_type_key),
                 )),
                 Member::NestedType(declaration) => out.push((declaration.name.key, None)),
-                Member::NestedConst { name, .. } => out.push((name.key, None)),
+                Member::NestedConst(nested) => out.push((nested.name.key, None)),
             }
         }
     }
@@ -6025,10 +6020,10 @@ mod tests {
             panic!("expected class");
         };
         let members = &class_type.sections[0].members;
-        let Member::Field { attributes, .. } = &members[0] else {
+        let Member::Field(field) = &members[0] else {
             panic!("expected field");
         };
-        assert_eq!(attribute_names(attributes), ["Weak"]);
+        assert_eq!(attribute_names(&field.attributes), ["Weak"]);
 
         let Member::Method(method) = &members[1] else {
             panic!("expected method");
@@ -6416,16 +6411,16 @@ mod tests {
         assert_eq!(class_type.sections[1].visibility, Visibility::Private);
 
         let private_members = &class_type.sections[1].members;
-        let Member::Field { names, is_class_var, .. } = &private_members[0] else {
+        let Member::Field(field) = &private_members[0] else {
             panic!("field");
         };
-        assert_eq!(names.len(), 2);
-        assert!(!is_class_var);
-        let Member::Field { is_class_var, field_type, .. } = &private_members[1] else {
+        assert_eq!(field.names.len(), 2);
+        assert!(!field.is_class_var);
+        let Member::Field(field) = &private_members[1] else {
             panic!("class var field");
         };
-        assert!(is_class_var);
-        let TypeExpression::Reference { type_arguments, .. } = field_type else {
+        assert!(field.is_class_var);
+        let TypeExpression::Reference { type_arguments, .. } = &field.field_type else {
             panic!("generic reference");
         };
         assert_eq!(type_arguments.len(), 1);
@@ -6487,10 +6482,10 @@ mod tests {
         let TypeExpression::Record(record_type) = type_expression else {
             panic!("expected record");
         };
-        let Member::Field { field_type, .. } = &record_type.sections[0].members[0] else {
+        let Member::Field(field) = &record_type.sections[0].members[0] else {
             panic!("enum field");
         };
-        let TypeExpression::Enumeration(members) = field_type else {
+        let TypeExpression::Enumeration(members) = &field.field_type else {
             panic!("enumeration");
         };
         assert_eq!(members.len(), 2);
@@ -6499,10 +6494,10 @@ mod tests {
         let variant_part = record_type.variant_part.as_ref().expect("variant part");
         assert!(variant_part.selector_name.is_some());
         assert_eq!(variant_part.arms.len(), 2);
-        let Member::Field { field_type, .. } = &variant_part.arms[1].fields[0] else {
+        let Member::Field(field) = &variant_part.arms[1].fields[0] else {
             panic!("array field");
         };
-        let TypeExpression::Array { bounds, .. } = field_type else {
+        let TypeExpression::Array { bounds, .. } = &field.field_type else {
             panic!("array");
         };
         assert!(bounds.is_some());
@@ -6600,8 +6595,8 @@ mod tests {
         let members = &class_type.sections[0].members;
         let mut field_names = Vec::new();
         for member in members {
-            if let Member::Field { names, .. } = member {
-                for name in names {
+            if let Member::Field(field) = member {
+                for name in &field.names {
                     field_names.push(resolve(&context, name.name));
                 }
             }
@@ -6611,10 +6606,10 @@ mod tests {
             field_names,
             ["StdHook", "CdeclHook", "RegHook", "EventHook", "After"]
         );
-        let Member::Field { field_type, .. } = &members[3] else {
+        let Member::Field(field) = &members[3] else {
             panic!("EventHook field");
         };
-        let TypeExpression::Routine(routine) = field_type else {
+        let TypeExpression::Routine(routine) = &field.field_type else {
             panic!("procedure type");
         };
         assert!(routine.of_object);

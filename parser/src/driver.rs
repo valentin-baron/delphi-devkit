@@ -2866,8 +2866,8 @@ fn collect_members_into(
 
     for member in members {
         match member {
-            Member::Field { names, .. } => {
-                for name in names {
+            Member::Field(field) => {
+                for name in &field.names {
                     sites.insert(name.location.span, (SemanticKind::Field, declaration));
                 }
             }
@@ -2895,8 +2895,8 @@ fn collect_members_into(
                 let kind = declaration_semantic_kind(declaration_box);
                 sites.insert(declaration_box.name.location.span, (kind, declaration));
             }
-            Member::NestedConst { name, .. } => {
-                sites.insert(name.location.span, (SemanticKind::Constant, declaration));
+            Member::NestedConst(nested) => {
+                sites.insert(nested.name.location.span, (SemanticKind::Constant, declaration));
             }
         }
     }

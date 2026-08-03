@@ -420,9 +420,34 @@ pub fn dump_ast_yaml(meta: &UnitMeta) -> Result<String, String> {
         usages: &meta.usages,
     };
     crate::meta::with_self_file_context(meta.ast.name.location.file, || {
-        let value = serde_json::to_value(&dump).map_err(|error| error.to_string())?;
+        let mut value = serde_json::to_value(&dump).map_err(|error| error.to_string())?;
+        // Drop `null` fields (an absent `Option`) — a dump full of
+        // `source_file: null` / `initialization: null` is noise. `serde_json`'s
+        // `preserve_order` feature keeps declaration order (interface before
+        // implementation), so this only removes the null entries.
+        prune_null_fields(&mut value);
         serde_yaml::to_string(&value).map_err(|error| error.to_string())
     })
+}
+
+/// Recursively remove every object entry whose value is `null` (an absent
+/// `Option` field), in place. Purely cosmetic for the YAML dump — never touches
+/// the durable `.unit` form.
+fn prune_null_fields(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.retain(|_, child| !child.is_null());
+            for child in map.values_mut() {
+                prune_null_fields(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                prune_null_fields(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 impl UnitMeta {
@@ -710,7 +735,7 @@ fn shallow_member_count(type_expression: &TypeExpression) -> usize {
         source
             .iter()
             .map(|member| match member {
-                Member::Field { names, .. } => names.len(),
+                Member::Field(field) => field.names.len(),
                 _ => 1,
             })
             .sum()
@@ -815,14 +840,9 @@ fn collect_from_members(
 ) {
     for member in source {
         match member {
-            Member::Field {
-                names,
-                field_type,
-                attributes,
-                ..
-            } => {
-                let type_key = simple_type_key(field_type);
-                for name in names {
+            Member::Field(field) => {
+                let type_key = simple_type_key(&field.field_type);
+                for name in &field.names {
                     members.push(MemberSymbol {
                         name: name.name,
                         key: name.key,
@@ -834,7 +854,7 @@ fn collect_from_members(
                         directives: Vec::new(),
                         visibility,
                         strict,
-                        attributes: attribute_keys(attributes),
+                        attributes: attribute_keys(&field.attributes),
                     });
                 }
             }
@@ -877,20 +897,18 @@ fn collect_from_members(
                 strict,
                 attributes: attribute_keys(&declaration.attributes),
             }),
-            Member::NestedConst {
-                name, attributes, ..
-            } => members.push(MemberSymbol {
-                name: name.name,
-                key: name.key,
+            Member::NestedConst(nested) => members.push(MemberSymbol {
+                name: nested.name.name,
+                key: nested.name.key,
                 kind: MemberKind::NestedConst,
-                location: name.location,
+                location: nested.name.location,
                 read_target: None,
                 write_target: None,
                 type_key: None,
                 directives: Vec::new(),
                 visibility,
                 strict,
-                attributes: attribute_keys(attributes),
+                attributes: attribute_keys(&nested.attributes),
             }),
         }
     }
@@ -1497,10 +1515,10 @@ mod tests {
         let Some(TypeExpression::Class(class_type)) = declaration.type_expression.as_ref() else {
             panic!("expected class");
         };
-        let Member::Field { attributes, .. } = &class_type.sections[0].members[0] else {
+        let Member::Field(field) = &class_type.sections[0].members[0] else {
             panic!("expected field");
         };
-        assert_eq!(crate::globals::resolve(attributes[0].name.name), "Weak");
+        assert_eq!(crate::globals::resolve(field.attributes[0].name.name), "Weak");
     }
 
     // ─── v18 slimmed-format round-trip correctness ─────────────────────────

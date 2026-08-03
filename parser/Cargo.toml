@@ -20,7 +20,7 @@ moka = { version = "0.12.15", features = ["sync"] }
 notify = "8.2.0"
 once_cell = "1.20"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+serde_json = { version = "1.0.150", features = ["preserve_order"] }
 serde_yaml = "0.9"
 windows = { version = "0.62.2", features = ["Win32_Globalization"] }
 xxhash-rust = { version = "0.8.17", features = ["xxh3"] }
