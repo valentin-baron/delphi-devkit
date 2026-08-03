@@ -4,6 +4,7 @@ import { Runtime } from '../runtime';
 import { DELPHILSP } from '../constants';
 import { DelphiLspCommands } from './commands';
 import { DelphiLspAutoSync } from './autoSync';
+import { DelphiLspGitExclude } from './gitExclude';
 import { MergedDiagnostics } from './mergedDiagnostics';
 
 /**
@@ -44,7 +45,11 @@ export class DelphiLspFeature implements Feature {
     Runtime.extension.subscriptions.push(
       ...DelphiLspCommands.registers,
       // DelphiLSP may be installed (or uninstalled) after DDK has already activated.
-      extensions.onDidChange(() => this.updateAvailability())
+      extensions.onDidChange(() => this.updateAvailability()),
+      workspace.onDidChangeConfiguration((event) => {
+        if (event.affectsConfiguration(`${DELPHILSP.CONFIG.KEY}.${DELPHILSP.CONFIG.AUTO_IGNORE}`))
+          void DelphiLspGitExclude.onSettingChanged();
+      })
     );
   }
 

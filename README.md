@@ -157,9 +157,13 @@ the DDK tree, and whenever the active project changes DDK keeps DelphiLSP in
 sync automatically (`ddk.delphilsp.autoSync`, on by default): it points
 DelphiLSP's `delphiLsp.settingsFile` at the active project's
 `.delphilsp.json`, generating the file on the fly when it is missing — or
-regenerating it when it is DDK-owned and older than its `.dproj` — so code
-insight always resolves units, defines and search paths in the context of the
-project you are actually working on. Because DelphiLSP's server applies a
+regenerating it when it is DDK-owned and its `.dproj` content has changed
+since generation — so code insight always resolves units, defines and search
+paths in the context of the project you are actually working on. Because the
+generated files are machine-specific, DDK also keeps them out of version
+control by adding `*.delphilsp.json` to the owning repository's local
+`.git/info/exclude` (`ddk.delphilsp.autoIgnoreDelphiLspFiles`, on by default;
+disabling it removes exactly the entry DDK added, nothing else). Because DelphiLSP's server applies a
 settings change only to files opened afterwards (its own *Select project
 settings* command leaves already-open files with stale diagnostics until they
 are edited), DDK also re-validates every open Delphi file after the switch via

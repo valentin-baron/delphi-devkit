@@ -7,6 +7,7 @@ import { Entities } from '../projects/entities';
 import { DELPHILSP } from '../constants';
 import { Option } from '../types';
 import { basenameNoExt, fileExists } from '../utils';
+import { DelphiLspGitExclude } from './gitExclude';
 
 /**
  * Keeps DelphiLSP's active `settingsFile` pointed at DDK's active project.
@@ -180,6 +181,8 @@ export namespace DelphiLspAutoSync {
     if (!project) return;
 
     const filePath = await ensureSettingsFile(project);
-    if (filePath) await pointDelphiLspAt(filePath);
+    if (!filePath) return;
+    await DelphiLspGitExclude.ensureExcludedFor(filePath);
+    await pointDelphiLspAt(filePath);
   }
 }

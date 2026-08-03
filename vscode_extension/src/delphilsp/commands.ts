@@ -2,6 +2,7 @@ import { commands, Disposable, window } from 'vscode';
 import { Runtime } from '../runtime';
 import { DELPHILSP } from '../constants';
 import { BaseFileItem } from '../projects/trees/items/baseFile';
+import { DelphiLspGitExclude } from './gitExclude';
 
 export class DelphiLspCommands {
   public static get registers(): Disposable[] {
@@ -16,6 +17,7 @@ export class DelphiLspCommands {
 
     try {
       const result = await Runtime.client.generateDelphiLspConfig(project ? String(project.id) : undefined);
+      await DelphiLspGitExclude.ensureExcludedFor(result.file_path);
       if (result.warnings.length > 0)
         window.showWarningMessage(`DelphiLSP config for "${label}" generated with warnings:\n${result.warnings.join('\n')}`);
       window.showInformationMessage(`Wrote DelphiLSP settings for "${label}": ${result.file_path}`);
