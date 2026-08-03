@@ -23,6 +23,7 @@ export namespace PROJECTS {
     export const SECTION = 'ddk';
     export const COMPILER_ENCODING = 'compiler.encoding';
     export const COMPILER_RESULT_TIMEOUT = 'compiler.resultTimeout';
+    export const DEBUG_AST_JSON_DIR = 'debugAstJsonDir';
   }
   export namespace COMMAND {
     export const ADD_WORKSPACE = `${PROJECTS.CONFIG.KEY}.addWorkspace`;

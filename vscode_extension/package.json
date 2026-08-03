@@ -777,6 +777,11 @@
           "default": 5000,
           "minimum": 0,
           "markdownDescription": "How long (in milliseconds) the compilation result is shown in the status bar after a build finishes. Set to `0` to disable the result display entirely."
+        },
+        "ddk.debugAstJsonDir": {
+          "type": "string",
+          "default": "",
+          "description": "Debug: if set to a directory path, the language server writes a JSON dump of each parsed unit's AST there, one file per unit (<UnitName>.json). Empty disables it."
         }
       }
     },

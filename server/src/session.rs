@@ -337,6 +337,36 @@ impl SessionManager {
         joined.unwrap_or(UnitIndexOutcome::Failed)
     }
 
+    /// Fetch the cached [`UnitMeta`] for a unit by its filename STEM (e.g.
+    /// `System.SysUtils` from `System.SysUtils.pas`), interning the stem to the
+    /// unit key via the open session's context and reading the cache entry. `None`
+    /// when no session is open or nothing is cached under that key.
+    ///
+    /// Used by the background indexing / bootstrap passes to obtain the meta they
+    /// just cached so the debug AST dump can serialize it. Runs the (cheap) cache
+    /// lookup on a blocking task under the session lock — a short critical section,
+    /// never held across `.await` — so it serializes with parses like every other
+    /// session access. An indexed/bootstrapped unit is BODYLESS by design (the
+    /// implementation body is not retained for indexed units — see `index_unit`),
+    /// so the dump of such a meta shows an EMPTY `implementation_body`, which is
+    /// correct and expected.
+    pub async fn cached_meta_for_stem(
+        &self,
+        stem: &str,
+    ) -> Option<Arc<delphi_parser::unit_meta::UnitMeta>> {
+        let session_handle = self.session.clone();
+        let stem = stem.to_string();
+        tokio::task::spawn_blocking(move || {
+            let guard = session_handle.blocking_lock();
+            let project_session = guard.as_ref()?;
+            let unit_key = project_session.context().intern_key(&stem);
+            project_session.meta_for(unit_key)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// The project's OWN unit directories for the background indexer: the dproj
     /// directory plus every project `DCC_UnitSearchPath` entry, EXCLUDING the
     /// standard RTL/VCL source directories (`standard_source_paths` — Task 22's

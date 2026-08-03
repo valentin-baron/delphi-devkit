@@ -144,7 +144,8 @@ export class DDK_Client {
                 { scheme: 'file', language: 'objectpascal' }
             ],
             initializationOptions: {
-                encoding: workspace.getConfiguration(PROJECTS.SETTINGS.SECTION).get<string>(PROJECTS.SETTINGS.COMPILER_ENCODING, 'oem')
+                encoding: workspace.getConfiguration(PROJECTS.SETTINGS.SECTION).get<string>(PROJECTS.SETTINGS.COMPILER_ENCODING, 'oem'),
+                debugAstJsonDir: workspace.getConfiguration(PROJECTS.SETTINGS.SECTION).get<string>(PROJECTS.SETTINGS.DEBUG_AST_JSON_DIR, '')
             }
         };
         clientOptions.outputChannelName = 'DDK Server';
@@ -231,6 +232,11 @@ export class DDK_Client {
                     const encoding = workspace.getConfiguration(PROJECTS.SETTINGS.SECTION)
                         .get<string>(PROJECTS.SETTINGS.COMPILER_ENCODING, 'oem');
                     this.client.sendNotification('notifications/settings/encoding', { encoding });
+                }
+                if (e.affectsConfiguration(`${PROJECTS.SETTINGS.SECTION}.${PROJECTS.SETTINGS.DEBUG_AST_JSON_DIR}`)) {
+                    const debugAstJsonDir = workspace.getConfiguration(PROJECTS.SETTINGS.SECTION)
+                        .get<string>(PROJECTS.SETTINGS.DEBUG_AST_JSON_DIR, '');
+                    this.client.sendNotification('notifications/settings/debugAstJsonDir', { debugAstJsonDir });
                 }
             })
         );

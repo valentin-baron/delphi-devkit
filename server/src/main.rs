@@ -101,6 +101,15 @@ struct DelphiLsp {
     /// kick. Guarded by an async mutex; the critical section is a cheap
     /// compare-and-set, never held across the pass. See [`run_bootstrap_pass`].
     bootstrapped_identity: Arc<Mutex<Option<Vec<PathBuf>>>>,
+    /// Debug-only: if `Some(directory)`, every parsed unit's AST is dumped as a
+    /// pretty-printed JSON file (`<UnitName>.json`) into that directory. `None`
+    /// (the default) disables it entirely — zero behaviour change, one branch on
+    /// the parse path. Set from `initializationOptions.debugAstJsonDir` at
+    /// `initialize` and updated live via `notifications/settings/debugAstJsonDir`.
+    /// A `std::sync::RwLock` (not the tokio one) so it can be read cheaply from
+    /// inside `spawn_blocking` without an `.await`; the write side (config change)
+    /// is rare and never held across a file write. See [`Self::dump_ast_json`].
+    debug_ast_json_dir: Arc<std::sync::RwLock<Option<std::path::PathBuf>>>,
 }
 
 /// The monotonic publish-slot decision, extracted so the out-of-order race is
@@ -115,6 +124,64 @@ fn claim_publish_slot(published: &mut HashMap<Url, i32>, uri: &Url, version: i32
             published.insert(uri.clone(), version);
             true
         }
+    }
+}
+
+/// Serialize `meta`'s FULL AST (including the `#[serde(skip)]`
+/// `implementation_body`) to a pretty-printed JSON file `<UnitName>.json` in
+/// `directory`. Returns the path written on success. Extracted from
+/// [`DelphiLsp::dump_ast_json`] so the serialize+write is unit-testable without a
+/// live LSP `Client`.
+///
+/// The `AstJsonDump` wrapper is what re-includes the implementation body: a plain
+/// serialize of `meta` OMITS it (`#[serde(skip)]`), so the wrapper `flatten`s the
+/// meta and appends `implementation_body` as its own field for the debug dump.
+fn write_ast_json_dump(
+    directory: &std::path::Path,
+    meta: &delphi_parser::unit_meta::UnitMeta,
+) -> std::io::Result<std::path::PathBuf> {
+    #[derive(serde::Serialize)]
+    struct AstJsonDump<'a> {
+        #[serde(flatten)]
+        meta: &'a delphi_parser::unit_meta::UnitMeta,
+        implementation_body: &'a delphi_parser::ast_impl::ImplementationBody,
+    }
+
+    let dump = AstJsonDump {
+        meta,
+        implementation_body: &meta.implementation_body,
+    };
+    let json = serde_json::to_string_pretty(&dump)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    // File name = the unit's resolved name, sanitized to a safe filename. The
+    // resolver turns the interned `Identifier` back into its source text.
+    let unit_name = delphi_parser::globals::resolve(meta.name());
+    let file_name = format!("{}.json", sanitize_ast_dump_filename(unit_name));
+    let file_path = directory.join(file_name);
+    std::fs::write(&file_path, json)?;
+    Ok(file_path)
+}
+
+/// Sanitize a unit name into a safe filename stem for the debug AST dump: any
+/// character that is not alphanumeric, `.`, `-`, or `_` is replaced with `_`, so
+/// a dotted RTL unit name (`System.SysUtils`) stays readable while a name that
+/// somehow carried a path separator or other filesystem-hostile character cannot
+/// escape the target directory. An empty result falls back to `unit`.
+fn sanitize_ast_dump_filename(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "unit".to_string()
+    } else {
+        sanitized
     }
 }
 
@@ -173,6 +240,70 @@ impl DelphiLsp {
             // Task 22: no bootstrap kicked yet — the first `spawn_idle_indexer`
             // one-shot fills it with the resolved installation identity.
             bootstrapped_identity: Arc::new(Mutex::new(None)),
+            // Debug AST JSON dump: off by default. Enabled only when the client
+            // sets `debugAstJsonDir` at initialize or pushes it live.
+            debug_ast_json_dir: Arc::new(std::sync::RwLock::new(None)),
+        }
+    }
+
+    /// Debug-only: dump `meta`'s full AST (INCLUDING the implementation body,
+    /// which `UnitMeta` marks `#[serde(skip)]`) as a pretty-printed JSON file into
+    /// the configured debug directory. A NO-OP when `debug_ast_json_dir` is `None`
+    /// (the default) — one lock read then an early return, so a disabled dump adds
+    /// no measurable cost to a parse.
+    ///
+    /// Entirely BEST-EFFORT: a serialization or write failure is logged and never
+    /// propagated, so a dump problem can never fail or corrupt a parse. The
+    /// directory path is snapshotted out of the `RwLock` first, so no lock is held
+    /// across the (blocking) file write.
+    ///
+    /// The wrapper below is why the implementation body appears in the JSON at all:
+    /// a plain `serde_json::to_string(meta)` would OMIT `implementation_body`
+    /// (it is `#[serde(skip)]`, WORKING-SET state never written to the durable
+    /// snapshot). `AstJsonDump` `#[serde(flatten)]`s the whole meta and then adds
+    /// `implementation_body` as its own field, re-including it for the debug dump
+    /// only — the snapshot format is untouched.
+    fn dump_ast_json(&self, meta: &delphi_parser::unit_meta::UnitMeta) {
+        // Snapshot the target directory out of the lock; drop the guard before any
+        // serialization or file IO so the write never holds the lock.
+        let directory = match self.debug_ast_json_dir.read() {
+            Ok(guard) => match guard.as_ref() {
+                Some(directory) => directory.clone(),
+                None => return, // disabled — the fast path, one branch.
+            },
+            // A poisoned lock (a panic while writing the setting) must not fail a
+            // parse — treat it as disabled.
+            Err(_) => return,
+        };
+
+        // The serialize + write is a pure function so it is unit-testable without a
+        // live LSP `Client`; `self` here only supplies logging on failure.
+        if let Err(error) = write_ast_json_dump(&directory, meta) {
+            lsp_error!(self.client, "debug AST dump failed: {}", error);
+        }
+    }
+
+    /// Apply a new `debugAstJsonDir` value (from `initialize` or a live push).
+    /// An empty/whitespace string DISABLES the dump (`None`); a non-empty path
+    /// enables it and `create_dir_all`s the directory best-effort (a create
+    /// failure is logged, the path still stored so a later manual mkdir works).
+    fn set_debug_ast_json_dir(&self, raw: &str) {
+        let value = if raw.trim().is_empty() {
+            None
+        } else {
+            let directory = std::path::PathBuf::from(raw);
+            if let Err(error) = std::fs::create_dir_all(&directory) {
+                lsp_error!(
+                    self.client,
+                    "debug AST dump: could not create directory {}: {}",
+                    directory.display(),
+                    error
+                );
+            }
+            Some(directory)
+        };
+        if let Ok(mut guard) = self.debug_ast_json_dir.write() {
+            *guard = value;
         }
     }
 
@@ -326,6 +457,16 @@ impl DelphiLsp {
             }
             if matches!(outcome, indexing::UnitIndexOutcome::Indexed) {
                 indexed += 1;
+                // Debug AST dump of the just-indexed unit (no-op when disabled).
+                // Indexed units are BODYLESS — the implementation body is not
+                // retained for indexed units (see `index_unit`) — so this dump
+                // shows an EMPTY `implementation_body`. That is correct and
+                // expected; only the OPEN unit (via `analyze`) dumps a full body.
+                if let Some(stem) = indexing::unit_stem(path) {
+                    if let Some(meta) = self.session.cached_meta_for_stem(&stem).await {
+                        self.dump_ast_json(&meta);
+                    }
+                }
             }
 
             // Progress: "N/M — <unit-file>", percentage over the work list.
@@ -490,6 +631,15 @@ impl DelphiLsp {
             }
             if matches!(outcome, indexing::UnitIndexOutcome::Indexed) {
                 bootstrapped += 1;
+                // Debug AST dump of the just-bootstrapped RTL/VCL unit (no-op when
+                // disabled). Bootstrapped units are BODYLESS (see `index_unit`), so
+                // this dump shows an EMPTY `implementation_body` — correct and
+                // expected for an indexed unit.
+                if let Some(stem) = indexing::unit_stem(path) {
+                    if let Some(meta) = self.session.cached_meta_for_stem(&stem).await {
+                        self.dump_ast_json(&meta);
+                    }
+                }
             }
 
             // Progress: "N/M — <unit-file>", percentage over the work list.
@@ -780,6 +930,11 @@ impl DelphiLsp {
         // Parse the buffer and collect LSP diagnostics on a blocking thread.
         let session_handle = self.session.handle();
         let parse_path = session::document_path(&path);
+        // Clone the server handle into the blocking task so it can dump the parsed
+        // AST (debug setting; a no-op when disabled). `DelphiLsp` is `Clone` (Arc
+        // fields), so this is cheap and the dump runs on the blocking thread where
+        // the `meta` is live — no need to carry the meta back to the async layer.
+        let dump_handle = self.clone();
         let result = tokio::task::spawn_blocking(move || {
             let index = positions::LineIndex::new(text);
             let mut guard = session_handle.blocking_lock();
@@ -795,6 +950,11 @@ impl DelphiLsp {
                 Ok((_, Some(meta))) => {
                     let unit_key = meta.name();
                     let buffer_file = meta.ast.name.location.file;
+                    // Debug AST dump of the OPEN unit — this meta carries the FULL
+                    // implementation body (the editor buffer's body is retained),
+                    // so its dump includes a populated `implementation_body`.
+                    // Best-effort and gated by the setting (no-op when disabled).
+                    dump_handle.dump_ast_json(&meta);
                     let unified = project_session.diagnostics(unit_key);
                     AnalyzeOutcome::Publish {
                         diagnostics: diagnostics::to_lsp_diagnostics(
@@ -1296,6 +1456,21 @@ impl DelphiLsp {
         Ok(())
     }
 
+    /// Live update of the debug AST JSON dump directory (mirrors
+    /// `settings_encoding`). The extension pushes
+    /// `{ "debugAstJsonDir": "<path>" }` on an `onDidChangeConfiguration` for the
+    /// `ddk` section. An empty string disables the dump.
+    async fn settings_debug_ast_json_dir(
+        &self,
+        params: serde_json::Value,
+    ) -> tower_lsp::jsonrpc::Result<()> {
+        if let Some(dir) = params.get("debugAstJsonDir").and_then(|v| v.as_str()) {
+            self.set_debug_ast_json_dir(dir);
+            lsp_info!(self.client, "Debug AST JSON dump directory set to: {:?}", dir);
+        }
+        Ok(())
+    }
+
     async fn custom_document_format(
         &self,
         params: CustomDocumentFormat,
@@ -1425,6 +1600,11 @@ impl LanguageServer for DelphiLsp {
         if let Some(opts) = params.initialization_options {
             if let Some(enc) = opts.get("encoding").and_then(|v| v.as_str()) {
                 ddk_core::encoding::set_encoding(enc);
+            }
+            // Debug AST JSON dump directory (empty string ⇒ disabled). Stored in
+            // the RwLock and the directory created best-effort by the helper.
+            if let Some(dir) = opts.get("debugAstJsonDir").and_then(|v| v.as_str()) {
+                self.set_debug_ast_json_dir(dir);
             }
         }
         // Record whether the CLIENT advertised support for handling progress
@@ -1839,6 +2019,10 @@ async fn main() -> Result<()> {
         .custom_method("projects/compile-cancel", DelphiLsp::projects_compile_cancel)
         .custom_method("custom/document/format", DelphiLsp::custom_document_format)
         .custom_method("notifications/settings/encoding", DelphiLsp::settings_encoding)
+        .custom_method(
+            "notifications/settings/debugAstJsonDir",
+            DelphiLsp::settings_debug_ast_json_dir,
+        )
         .custom_method("dproj/metadata", DelphiLsp::dproj_metadata)
         .finish();
 
@@ -1962,6 +2146,101 @@ mod bootstrap_gate_tests {
             "a changed installation identity re-runs the bootstrap"
         );
         assert_eq!(claimed.as_ref(), Some(&install_11), "the new identity is recorded");
+    }
+}
+
+#[cfg(test)]
+mod ast_json_dump_tests {
+    //! Debug AST JSON dump (`ddk.debugAstJsonDir`). `write_ast_json_dump` is the
+    //! pure serialize+write extracted from `DelphiLsp::dump_ast_json` so it is
+    //! testable without a live LSP `Client`. The test parses a real unit via the
+    //! fallback session (so the meta carries a populated implementation body),
+    //! dumps it to a temp dir, and asserts the `<Name>.json` file appears and is
+    //! valid JSON that contains the unit name AND the `implementation_body` key
+    //! (proving the `#[serde(skip)]` body is re-included by the wrapper).
+
+    use super::{sanitize_ast_dump_filename, write_ast_json_dump};
+
+    /// A fresh unique temp directory for this test.
+    fn fresh_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir()
+            .join("ddk-server-astdump")
+            .join(format!("{tag}-{}-{nonce}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    #[test]
+    fn dumps_unit_ast_json_with_implementation_body_key() {
+        // Parse a real unit (with an implementation-section routine, so the body
+        // is non-empty) through the fallback session — reuses the session test's
+        // meta source, giving a full `Arc<UnitMeta>`.
+        let mut session = crate::session::build_fallback_session_for_test();
+        let source_dir = fresh_dir("parse");
+        let (_, meta) = session
+            .parse_buffer(
+                source_dir.join("DumpMe.pas"),
+                "unit DumpMe;\ninterface\nprocedure Run;\nimplementation\n\
+                 procedure Run;\nbegin\nend;\nend.",
+            )
+            .expect("buffer parses under the fallback context");
+        let meta = meta.expect("a unit meta is produced");
+        // The parsed OPEN unit retains its implementation body — the dump should
+        // therefore carry a populated body.
+        assert!(
+            !meta.implementation_body.routines.is_empty(),
+            "the parsed unit has an implementation-section routine"
+        );
+
+        let dump_dir = fresh_dir("dump");
+        let written = write_ast_json_dump(&dump_dir, &meta).expect("the dump writes");
+        // The file is named `<UnitName>.json`; the parser folds identifiers to a
+        // canonical (upper) case, so match case-insensitively on the stem.
+        let file_stem = written
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("the dump has a filename");
+        assert!(
+            file_stem.eq_ignore_ascii_case("DumpMe.json"),
+            "the file is named after the resolved unit name (got {file_stem})"
+        );
+        assert!(written.exists(), "the <Name>.json file appears in the dir");
+
+        // The file is valid JSON containing the unit name and an
+        // `implementation_body` key (the `#[serde(skip)]` body re-included).
+        let contents = std::fs::read_to_string(&written).expect("read the dump");
+        let value: serde_json::Value =
+            serde_json::from_str(&contents).expect("the dump is valid JSON");
+        assert!(
+            value.get("implementation_body").is_some(),
+            "the dump includes the implementation_body key (re-included despite #[serde(skip)])"
+        );
+        // The implementation body carries the routine we wrote (non-empty),
+        // proving the body was serialized, not just present-but-empty.
+        assert!(
+            !value["implementation_body"]["routines"]
+                .as_array()
+                .expect("routines is an array")
+                .is_empty(),
+            "the serialized implementation_body carries the parsed routine"
+        );
+        // The unit name appears somewhere in the JSON (case-insensitively — the
+        // parser folds identifiers to a canonical case).
+        assert!(
+            contents.to_ascii_uppercase().contains("DUMPME"),
+            "the dump contains the unit name"
+        );
+    }
+
+    #[test]
+    fn sanitizes_hostile_unit_names() {
+        assert_eq!(sanitize_ast_dump_filename("System.SysUtils"), "System.SysUtils");
+        assert_eq!(sanitize_ast_dump_filename("a/b\\c"), "a_b_c");
+        assert_eq!(sanitize_ast_dump_filename(""), "unit");
     }
 }
 
