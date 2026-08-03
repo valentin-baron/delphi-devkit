@@ -450,3 +450,52 @@ fn ambiguous_projects_display_matches_spec() {
     assert!(display.contains("- ID 123 = Workspace 1 - be (path\\to\\be.dpr)"));
     assert!(display.contains("- ID 124 = Workspace 2 - be"));
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  DelphiLspConfigResult
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn delphilsp_result() -> ddk_core::delphilsp::DelphiLspConfigResult {
+    ddk_core::delphilsp::DelphiLspConfigResult {
+        file_path: r"C:\proj\App.delphilsp.json".into(),
+        project_file: r"C:\proj\App.dproj".into(),
+        project_uri: "file:///C%3A/proj/App.dpr".into(),
+        dllname: "dcc64290.dll".into(),
+        configuration: "Debug".into(),
+        platform: "Win64".into(),
+        compiler: "Delphi 12.0 Athens".into(),
+        search_path_count: 42,
+        browsing_path_count: 7,
+        define_count: 2,
+        warnings: Vec::new(),
+    }
+}
+
+#[test]
+fn delphilsp_result_display_summarises_the_written_file() {
+    let display = format!("{}", delphilsp_result());
+    assert!(display.contains(r"Wrote C:\proj\App.delphilsp.json"), "{display}");
+    assert!(display.contains("Debug / Win64"), "{display}");
+    assert!(display.contains("Delphi 12.0 Athens (dcc64290.dll)"), "{display}");
+    assert!(display.contains("42 entries, 7 browsing paths, 2 defines"), "{display}");
+}
+
+#[test]
+fn delphilsp_result_display_lists_warnings() {
+    let mut result = delphilsp_result();
+    result.warnings.push("Dropped search-path entry with unresolved macro: $(NOPE)".into());
+    let display = format!("{result}");
+    assert!(display.contains("! Dropped search-path entry with unresolved macro: $(NOPE)"), "{display}");
+}
+
+#[test]
+fn delphilsp_result_serialises_every_field() {
+    let json = serde_json::to_value(delphilsp_result()).unwrap();
+    for key in [
+        "file_path", "project_file", "project_uri", "dllname", "configuration",
+        "platform", "compiler", "search_path_count", "browsing_path_count",
+        "define_count", "warnings",
+    ] {
+        assert!(json.get(key).is_some(), "missing {key} in {json}");
+    }
+}

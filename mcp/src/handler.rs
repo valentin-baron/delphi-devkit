@@ -237,6 +237,34 @@ pub struct FormatFileArgs {
     pub encoding: Option<String>,
 }
 
+#[macros::mcp_tool(
+    name = "delphi_generate_delphilsp_config",
+    description = "Generates the `<project>.delphilsp.json` settings file that Embarcadero's \
+        DelphiLSP VS Code extension needs for Delphi code insight (completion, go-to-definition), \
+        so it works without ever opening the RAD Studio IDE. \
+        The file is reconstructed from the project's .dproj, the compiler installation's rsvars.bat, \
+        and the IDE's global Library Path + environment-variable overrides from the registry. \
+        Target it with `project`: a numeric ID, a project name, or a path to a .dproj/.dpr/.dpk. \
+        A name matching several projects returns the candidate list instead of writing anything. \
+        Omit `project` to use the currently active project. \
+        A path that belongs to no workspace is handled ad-hoc: pick its compiler with `compiler` \
+        (an exact key like \"12.0\" or a product name like \"Delphi 12\"; default: newest installed). \
+        `out` overrides the destination, which is otherwise `<main source stem>.delphilsp.json` \
+        next to the project. Re-run it after changing the project's search paths, defines, \
+        configuration or platform."
+)]
+#[derive(Debug, Deserialize, Serialize, macros::JsonSchema)]
+pub struct GenerateDelphiLspConfigArgs {
+    /// Project to describe: a numeric ID, a project name, or a path to a
+    /// .dproj/.dpr/.dpk. Omit to use the currently active project.
+    pub project: Option<String>,
+    /// Compiler key (e.g. "12.0") or product name (e.g. "Delphi 12"), used only
+    /// for a file path that belongs to no workspace. Optional.
+    pub compiler: Option<String>,
+    /// Write the settings file here instead of next to the project's main source. Optional.
+    pub out: Option<String>,
+}
+
 rust_mcp_sdk::tool_box!(DdkTools, [
     GetDdkExtensionInfoArgs,
     GetEnvironmentInfoArgs,
@@ -251,6 +279,7 @@ rust_mcp_sdk::tool_box!(DdkTools, [
     AddProjectArgs,
     AddWorkspaceArgs,
     FormatFileArgs,
+    GenerateDelphiLspConfigArgs,
 ]);
 
 // ---------------------------------------------------------------------------
@@ -295,6 +324,7 @@ impl ServerHandler for DdkMcpHandler {
             "delphi_add_project"              => add_project(&args).await,
             "delphi_add_workspace"            => add_workspace(&args).await,
             "delphi_format_file"              => format_file(&args).await,
+            "delphi_generate_delphilsp_config" => generate_delphilsp_config(&args).await,
             _ => format!("Unknown tool: {name}"),
         };
         Ok(CallToolResult::text_content(vec![TextContent::from(result_text)]))
@@ -468,6 +498,21 @@ async fn add_workspace(args: &Value) -> String {
     };
     match commands::cmd_add_workspace(name, compiler).await {
         Ok(result) => result.to_string(),
+        Err(e) => format!("{e}"),
+    }
+}
+
+async fn generate_delphilsp_config(args: &Value) -> String {
+    let string_arg = |key: &str| args.get(key).and_then(|v| v.as_str()).map(|s| s.to_string());
+    match commands::cmd_delphilsp_config(
+        string_arg("project"),
+        string_arg("compiler"),
+        string_arg("out"),
+    )
+    .await
+    {
+        Ok(commands::DelphiLspOrAmbiguity::Output(result)) => result.to_string(),
+        Ok(commands::DelphiLspOrAmbiguity::Ambiguity(amb)) => amb.to_string(),
         Err(e) => format!("{e}"),
     }
 }

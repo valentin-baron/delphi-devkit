@@ -1,4 +1,6 @@
 pub mod compiler_state;
+pub mod macro_map;
+pub use macro_map::MacroMap;
 
 use super::*;
 use crate::files::dproj as dproj_cache;

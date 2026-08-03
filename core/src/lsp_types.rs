@@ -291,6 +291,21 @@ pub struct DprojMetadataResponse {
     pub active_platform: String,
 }
 
+/// Request params for `delphilsp/generate` – asks the server to (re)write the
+/// `.delphilsp.json` settings file consumed by Embarcadero's DelphiLSP
+/// extension. All fields are optional and mirror `cmd_delphilsp_config`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct DelphiLspGenerateParams {
+    /// Project ID, project name, or path to a `.dproj`/`.dpr`/`.dpk`.
+    /// Omit to use the currently active project.
+    pub project: Option<String>,
+    /// Compiler key or product name for a file that belongs to no workspace.
+    pub compiler: Option<String>,
+    /// Destination override; defaults to `<main source stem>.delphilsp.json`.
+    pub out: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CustomDocumentFormat {
     /// The full document text. Range formatting still needs the whole file so

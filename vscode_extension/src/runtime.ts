@@ -8,6 +8,7 @@ import { PROJECTS } from './constants';
 import { randomUUID, UUID } from 'crypto';
 import { Option } from './types';
 import { McpServerFeature } from './mcp/server';
+import { DelphiLspFeature } from './delphilsp/feature';
 
 /**
  * Runtime class to manage workspace state and global variables.
@@ -26,10 +27,15 @@ export abstract class Runtime {
   public static client: DDK_Client;
   public static compilerOutputChannel: OutputChannel;
   public static mcp: McpServerFeature;
+  public static delphilsp: DelphiLspFeature;
 
   static async initialize(context: ExtensionContext) {
     this.extension = context;
     this.compilerOutputChannel = window.createOutputChannel('DDK Compiler', 'ddk.compiler');
+    // Initialized before the client so its availability flag and hook are
+    // ready by the time the client's own initial `refresh()` runs.
+    this.delphilsp = new DelphiLspFeature();
+    await this.delphilsp.initialize();
     this.client = new DDK_Client();
     await this.client.initialize();
     this.projects = new ProjectsFeature();

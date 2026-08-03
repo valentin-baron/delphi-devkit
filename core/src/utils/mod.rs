@@ -31,10 +31,26 @@ pub fn bds_environment_overrides(bds_major_version: usize) -> Vec<(String, Strin
     let Ok(env_key) = hkcu.open_subkey(key_path) else {
         return Vec::new();
     };
+    read_environment_values(&env_key)
+}
+
+/// Decode the name/value pairs of an IDE `Environment Variables` registry key.
+/// Only string values (`REG_SZ`/`REG_EXPAND_SZ`) define a usable `$(NAME)`
+/// variable; names and values are trimmed and empty ones dropped.
+#[cfg(windows)]
+fn read_environment_values(env_key: &winreg::RegKey) -> Vec<(String, String)> {
+    use winreg::enums::{REG_EXPAND_SZ, REG_SZ};
+    use winreg::types::FromRegValue;
+
     env_key
         .enum_values()
         .flatten()
-        .map(|(name, value)| (name, value.to_string()))
+        .filter(|(_, value)| matches!(value.vtype, REG_SZ | REG_EXPAND_SZ))
+        .filter_map(|(name, value)| {
+            // Proper registry decoding — `RegValue`'s Display is debug formatting.
+            let text = String::from_reg_value(&value).ok()?.trim().to_string();
+            (!name.trim().is_empty() && !text.is_empty()).then_some((name, text))
+        })
         .collect()
 }
 
@@ -66,11 +82,7 @@ pub fn ide_environment_overrides() -> Vec<(String, String)> {
         let Ok(env_key) = bds.open_subkey(format!(r"{version}\Environment Variables")) else {
             continue;
         };
-        let overrides: Vec<(String, String)> = env_key
-            .enum_values()
-            .flatten()
-            .map(|(name, value)| (name, value.to_string()))
-            .collect();
+        let overrides = read_environment_values(&env_key);
         if !overrides.is_empty() {
             return overrides;
         }
@@ -81,6 +93,48 @@ pub fn ide_environment_overrides() -> Vec<(String, String)> {
 #[cfg(not(windows))]
 pub fn ide_environment_overrides() -> Vec<(String, String)> {
     Vec::new()
+}
+
+/// Strip trailing path separators (`c:\foo\` → `c:\foo`) without eating a
+/// drive root (`c:\` stays `c:\`).
+pub fn trim_trailing_separator(path: &str) -> &str {
+    let trimmed = path.trim_end_matches(['\\', '/']);
+    if trimmed.is_empty() || trimmed.ends_with(':') {
+        path
+    } else {
+        trimmed
+    }
+}
+
+/// Percent-encode a Windows path into the `file:///C%3A/dir/file.dpk` form the
+/// RAD Studio IDE writes: backslashes become forward slashes and everything
+/// outside the unreserved URI set is percent-encoded — including `:`, spaces,
+/// `(`, `)` and `+`, all observed encoded in IDE-generated files.
+pub fn path_to_file_uri(path: &Path) -> String {
+    const SAFE: &str = "-._~/";
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    let mut encoded = String::with_capacity(normalized.len() + 8);
+    for byte in normalized.as_bytes() {
+        let ch = *byte as char;
+        if ch.is_ascii_alphanumeric() || SAFE.contains(ch) {
+            encoded.push(ch);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    if normalized.starts_with("//") {
+        // UNC path: \\server\share\file → file://server/share/file (the
+        // server is the URI authority, so exactly two slashes after `file:`).
+        return format!("file:{encoded}");
+    }
+    format!("file:///{}", encoded.trim_start_matches('/'))
+}
+
+/// Like [`path_to_file_uri`] but for a directory: the IDE always terminates
+/// those URIs with a slash.
+pub fn dir_to_file_uri(path: &Path) -> String {
+    let uri = path_to_file_uri(path);
+    if uri.ends_with('/') { uri } else { format!("{uri}/") }
 }
 
 /// Normalise a path by:

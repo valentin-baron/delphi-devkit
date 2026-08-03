@@ -28,6 +28,7 @@ This extension is currently developed in my free time, and any feedback is welco
 * **Smart Navigation**: .dfm -> .pas jumps with Ctrl+click
 * **Compiler Output Enhancements**: Timestamps, clickable file links, and diagnostics published to the Problems panel
 * **Formatter Support**: Configurable Delphi code formatter.
+* **DelphiLSP Settings Generation**: Generate the `.delphilsp.json` file Embarcadero's DelphiLSP extension needs for code insight, without ever opening RAD Studio
 * **LSP Server**: Bundled `ddk-server` (Rust) handles all project state, compilation, and formatting
 * **MCP Server**: Bundled `ddk-mcp-server` exposes project and compiler management as MCP tools for AI assistants (VS Code Copilot, Claude Desktop, etc.)
 * **CLI** (`ddk`): Standalone command-line interface for managing projects and compilers outside of VS Code. Install via WinGet or use the bundled binary.
@@ -68,6 +69,10 @@ ddk run                                # Run the active project's executable
 ddk run <ID|NAME>                      # Run a project by ID or name (= -p; lists candidates if ambiguous)
 ddk run <PATH>                         # Run a .exe directly, or a .dproj/.dpr/.dpk's owning project
 ddk run -a "-flag \"value with spaces\""  # Override the project's saved Start Parameters for this run
+ddk delphilsp-config                   # Write the active project's .delphilsp.json (DelphiLSP code insight)
+ddk delphilsp-config <ID|NAME|PATH>    # ...for a specific project (lists candidates if ambiguous)
+ddk delphilsp-config <PATH> -c "Delphi 12"   # ...choosing the compiler for an unmanaged path
+ddk delphilsp-config <PATH> -o <FILE>  # ...writing somewhere else instead of next to the project
 ddk env                                # Show active project & compiler info
 ddk info                               # Print the DDK README
 ddk --json <command>                   # Output as JSON
@@ -120,6 +125,64 @@ package project runnable at all. `--args`/`-a` overrides the run parameters for 
 one run; the process is launched detached, so the CLI/MCP call returns
 immediately without waiting for it to exit. The same is exposed to AI
 tooling via the MCP `delphi_run_project` and `delphi_run_file` tools.
+
+`ddk delphilsp-config` writes the `<project>.delphilsp.json` settings file that
+Embarcadero's **DelphiLSP** VS Code extension reads for code insight
+(completion, go-to-definition). That file is normally produced only when the
+project is opened in the RAD Studio IDE, so code insight is dead for anyone
+working purely in VS Code. DDK reconstructs it from the project's `.dproj`
+(evaluated for the effective configuration/platform), the compiler
+installation's `bin\rsvars.bat`, and the IDE's global **Library Path**,
+**Browsing Path** and user-defined environment variables read from
+`HKCU\SOFTWARE\Embarcadero\BDS\<version>`. Search-path entries whose
+`$(MACRO)` cannot be resolved are dropped and reported as warnings. The target
+resolves like `ddk compile`: an ID, a name, or a path (ad-hoc when the path
+belongs to no workspace). Re-run it after changing the project's search paths,
+defines, configuration or platform. The same is exposed to AI tooling via the
+MCP `delphi_generate_delphilsp_config` tool, and to the VS Code extension via
+the `delphilsp/generate` LSP request.
+
+Every file DDK writes carries a top-level `"generatedBy": "delphi-devkit"` key
+next to `"settings"`. RAD Studio never writes that key, so it marks the file as
+DDK's to maintain: the VS Code extension refreshes a stale configuration only
+when the marker is present, and leaves an IDE-generated or hand-written
+`.delphilsp.json` alone. Running `ddk delphilsp-config` explicitly always
+rewrites the file regardless of the marker.
+
+In the VS Code extension the integration activates only when the DelphiLSP
+extension (`EmbarcaderoTechnologies.delphilsp`) is installed — no commands or
+menu items appear otherwise, and installing it later enables them on the fly.
+A **Generate DelphiLSP Config** context-menu action is added to projects in
+the DDK tree, and whenever the active project changes DDK keeps DelphiLSP in
+sync automatically (`ddk.delphilsp.autoSync`, on by default): it points
+DelphiLSP's `delphiLsp.settingsFile` at the active project's
+`.delphilsp.json`, generating the file on the fly when it is missing — or
+regenerating it when it is DDK-owned and its `.dproj` content has changed
+since generation — so code insight always resolves units, defines and search
+paths in the context of the project you are actually working on. Because the
+generated files are machine-specific, DDK also keeps them out of version
+control by adding `*.delphilsp.json` to the owning repository's local
+`.git/info/exclude` (`ddk.delphilsp.autoIgnoreDelphiLspFiles`, on by default;
+disabling it removes exactly the entry DDK added, nothing else). Because DelphiLSP's server applies a
+settings change only to files opened afterwards (its own *Select project
+settings* command leaves already-open files with stale diagnostics until they
+are edited), DDK also re-validates every open Delphi file after the switch via
+an invisible language-mode round-trip that re-emits `didOpen` — tabs, focus,
+cursor, dirty state and undo history are untouched
+(`ddk.delphilsp.revalidateOpenFilesOnSwitch`, on by default).
+
+With both extensions active the **Problems** view would otherwise show the same
+error twice — once from DDK's last compile and once from DelphiLSP's live
+analysis — and DDK's copy would go stale the moment the code is fixed, since it
+only refreshes on the next compile. DDK therefore merges the two: whenever
+DelphiLSP reports live diagnostics for a file, every DDK compile diagnostic
+matching one of them (same line, same `Exxxx` code) is removed, leaving only
+the live entry with its precise token range — and when DelphiLSP later clears
+that entry because the error was fixed in the editor (even without
+recompiling), no stale compile copy resurfaces. Compile diagnostics DelphiLSP
+knows nothing about (files it has not validated, link errors) keep their normal
+lifetime, and without DelphiLSP installed nothing is ever removed
+(`ddk.delphilsp.mergeDiagnostics`, on by default).
 
 Without `--args`, a project runs with the `.dproj`'s own `Debugger_RunParams`
 — the Run Parameters set via Project > Options > Run in the Delphi IDE,

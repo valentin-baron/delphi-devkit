@@ -8,6 +8,7 @@ import { UUID } from 'crypto';
 import { join } from 'path';
 import { existsSync } from 'fs';
 import { CompilerOutputDefinitionProvider } from './projects/compiler/language';
+import { MergedDiagnostics } from './delphilsp/mergedDiagnostics';
 import { PROJECTS } from './constants';
 
 /**
@@ -107,6 +108,21 @@ export interface DprojMetadata {
     active_platform: string;
 }
 
+/** Mirrors `ddk_core::delphilsp::DelphiLspConfigResult` — the outcome of `delphilsp/generate`. */
+export interface DelphiLspConfigResult {
+    file_path: string;
+    project_file: string;
+    project_uri: string;
+    dllname: string;
+    configuration: string;
+    platform: string;
+    compiler: string;
+    search_path_count: number;
+    browsing_path_count: number;
+    define_count: number;
+    warnings: string[];
+}
+
 export class DDK_Client {
     private client: LanguageClient;
     private compilerLinkProvider = new CompilerOutputDefinitionProvider();
@@ -129,6 +145,12 @@ export class DDK_Client {
         const clientOptions: LanguageClientOptions = {
             initializationOptions: {
                 encoding: workspace.getConfiguration(PROJECTS.SETTINGS.SECTION).get<string>(PROJECTS.SETTINGS.COMPILER_ENCODING, 'oem')
+            },
+            middleware: {
+                // Route the server's compile diagnostics into a collection DDK
+                // owns, so single entries can be dropped when DelphiLSP reports
+                // the same error live (see MergedDiagnostics).
+                handleDiagnostics: (uri, diagnostics) => MergedDiagnostics.publish(uri, diagnostics)
             }
         };
         // we can't set the documentSelector until we implement the actual LSP
@@ -147,6 +169,7 @@ export class DDK_Client {
                 await Runtime.projects.workspacesTreeView.refresh();
                 await Runtime.projects.groupProjectTreeView.refresh();
                 await Runtime.projects.compilerStatusBarItem.updateDisplay();
+                await Runtime.delphilsp?.onProjectsUpdated();
             }
         );
         this.client.onNotification(
@@ -197,6 +220,7 @@ export class DDK_Client {
             Runtime.projectsData = data.projects;
             Runtime.compilerConfigurations = data.compilers;
             Runtime.updateProjectContexts();
+            await Runtime.delphilsp?.onProjectsUpdated();
         } catch (e) {
             window.showErrorMessage(`Failed to fetch configuration from DDK Server: ${e}`);
         }
@@ -279,6 +303,13 @@ export class DDK_Client {
 
     public async dprojMetadata(projectId: number): Promise<DprojMetadata> {
         return await this.client.sendRequest('dproj/metadata', { project_id: projectId });
+    }
+
+    /** Thin wrapper over the `delphilsp/generate` custom method. `project` is a project id
+     *  (as a string), name, or path — omit to target the currently active project. Throws
+     *  (with a formatted candidate list as the message) when the reference is ambiguous. */
+    public async generateDelphiLspConfig(project?: string, compiler?: string, out?: string): Promise<DelphiLspConfigResult> {
+        return await this.client.sendRequest('delphilsp/generate', { project, compiler, out });
     }
 
     public onCompilerProgress(params: CompilerProgressParams) {

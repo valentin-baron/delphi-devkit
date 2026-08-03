@@ -147,6 +147,32 @@ enum Commands {
         args: Option<String>,
     },
 
+    /// Generate the `.delphilsp.json` settings file used by Embarcadero's
+    /// DelphiLSP VS Code extension (code insight), without needing RAD Studio.
+    ///
+    /// TARGET may be a project ID, a project name, or a path to a
+    /// .dproj/.dpr/.dpk. A path owned by no workspace is handled ad-hoc; pick
+    /// its compiler with --compiler.
+    #[command(name = "delphilsp-config", visible_alias = "delphilsp_config")]
+    DelphiLspConfig {
+        /// What to describe: a project ID, a project name, or a path to a
+        /// .dproj/.dpr/.dpk. Omit to use the active project.
+        target: Option<String>,
+
+        /// Compiler configuration for an ad-hoc file TARGET: an exact key
+        /// (e.g. "12.0") or product name (e.g. "Delphi 12"). Defaults to the
+        /// newest installed compiler. Only meaningful when TARGET is a file
+        /// that belongs to no workspace.
+        #[arg(long, short = 'c')]
+        compiler: Option<String>,
+
+        /// Write the settings file here instead of next to the project's main
+        /// source (useful for inspecting the output without overwriting an
+        /// IDE-generated file).
+        #[arg(long, short = 'o')]
+        out: Option<String>,
+    },
+
     /// Show environment info for the active project.
     Env,
 
@@ -413,6 +439,26 @@ async fn main() -> Result<()> {
                     }
                 }
                 RunOrAmbiguity::Ambiguity(a) => {
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&a)?);
+                    } else {
+                        print!("{a}");
+                    }
+                }
+            }
+        }
+
+        Commands::DelphiLspConfig { target, compiler, out } => {
+            use commands::DelphiLspOrAmbiguity;
+            match commands::cmd_delphilsp_config(target, compiler, out).await? {
+                DelphiLspOrAmbiguity::Output(result) => {
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&result)?);
+                    } else {
+                        println!("{result}");
+                    }
+                }
+                DelphiLspOrAmbiguity::Ambiguity(a) => {
                     if cli.json {
                         println!("{}", serde_json::to_string_pretty(&a)?);
                     } else {

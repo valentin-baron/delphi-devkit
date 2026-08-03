@@ -63,6 +63,7 @@ export namespace PROJECTS {
     export const SET_GROUP_PROJECT_CONFIGURATION = `${PROJECTS.CONFIG.KEY}.setGroupProjectConfiguration`;
     export const SET_GROUP_PROJECT_PLATFORM = `${PROJECTS.CONFIG.KEY}.setGroupProjectPlatform`;
     export const TRANSFER_GROUP_PROJECT = `${PROJECTS.CONFIG.KEY}.transferGroupProject`;
+    export const GENERATE_DELPHILSP_CONFIG = `${PROJECTS.CONFIG.KEY}.generateDelphiLspConfig`;
   }
 
   export namespace CONTEXT {
@@ -128,6 +129,35 @@ export namespace PROJECTS {
 export namespace DFM {
   export enum Commands {
     SWAP_DFM_PAS = 'ddk.dfm.swapToDfmPas'
+  }
+}
+
+export namespace DELPHILSP {
+  /** Embarcadero's DelphiLSP VS Code extension. DDK only activates this feature when it is installed. */
+  export const EXTENSION_ID = 'embarcaderotechnologies.delphilsp';
+  /** Written as the top-level `generatedBy` key of a `.delphilsp.json` DDK produced — mirrors `GENERATED_BY_MARKER` in `core/src/delphilsp/mod.rs`. */
+  export const GENERATED_BY_MARKER = 'delphi-devkit';
+
+  export namespace CONFIG {
+    export const KEY = 'ddk.delphilsp';
+    export const AUTO_SYNC = 'autoSync';
+    export const AUTO_IGNORE = 'autoIgnoreDelphiLspFiles';
+    export const REVALIDATE_ON_SWITCH = 'revalidateOpenFilesOnSwitch';
+    export const MERGE_DIAGNOSTICS = 'mergeDiagnostics';
+  }
+
+  export namespace COMMAND {
+    export const GENERATE_CONFIG = PROJECTS.COMMAND.GENERATE_DELPHILSP_CONFIG;
+  }
+
+  export namespace CONTEXT {
+    export const AVAILABLE = 'ddk:delphiLspAvailable';
+  }
+
+  /** The DelphiLSP extension's own configuration — not DDK's. */
+  export namespace EXTERNAL_SETTINGS {
+    export const SECTION = 'delphiLsp';
+    export const SETTINGS_FILE = 'settingsFile';
   }
 }
 

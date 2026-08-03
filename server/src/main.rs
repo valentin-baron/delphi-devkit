@@ -104,6 +104,34 @@ impl DelphiLsp {
         })
     }
 
+    /// Thin wrapper over `commands::cmd_delphilsp_config` so the VS Code
+    /// extension can regenerate a project's DelphiLSP settings file without
+    /// shelling out to the CLI.
+    async fn delphilsp_generate(
+        &self,
+        params: DelphiLspGenerateParams,
+    ) -> tower_lsp::jsonrpc::Result<ddk_core::delphilsp::DelphiLspConfigResult> {
+        use ddk_core::commands::{DelphiLspOrAmbiguity, cmd_delphilsp_config};
+        match cmd_delphilsp_config(params.project, params.compiler, params.out).await {
+            Ok(DelphiLspOrAmbiguity::Output(result)) => {
+                lsp_info!(self.client, "Wrote DelphiLSP settings: {}", result.file_path);
+                Ok(result)
+            }
+            Ok(DelphiLspOrAmbiguity::Ambiguity(ambiguity)) => {
+                Err(jsonrpc::Error::invalid_params(ambiguity.to_string()))
+            }
+            Err(error) => {
+                lsp_error!(self.client, "Failed to generate DelphiLSP settings: {}", error);
+                // Internal failure, not a caller mistake — report it as such.
+                Err(jsonrpc::Error {
+                    code: jsonrpc::ErrorCode::InternalError,
+                    message: format!("Failed to generate DelphiLSP settings: {error}").into(),
+                    data: None,
+                })
+            }
+        }
+    }
+
     async fn dproj_metadata(
         &self,
         params: DprojMetadataParams,
@@ -242,6 +270,7 @@ async fn main() -> Result<()> {
         .custom_method("custom/document/format", DelphiLsp::custom_document_format)
         .custom_method("notifications/settings/encoding", DelphiLsp::settings_encoding)
         .custom_method("dproj/metadata", DelphiLsp::dproj_metadata)
+        .custom_method("delphilsp/generate", DelphiLsp::delphilsp_generate)
         .finish();
 
     Server::new(stdin(), stdout(), socket).serve(service).await;
