@@ -4,6 +4,19 @@ All notable changes to the "delphi-devkit" extension will be documented in this 
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [Unreleased]
+
+### Changed
+
+- **Run happens inside VS Code**: `Run` / `Run Selected Project` (F9) no longer launches the project's run target detached with its output thrown away. `ddk.projects.runIn` picks where it goes:
+  - `terminal` (default) runs the executable in its own **DDK Run: \<project\>** terminal — as a task — with the project's usual run parameters and the executable's directory as the working directory. Since a terminal is a real console (ConPTY), everything a console gives a program keeps working: **its own colors** — including a program coloring through the Windows console API, such as DUnitX's test runner — output the view follows, and keyboard input for a program that reads `stdin`. When the program exits the terminal stays open on its finished output, until it is closed or the next run of that project reuses and clears it (each project gets its own). A plain terminal whose process *is* the executable would not do: VS Code disposes it the moment that process ends, taking a short-lived program's output with it. Being a task, a run also appears in the *Run Task* history and repeats with *Rerun Last Task*.
+  - `output` pipes `stdout`/`stderr` into a new **DDK Run** output channel instead, framed by a header with the exact command line and a footer with the exit code (or terminating signal) and elapsed time — searchable text that survives the run, with concurrent runs labelled by project name. The channel is cleared when a run starts (unless another run is still writing to it) and, for a GUI application that prints nothing, is only revealed once output appears (`ddk.projects.runRevealOutput`). No console window is created either way. Output is decoded with Windows' own default charset for non-Unicode text — the system ANSI codepage (`GetACP`, e.g. 1252, read from the registry) — which is what a program writing to a redirected handle normally produces; `ddk.projects.runOutputEncoding` switches it to `oem` (the console codepage `chcp` reports), `utf8` (what a current Delphi RTL emits while redirected), a fixed codepage (`cp437`/`cp850`/`cp852`, `ibm866`, `windows-125x`, ISO 8859) or `auto`, which takes each line as UTF-8 when it is valid UTF-8 and as the ANSI codepage otherwise.
+  - `detached` keeps the previous behavior.
+
+  Why `terminal` is the default: a program that colors its output through `SetConsoleTextAttribute` writes no color information into `stdout` at all — the color is an attribute of the console screen buffer's cells, set by a side-channel API call that simply fails once the handle is a pipe. So in `output` mode those colors cannot be recovered by any means, and since the Output panel renders no ANSI escape sequences either, escape sequences a program does emit are stripped, together with carriage-return overwrites (a self-rewriting progress line keeps only its final state, as on screen) and other control characters, instead of appearing as `←[32m` litter. `output` mode also cannot forward keystrokes (a program reading input sees end-of-file), and the process is a child of VS Code, so closing VS Code breaks its output pipe.
+
+  `ddk run` (CLI/MCP) is unchanged and still launches detached.
+
 ## [2.6.0] - 2026-08-03
 
 ### Added

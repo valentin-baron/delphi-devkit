@@ -13,6 +13,9 @@ export namespace PROJECTS {
     export const SortProjects = 'sortProjects';
     export const CONFIG_PLATFORM_DISPLAY = 'configPlatformDisplay';
     export const USE_DEBUGGER_RUN_PARAMS = 'useDebuggerRunParams';
+    export const RUN_IN = 'runIn';
+    export const RUN_OUTPUT_ENCODING = 'runOutputEncoding';
+    export const RUN_REVEAL_OUTPUT = 'runRevealOutput';
     export namespace COMPILER {
       export const NS = 'compiler';
       export const CONFIGURATIONS = `${NS}.configurations`;
@@ -64,6 +67,13 @@ export namespace PROJECTS {
     export const SET_GROUP_PROJECT_PLATFORM = `${PROJECTS.CONFIG.KEY}.setGroupProjectPlatform`;
     export const TRANSFER_GROUP_PROJECT = `${PROJECTS.CONFIG.KEY}.transferGroupProject`;
     export const GENERATE_DELPHILSP_CONFIG = `${PROJECTS.CONFIG.KEY}.generateDelphiLspConfig`;
+  }
+
+  export namespace TASK {
+    /** Task type of a project run; contributed in package.json under `taskDefinitions`. */
+    export const RUN = 'ddk.run';
+    /** Task source — VS Code titles the terminal `<source>: <task name>`. */
+    export const RUN_SOURCE = 'DDK Run';
   }
 
   export namespace CONTEXT {

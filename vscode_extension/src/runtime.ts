@@ -26,12 +26,15 @@ export abstract class Runtime {
   public static extension: ExtensionContext;
   public static client: DDK_Client;
   public static compilerOutputChannel: OutputChannel;
+  /** stdout/stderr of project executables started through Run. */
+  public static runOutputChannel: OutputChannel;
   public static mcp: McpServerFeature;
   public static delphilsp: DelphiLspFeature;
 
   static async initialize(context: ExtensionContext) {
     this.extension = context;
     this.compilerOutputChannel = window.createOutputChannel('DDK Compiler', 'ddk.compiler');
+    this.runOutputChannel = window.createOutputChannel('DDK Run');
     // Initialized before the client so its availability flag and hook are
     // ready by the time the client's own initial `refresh()` runs.
     this.delphilsp = new DelphiLspFeature();
@@ -48,7 +51,8 @@ export abstract class Runtime {
     await this.mcp.initialize();
     context.subscriptions.push(
       ...GeneralCommands.registers,
-      this.compilerOutputChannel
+      this.compilerOutputChannel,
+      this.runOutputChannel
     );
   }
 

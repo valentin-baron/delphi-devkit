@@ -7,7 +7,8 @@ import { Coroutine, DelphiProjectTreeItemType } from '../types';
 import { Entities } from './entities';
 import { BaseFileItem } from './trees/items/baseFile';
 import { ProjectItem } from './trees/items/project';
-import { assertError, basenameNoExt, launchExecutable } from '../utils';
+import { assertError, basenameNoExt } from '../utils';
+import { ProjectRunner } from './runner';
 import { WorkspaceItem } from './trees/items/workspaceItem';
 import { Change } from '../client';
 import { Option } from '../types';
@@ -74,12 +75,7 @@ export namespace ProjectsCommands {
           window.showWarningMessage('Selected project has no associated executable or Host Application to run.');
           return;
         }
-        try {
-          launchExecutable(target, resolveEffectiveStartParameters(project));
-          window.showInformationMessage(`Running: ${target}`);
-        } catch (error) {
-          window.showErrorMessage(`Failed to launch executable: ${error}`);
-        }
+        ProjectRunner.run(target, resolveEffectiveStartParameters(project), project.name);
       });
     }
   }
@@ -132,17 +128,13 @@ export namespace ProjectsCommands {
     }
 
     private static async runExecutable(item: BaseFileItem): Promise<void> {
-      const target = resolveRunTarget(item.project.entity);
+      const entity = item.project.entity;
+      const target = resolveRunTarget(entity);
       if (!target) {
         window.showWarningMessage(`No executable or Host Application found for: ${item.label}`);
         return;
       }
-      try {
-        launchExecutable(target, resolveEffectiveStartParameters(item.project.entity));
-        window.showInformationMessage(`Running: ${target}`);
-      } catch (error) {
-        window.showErrorMessage(`Failed to launch executable: ${error}`);
-      }
+      ProjectRunner.run(target, resolveEffectiveStartParameters(entity), entity.name);
     }
 
     private static async setStartParameters(item: BaseFileItem): Promise<void> {

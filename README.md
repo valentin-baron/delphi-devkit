@@ -195,6 +195,62 @@ disable it to always use only the saved Start Parameters, ignoring the
 dproj's Run Parameters entirely. The CLI/MCP always fuse `Debugger_RunParams`
 in, since there is no extension setting for them to consult.
 
+In VS Code, a project started with `Run` / `Run Selected Project` (F9) runs
+inside the editor instead of in a console window that closes on exit.
+`ddk.projects.runIn` picks where:
+
+* `terminal` (default) runs the executable in its own **DDK Run: \<project\>**
+  terminal — as a task — with the project's run parameters and the executable's
+  directory as the working directory. A terminal is a real console (ConPTY), so
+  everything a console gives a program keeps working: its own colors, output
+  that the view follows, and keyboard input for a program that reads `stdin`.
+  When the program exits, the terminal **stays open** on its finished output
+  until you close it or the next run of that project reuses and clears it (each
+  project gets its own terminal). Being a task, the run also shows up under
+  *Terminal > Run Task* history and can be repeated with *Rerun Last Task*.
+* `output` pipes `stdout` and `stderr` into the **DDK Run** output channel
+  instead, framed by a header with the exact command line and a footer with the
+  exit code and elapsed time — searchable text that survives the run. The
+  channel is cleared when a run starts (unless another run is still writing to
+  it) and, for a GUI application that prints nothing, is only revealed once
+  output actually appears (`ddk.projects.runRevealOutput`).
+* `detached` is the old behavior: launched detached, output discarded.
+
+`ddk run` on the CLI is unaffected — it always launches detached.
+
+What a pipe cannot carry, and why `terminal` is the default: a program coloring
+its output through the Windows console API (`SetConsoleTextAttribute` — what
+DUnitX's test runner uses) writes **no** color information into `stdout` at all.
+The color is an attribute of the console screen buffer's cells, set by a
+side-channel API call; with the handle redirected to a pipe that call simply
+fails, so nothing about it reaches DDK, and no reader could recover it. Only a
+real console produces those colors — which is exactly what ConPTY gives the
+process, and it re-encodes them into escape sequences the terminal renders.
+In `output` mode the text is therefore plain: the Output panel renders no ANSI
+escape sequences either, so any that a program does emit are stripped, along
+with carriage-return overwrites (a self-rewriting progress line keeps only its
+final state) and other control characters, rather than showing up as `←[32m`
+litter. Keyboard input is impossible there as well (a program reading `stdin`
+sees end-of-file), the process is a child of VS Code — closing VS Code breaks
+its output pipe — and VS Code's own "smart scroll" stops the panel from
+following new output once the cursor sits off the last line
+(`output.smartScroll.enabled: false`, or **View: Toggle Locked Scrolling**,
+releases it).
+
+Output in `output` mode is decoded with Windows' own default charset for
+non-Unicode text — the system ANSI codepage (`GetACP`, e.g. 1252) — which is
+what a program writing to a redirected handle normally produces;
+`ddk.projects.runOutputEncoding` switches it to `oem` (the console codepage such
+as CP850), `utf8` (what a current Delphi RTL writes while redirected), a fixed
+codepage, or `auto`, which takes each line as UTF-8 when it is valid UTF-8 and
+as the ANSI codepage otherwise. A terminal decodes its own output, so the
+setting does not apply there.
+
+Because the output channel cannot forward keystrokes, a captured program's
+`stdin` is not connected: one that reads input sees end-of-file instead of
+hanging invisibly. Run such a program from a terminal, or disable
+`ddk.projects.runInOutputChannel`.
+
 ## Demos
 
 ### Add a Workspace and drag in a Project
@@ -261,6 +317,9 @@ in, since there is no extension setting for them to consult.
 
 * `ddk.compiler.encoding`: Character encoding used to decode MSBuild output (`oem` by default, use `utf8` if your paths contain non-ASCII characters).
 * `ddk.projects.useDebuggerRunParams`: When running a project, fuse the `.dproj`'s own `Debugger_RunParams` with the saved Start Parameters, dproj first (`true` by default). Disable to always use only the saved Start Parameters.
+* `ddk.projects.runIn`: Where a run sends its output: `terminal` (default, a real console — the program's own colors, following output and keyboard input all work), `output` (piped into the **DDK Run** output channel: searchable text, no colors, no input) or `detached` (output discarded, as before).
+* `ddk.projects.runOutputEncoding`: Encoding used to decode a running project's output in `output` mode (`ansi` by default: Windows' system ANSI codepage, e.g. 1252). Further choices: `auto` (per line UTF-8, falling back to ANSI), `utf8`, `oem` (console codepage), `cp437`/`cp850`/`cp852`, `ibm866`, `windows-1250`/`windows-1252` and the ISO 8859 variants.
+* `ddk.projects.runRevealOutput`: When to reveal the **DDK Run** channel in `output` mode: `onOutput` (default, as soon as the program prints something), `always` or `never`.
 
 ## Compiler Configurations
 

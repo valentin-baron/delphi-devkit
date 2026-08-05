@@ -773,6 +773,71 @@
           "default": true,
           "markdownDescription": "When running a project, fuse the `.dproj`'s own `Debugger_RunParams` (Project > Options > Run in the Delphi IDE) with the saved `Set Start Parameters` value — dproj first, saved value appended after. Disable to always use only the saved Start Parameters, ignoring the dproj's Run Parameters entirely."
         },
+        "ddk.projects.runIn": {
+          "type": "string",
+          "default": "terminal",
+          "enum": [
+            "terminal",
+            "output",
+            "detached"
+          ],
+          "enumDescriptions": [
+            "A dedicated 'DDK Run: <project>' terminal — a real console, so the program's own colors, its full output and keyboard input all work",
+            "The DDK Run output channel — captured through a pipe: searchable text, but no colors and no keyboard input",
+            "Detached, with its output discarded (the behavior before output was captured at all)"
+          ],
+          "markdownDescription": "Where `Run` / `Run Selected Project` sends a project's output.\n\n- `terminal` (default): the executable runs in its own **DDK Run: \\<project\\>** terminal, as a task. Because a terminal is a real console (ConPTY), a program coloring its output through the Windows console API — DUnitX's test runner, for example — keeps its colors, the view follows new output, and a program that reads input can be typed into. The terminal stays open on the finished output when the program exits, until you close it or the next run of that project reuses (and clears) it.\n- `output`: `stdout`/`stderr` are piped into the **DDK Run** output channel. The text is searchable and survives the run, but Windows console colors do not exist in a pipe and the Output panel renders no ANSI, so the output is plain text; keyboard input is impossible, and the process is a child of VS Code, so closing VS Code breaks its output pipe. `#ddk.projects.runOutputEncoding#` and `#ddk.projects.runRevealOutput#` apply to this mode.\n- `detached`: launched fully detached with its output discarded."
+        },
+        "ddk.projects.runOutputEncoding": {
+          "type": "string",
+          "default": "ansi",
+          "enum": [
+            "ansi",
+            "auto",
+            "utf8",
+            "oem",
+            "cp437",
+            "cp850",
+            "cp852",
+            "ibm866",
+            "windows-1250",
+            "windows-1252",
+            "iso-8859-1",
+            "iso-8859-2",
+            "iso-8859-15"
+          ],
+          "enumDescriptions": [
+            "Windows' own default charset for non-Unicode text (the system ANSI codepage, e.g. 1252 on a Western European install)",
+            "Decode each line as UTF-8 when it is valid UTF-8, otherwise as the system ANSI codepage",
+            "UTF-8",
+            "The console codepage (what `chcp` reports, e.g. 850) — for a program that writes console/OEM bytes",
+            "CP437 (DOS US)",
+            "CP850 (DOS Western European)",
+            "CP852 (DOS Central European)",
+            "CP866 (DOS Cyrillic)",
+            "Windows-1250 (Central European)",
+            "Windows-1252 (Western European)",
+            "ISO 8859-1 (Latin-1)",
+            "ISO 8859-2 (Latin-2)",
+            "ISO 8859-15 (Latin-9)"
+          ],
+          "markdownDescription": "Encoding used to decode the output of a running project shown in the **DDK Run** output channel. The default `ansi` is Windows' own default charset for non-Unicode text (the system ANSI codepage from `HKLM\\SYSTEM\\CurrentControlSet\\Control\\Nls\\CodePage\\ACP`, what `GetACP` returns — e.g. 1252), which is what a program writing to a redirected handle normally produces. Pick `oem` for a program that writes console codepage bytes (e.g. CP850), `utf8` for one that writes UTF-8 — which a current Delphi RTL does while its output is redirected — or `auto` to take each line as UTF-8 when it is valid UTF-8 and as the ANSI codepage otherwise, covering both kinds of program in one run. Only applies to `#ddk.projects.runIn#` = `output`; a terminal decodes its own output."
+        },
+        "ddk.projects.runRevealOutput": {
+          "type": "string",
+          "default": "onOutput",
+          "enum": [
+            "onOutput",
+            "always",
+            "never"
+          ],
+          "enumDescriptions": [
+            "Reveal the DDK Run channel as soon as the program writes its first output",
+            "Reveal the DDK Run channel whenever a project is run",
+            "Never reveal the DDK Run channel by itself"
+          ],
+          "markdownDescription": "When to bring the **DDK Run** output channel into view (without stealing focus from the editor). `onOutput` keeps the panel untouched for a GUI application that prints nothing. Only applies to `#ddk.projects.runIn#` = `output`."
+        },
         "ddk.compiler.resultTimeout": {
           "type": "number",
           "default": 5000,
@@ -801,6 +866,20 @@
         }
       }
     },
+    "taskDefinitions": [
+      {
+        "type": "ddk.run",
+        "required": [
+          "project"
+        ],
+        "properties": {
+          "project": {
+            "type": "string",
+            "description": "Name of the DDK project whose executable this task runs."
+          }
+        }
+      }
+    ],
     "grammars": [
       {
         "language": "ddk.compiler",
