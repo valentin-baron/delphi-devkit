@@ -1480,7 +1480,7 @@ pub enum RunOrAmbiguity {
 /// Fuses the dproj's `Debugger_RunParams` with the DDK "Start Parameters"
 /// override: both contribute, base first, joined by a space — neither
 /// silently discards the other. Blank/absent values contribute nothing.
-fn fuse_run_params(base: Option<String>, extra: Option<String>) -> Option<String> {
+pub(crate) fn fuse_run_params(base: Option<String>, extra: Option<String>) -> Option<String> {
     let base = base.filter(|s| !s.trim().is_empty());
     let extra = extra.filter(|s| !s.trim().is_empty());
     match (base, extra) {
@@ -1493,7 +1493,7 @@ fn fuse_run_params(base: Option<String>, extra: Option<String>) -> Option<String
 
 /// Splits a start-parameters string into argv entries, honoring
 /// double-quoted segments (e.g. `-flag "value with spaces"`).
-fn split_run_args(args: &str) -> Vec<String> {
+pub(crate) fn split_run_args(args: &str) -> Vec<String> {
     let re = Regex::new(r#""([^"]*)"|(\S+)"#).unwrap();
     re.captures_iter(args)
         .map(|c| c.get(1).or_else(|| c.get(2)).unwrap().as_str().to_string())
@@ -1637,6 +1637,115 @@ pub async fn cmd_run_path(path: String, args: Option<String>) -> Result<RunOrAmb
 
 /// Whether `value` names a Delphi project source (`.dproj`/`.dpr`/`.dpk`),
 /// case-insensitively and without allocating.
+// ─── Debug target ────────────────────────────────────────────────────────────
+
+/// Result of a debug-target request: the target, or the candidate list when
+/// the reference was ambiguous (mirroring the compile/run commands).
+#[derive(Debug, Clone)]
+pub enum DebugTargetOrAmbiguity {
+    Target(crate::debug_target::DebugTarget),
+    Ambiguity(AmbiguousProjects),
+}
+
+/// Describes the debug target of a project — see [`crate::debug_target`] —
+/// selected by reference: a numeric id, a project name, or a path to a
+/// `.dproj`/`.dpr`/`.dpk`; `None` targets the active project. A path owned by
+/// no managed project is described ad-hoc (nothing is persisted), building
+/// with `compiler` (an exact key or product name; default: the newest
+/// installed). A reference matching several projects returns the candidate
+/// list instead.
+pub async fn cmd_debug_target(
+    reference: Option<String>,
+    compiler: Option<String>,
+) -> Result<DebugTargetOrAmbiguity> {
+    let data = PROJECTS_DATA.read().await;
+    let project_id = match &reference {
+        None => match data.active_project_id {
+            Some(id) => id,
+            _ => bail!("No active project selected."),
+        },
+        Some(reference) if is_delphi_project_path(reference) => match resolve_project_by_path(&data, reference) {
+            ProjectResolution::Single(id) => id,
+            ProjectResolution::Ambiguous(matches) => {
+                return Ok(DebugTargetOrAmbiguity::Ambiguity(AmbiguousProjects {
+                    reference: reference.clone(),
+                    matches,
+                }));
+            }
+            ProjectResolution::NotFound => {
+                drop(data);
+                return Ok(DebugTargetOrAmbiguity::Target(adhoc_debug_target(reference, compiler).await?));
+            }
+        },
+        Some(reference) => match resolve_project_reference(&data, reference) {
+            ProjectResolution::Single(id) => id,
+            ProjectResolution::Ambiguous(matches) => {
+                return Ok(DebugTargetOrAmbiguity::Ambiguity(AmbiguousProjects {
+                    reference: reference.clone(),
+                    matches,
+                }));
+            }
+            ProjectResolution::NotFound => {
+                bail!("No project matches \"{reference}\". Use `list` to see available projects.")
+            }
+        },
+    };
+    let project = match data.get_project(project_id) {
+        Some(p) => p,
+        _ => bail!("Project with ID {project_id} not found."),
+    };
+    // An orphan project (linked to no workspace or group project) has no
+    // compiler of its own; describing it is read-only, so fall back to the
+    // requested or newest compiler and say so rather than refusing.
+    let (compiler, orphan_note) = match data.compiler_for_project(project_id).await {
+        Some(c) => (c, None),
+        _ => {
+            let key = resolve_compiler_key(compiler).await?;
+            let compilers = COMPILER_CONFIGURATIONS.read().await;
+            let fallback = compilers
+                .get(&key)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Compiler configuration \"{key}\" not found."))?;
+            let note = format!(
+                "Project \"{}\" is linked to no workspace or group project; described with {} ({key}).",
+                project.name, fallback.product_name
+            );
+            (fallback, Some(note))
+        }
+    };
+    let mut target = crate::debug_target::build_debug_target(project, &compiler)?;
+    if let Some(note) = orphan_note {
+        target.warnings.insert(0, note);
+    }
+    Ok(DebugTargetOrAmbiguity::Target(target))
+}
+
+/// The ad-hoc counterpart of [`cmd_debug_target`] for a project file that
+/// belongs to no workspace: an ephemeral, never-persisted project is
+/// discovered exactly as [`cmd_compile_file`] would build it.
+async fn adhoc_debug_target(file_path: &str, compiler: Option<String>) -> Result<crate::debug_target::DebugTarget> {
+    if !std::path::Path::new(file_path).exists() {
+        bail!("File not found: {file_path}");
+    }
+    let compiler_key = resolve_compiler_key(compiler).await?;
+    let mut data = ProjectsData::default();
+    data.new_workspace(&"ad-hoc".to_string(), &compiler_key).await?;
+    let workspace_id = data.workspaces[0].id;
+    let ide_env = data.ide_environment_for_workspace(workspace_id).await;
+    data.new_project(&file_path.to_string(), workspace_id, &ide_env)?;
+    let project = data
+        .projects
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("Failed to create ad-hoc project from: {file_path}"))?;
+    let compiler = data
+        .compiler_for_project(project.id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("Ad-hoc project link was not created."))?;
+    let mut target = crate::debug_target::build_debug_target(project, &compiler)?;
+    target.project_id = None;
+    Ok(target)
+}
+
 fn is_delphi_project_path(value: &str) -> bool {
     has_extension(value, &["dproj", "dpr", "dpk"])
 }

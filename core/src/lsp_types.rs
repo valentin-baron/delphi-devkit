@@ -314,6 +314,17 @@ pub struct DprojMetadataResponse {
     pub active_platform: String,
 }
 
+/// Request params for `debug/target` – asks the server to describe a
+/// project's debug target (see `ddk_core::debug_target`). Mirrors
+/// `cmd_debug_target`: `project` is an id, a name or a project-file path,
+/// `None` for the active project; `compiler` only matters for an ad-hoc path.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct DebugTargetParams {
+    pub project: Option<String>,
+    pub compiler: Option<String>,
+}
+
 /// Request params for `delphilsp/generate` – asks the server to (re)write the
 /// `.delphilsp.json` settings file consumed by Embarcadero's DelphiLSP
 /// extension. All fields are optional and mirror `cmd_delphilsp_config`.

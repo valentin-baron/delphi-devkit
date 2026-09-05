@@ -272,6 +272,33 @@ pub struct GenerateDelphiLspConfigArgs {
     pub out: Option<String>,
 }
 
+#[macros::mcp_tool(
+    name = "delphi_get_debug_target",
+    description = "Describes what debugging a Delphi project means, independently of any debugger: \
+        the executable to launch or attach to (the program itself, or the Host Application that loads \
+        a package/DLL), the .map/.rsm symbol files next to it, the project's own .bpl/.dll module with \
+        its symbols and .dcp, the source search paths (project directory, dproj unit/include paths, the \
+        IDE's Library and Browsing Paths, the compiler's source tree), the run arguments (dproj Run \
+        Parameters fused with the saved Start Parameters), config/platform/bitness, and warnings about \
+        missing or stale artefacts. Use it to build a debugger launch or attach configuration, or to \
+        check that a project is ready to debug (an empty warnings list means it is). \
+        Target it with `project`: a numeric ID, a project name, or a path to a .dproj/.dpr/.dpk. \
+        A name matching several projects returns the candidate list instead. \
+        Omit `project` to describe the currently active project. \
+        A path that belongs to no workspace is described ad-hoc: pick its compiler with `compiler` \
+        (an exact key like \"12.0\" or a product name like \"Delphi 12\"; default: newest installed). \
+        Nothing is written or compiled: compile with debug_info first if the warnings ask for it."
+)]
+#[derive(Debug, Deserialize, Serialize, macros::JsonSchema)]
+pub struct GetDebugTargetArgs {
+    /// Project to describe: a numeric ID, a project name, or a path to a
+    /// .dproj/.dpr/.dpk. Omit to use the currently active project.
+    pub project: Option<String>,
+    /// Compiler key (e.g. "12.0") or product name (e.g. "Delphi 12"), used only
+    /// for a file path that belongs to no workspace. Optional.
+    pub compiler: Option<String>,
+}
+
 rust_mcp_sdk::tool_box!(DdkTools, [
     GetDdkExtensionInfoArgs,
     GetEnvironmentInfoArgs,
@@ -287,6 +314,7 @@ rust_mcp_sdk::tool_box!(DdkTools, [
     AddWorkspaceArgs,
     FormatFileArgs,
     GenerateDelphiLspConfigArgs,
+    GetDebugTargetArgs,
 ]);
 
 // ---------------------------------------------------------------------------
@@ -332,6 +360,7 @@ impl ServerHandler for DdkMcpHandler {
             "delphi_add_workspace"            => add_workspace(&args).await,
             "delphi_format_file"              => format_file(&args).await,
             "delphi_generate_delphilsp_config" => generate_delphilsp_config(&args).await,
+            "delphi_get_debug_target"         => get_debug_target(&args).await,
             _ => format!("Unknown tool: {name}"),
         };
         Ok(CallToolResult::text_content(vec![TextContent::from(result_text)]))
@@ -536,6 +565,18 @@ async fn format_file(args: &Value) -> String {
         .and_then(|v| v.as_str().map(|s| s.to_string()));
     match commands::cmd_format_file(file_path, encoding).await {
         Ok(path) => format!("{path}"),
+        Err(e) => format!("{e}"),
+    }
+}
+
+async fn get_debug_target(args: &Value) -> String {
+    let project = args.get("project").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let compiler = args.get("compiler").and_then(|v| v.as_str()).map(|s| s.to_string());
+    match commands::cmd_debug_target(project, compiler).await {
+        Ok(commands::DebugTargetOrAmbiguity::Target(target)) => {
+            serde_json::to_string_pretty(&target).unwrap_or_else(|_| target.to_string())
+        }
+        Ok(commands::DebugTargetOrAmbiguity::Ambiguity(amb)) => amb.to_string(),
         Err(e) => format!("{e}"),
     }
 }

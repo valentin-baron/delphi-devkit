@@ -180,6 +180,30 @@ enum Commands {
         out: Option<String>,
     },
 
+    /// Describe a project's debug target: the executable to launch or attach
+    /// to (the program, or the Host Application of a package/DLL), its
+    /// .map/.rsm, the project's own .bpl/.dll with their symbols, the source
+    /// search paths (dproj + IDE library/browsing paths), the run arguments,
+    /// and warnings about missing or stale artefacts. Debugger-agnostic: a
+    /// debugger integration maps it onto its own launch configuration.
+    ///
+    /// TARGET may be a project ID, a project name, or a path to a
+    /// .dproj/.dpr/.dpk. A path owned by no workspace is described ad-hoc;
+    /// pick its compiler with --compiler.
+    #[command(name = "debug-target", visible_alias = "debug_target")]
+    DebugTarget {
+        /// What to describe: a project ID, a project name, or a path to a
+        /// .dproj/.dpr/.dpk. Omit to use the active project.
+        target: Option<String>,
+
+        /// Compiler configuration for an ad-hoc file TARGET: an exact key
+        /// (e.g. "12.0") or product name (e.g. "Delphi 12"). Defaults to the
+        /// newest installed compiler. Only meaningful when TARGET is a file
+        /// that belongs to no workspace.
+        #[arg(long, short = 'c')]
+        compiler: Option<String>,
+    },
+
     /// Show environment info for the active project.
     Env,
 
@@ -467,6 +491,26 @@ async fn main() -> Result<()> {
                     }
                 }
                 DelphiLspOrAmbiguity::Ambiguity(a) => {
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&a)?);
+                    } else {
+                        print!("{a}");
+                    }
+                }
+            }
+        }
+
+        Commands::DebugTarget { target, compiler } => {
+            use commands::DebugTargetOrAmbiguity;
+            match commands::cmd_debug_target(target, compiler).await? {
+                DebugTargetOrAmbiguity::Target(result) => {
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&result)?);
+                    } else {
+                        print!("{result}");
+                    }
+                }
+                DebugTargetOrAmbiguity::Ambiguity(a) => {
                     if cli.json {
                         println!("{}", serde_json::to_string_pretty(&a)?);
                     } else {

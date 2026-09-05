@@ -74,6 +74,8 @@ ddk delphilsp-config                   # Write the active project's .delphilsp.j
 ddk delphilsp-config <ID|NAME|PATH>    # ...for a specific project (lists candidates if ambiguous)
 ddk delphilsp-config <PATH> -c "Delphi 12"   # ...choosing the compiler for an unmanaged path
 ddk delphilsp-config <PATH> -o <FILE>  # ...writing somewhere else instead of next to the project
+ddk debug-target                       # Describe the active project's debug target (exe/host, symbols, sources, args)
+ddk debug-target <ID|NAME|PATH> --json # ...for a specific project, as JSON for a debugger integration
 ddk env                                # Show active project & compiler info
 ddk info                               # Print the DDK README
 ddk --json <command>                   # Output as JSON
@@ -203,6 +205,27 @@ can be turned off with the `ddk.projects.useDebuggerRunParams` setting:
 disable it to always use only the saved Start Parameters, ignoring the
 dproj's Run Parameters entirely. The CLI/MCP always fuse `Debugger_RunParams`
 in, since there is no extension setting for them to consult.
+
+`ddk debug-target` describes what debugging a project means, independently of
+any particular debugger: the executable to launch or attach to (the program
+itself, or the **Host Application** that loads a package or a DLL), the
+`.map`/`.rsm` symbol files next to it, the project's own `.bpl`/`.dll` module
+with its symbols and `.dcp` (searched where the IDE puts it: the dproj's
+output directories, the IDE's default package output, the host's directory),
+the source search paths (the project directory, the dproj's unit and include
+paths, the IDE's **Library Path** and **Browsing Path** for the platform, the
+compiler's `source` tree — only existing directories, macros expanded through
+`rsvars.bat` and the IDE's environment-variable overrides), the run arguments
+exactly as `Run` passes them, config/platform/bitness, and warnings about
+what is missing or stale (no `.rsm`, a `.map` older than the binary, a package
+that was never built). Nothing is written or compiled. The target resolves
+like `ddk compile`: an ID, a name, or a path (ad-hoc when the path belongs to
+no workspace, `-c` picks its compiler). `--json` is the form a debugger
+integration consumes: a debug adapter's extension maps it onto its own launch
+attributes, so a hand-written launch configuration shrinks to a project
+reference and stays correct when the project's paths change. The same is
+exposed to AI tooling via the MCP `delphi_get_debug_target` tool and to the VS
+Code extension via the `debug/target` LSP request.
 
 ## Demos
 
