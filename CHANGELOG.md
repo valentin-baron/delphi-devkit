@@ -4,6 +4,12 @@ All notable changes to the "delphi-devkit" extension will be documented in this 
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [Unreleased]
+
+### Added
+
+- **Debug-info builds** (`ddk compile --debug-info`, MCP `debug_info: true` on `delphi_compile_project`/`delphi_compile_file`, VS Code *Compile for Debugging* on a project, a workspace, the group project and the selected project): compile with the full debug artefact set a debugger needs — optimizations off, TD32 debug info in the binary, the `.rsm` remote-debug symbols and a detailed `.map` — regardless of what the selected build configuration says. The overrides travel as MSBuild global properties (`/p:DCC_Optimize=false`, `/p:DCC_DebugInfoInExe=true`, `/p:DCC_RemoteDebug=true`, `/p:DCC_MapFile=3`, …) or as extra `dcc` switches (`-$O- -V -VN -VR -GD`) for a bare `.dpr`/`.dpk`; the dproj is never modified. Off by default: a plain compile is unchanged.
+
 ## [2.6.0] - 2026-08-03
 
 ### Added

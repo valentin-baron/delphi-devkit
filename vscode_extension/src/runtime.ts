@@ -93,8 +93,8 @@ export abstract class Runtime {
     return [...workspaceLinks, ...groupProjectLinks];
   }
 
-  public static async compileProjectLink(link: Entities.ProjectLink, recreate: boolean = false): Promise<boolean> {
-    return await this.client.compileProject(recreate, link.project_id, link.id);
+  public static async compileProjectLink(link: Entities.ProjectLink, recreate: boolean = false, debugInfo: boolean = false): Promise<boolean> {
+    return await this.client.compileProject(recreate, link.project_id, link.id, debugInfo);
   }
 
   public static setContext(name: string, value: any): Thenable<void> {

@@ -93,6 +93,10 @@ pub struct SetGroupProjectsCompilerArgs {
 pub struct CompileSelectedProjectArgs {
     /// If true, rebuilds the project from scratch. If false, performs an incremental compile.
     pub rebuild: Option<bool>,
+    /// If true, forces the full debug artefact set a debugger needs (optimizations off,
+    /// TD32 debug info, .rsm symbols, detailed .map) regardless of the build configuration.
+    /// The dproj is never modified. Default: false.
+    pub debug_info: Option<bool>,
     /// Project to compile: a numeric ID or a project name. A name matching several
     /// projects returns the candidate list instead of compiling. Takes precedence over project_id.
     pub project: Option<String>,
@@ -135,6 +139,9 @@ pub struct CompileFileArgs {
     pub platform: Option<String>,
     /// If true, rebuilds from scratch. If false/omitted, incremental compile.
     pub rebuild: Option<bool>,
+    /// If true, forces the full debug artefact set (optimizations off, TD32 debug info,
+    /// .rsm symbols, detailed .map) regardless of the build configuration. Default: false.
+    pub debug_info: Option<bool>,
     /// Show warning lines verbatim instead of suppressing them. Default: false.
     pub show_warnings: Option<bool>,
     /// Show hint lines verbatim instead of suppressing them. Default: false.
@@ -385,6 +392,7 @@ async fn set_group_projects_compiler(args: &Value) -> String {
 
 async fn compile_project(args: &Value) -> String {
     let rebuild = args.get("rebuild").and_then(|v| v.as_bool()).unwrap_or(false);
+    let debug_info = args.get("debug_info").and_then(|v| v.as_bool()).unwrap_or(false);
     let filter = CompileFilterOptions {
         trim_banners: true,
         show_warnings: args.get("show_warnings").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -404,7 +412,7 @@ async fn compile_project(args: &Value) -> String {
                 .and_then(|v| v.as_u64())
                 .map(|id| id.to_string())
         });
-    match commands::cmd_compile_ref(rebuild, reference, filter, Vec::new()).await {
+    match commands::cmd_compile_ref(rebuild, debug_info, reference, filter, Vec::new()).await {
         Ok(commands::CompileOrAmbiguity::Output(output)) => {
             serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string())
         }
@@ -422,6 +430,7 @@ async fn compile_file(args: &Value) -> String {
     let config = args.get("config").and_then(|v| v.as_str()).map(|s| s.to_string());
     let platform = args.get("platform").and_then(|v| v.as_str()).map(|s| s.to_string());
     let rebuild = args.get("rebuild").and_then(|v| v.as_bool()).unwrap_or(false);
+    let debug_info = args.get("debug_info").and_then(|v| v.as_bool()).unwrap_or(false);
     let filter = CompileFilterOptions {
         trim_banners: true,
         show_warnings: args.get("show_warnings").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -431,7 +440,7 @@ async fn compile_file(args: &Value) -> String {
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
     };
-    match commands::cmd_compile_file(file_path, compiler, config, platform, rebuild, filter, Vec::new()).await {
+    match commands::cmd_compile_file(file_path, compiler, config, platform, rebuild, debug_info, filter, Vec::new()).await {
         Ok(commands::CompileOrAmbiguity::Output(output)) => {
             serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string())
         }

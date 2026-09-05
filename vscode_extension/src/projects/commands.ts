@@ -40,8 +40,18 @@ export namespace ProjectsCommands {
       return [
         commands.registerCommand(PROJECTS.COMMAND.COMPILE_SELECTED_PROJECT, this.compileSelectedProject.bind(this)),
         commands.registerCommand(PROJECTS.COMMAND.RECREATE_SELECTED_PROJECT, this.recreateSelectedProject.bind(this)),
+        commands.registerCommand(PROJECTS.COMMAND.COMPILE_SELECTED_PROJECT_FOR_DEBUGGING, this.compileSelectedProjectForDebugging.bind(this)),
         commands.registerCommand(PROJECTS.COMMAND.RUN_SELECTED_PROJECT, this.runSelectedProject.bind(this))
       ];
+    }
+
+    /** Incremental compile with the full debug artefact set (optimizations
+     *  off, TD32, `.rsm`, detailed `.map`), whatever the build configuration
+     *  says — like the Delphi IDE's Run-with-debugger build. */
+    private static async compileSelectedProjectForDebugging() {
+      await this.selectedProjectAction(async (link) => {
+        await Runtime.compileProjectLink(link, false, true);
+      });
     }
 
     private static async selectedProjectAction(callback: Coroutine<void, [Entities.ProjectLink]>): Promise<void> {
@@ -89,6 +99,8 @@ export namespace ProjectsCommands {
       return [
         commands.registerCommand(PROJECTS.COMMAND.COMPILE, this.compile.bind(this)),
         commands.registerCommand(PROJECTS.COMMAND.RECREATE, this.recreate.bind(this)),
+        commands.registerCommand(PROJECTS.COMMAND.COMPILE_FOR_DEBUGGING, this.compileForDebugging.bind(this)),
+        commands.registerCommand(PROJECTS.COMMAND.COMPILE_ALL_IN_WORKSPACE_FOR_DEBUGGING, this.compileAllInWorkspaceForDebugging.bind(this)),
         commands.registerCommand(PROJECTS.COMMAND.SHOW_IN_EXPLORER, this.showInExplorer.bind(this)),
         commands.registerCommand(PROJECTS.COMMAND.OPEN_IN_FILE_EXPLORER, this.openInFileExplorer.bind(this)),
         commands.registerCommand(PROJECTS.COMMAND.RUN_EXECUTABLE, this.runExecutable.bind(this)),
@@ -111,6 +123,16 @@ export namespace ProjectsCommands {
 
     private static async recreate(item: BaseFileItem): Promise<void> {
       await Runtime.compileProjectLink(item.project.link, true);
+    }
+
+    private static async compileForDebugging(item: BaseFileItem): Promise<void> {
+      await Runtime.compileProjectLink(item.project.link, false, true);
+    }
+
+    private static async compileAllInWorkspaceForDebugging(item: TreeItem): Promise<void> {
+      const wsItem = Runtime.projects.workspacesTreeView.getWorkspaceItemByTreeItem(item);
+      if (!assertError(wsItem?.workspace, 'Could not determine workspace from the selected item.')) return;
+      await Runtime.client.compileAllInWorkspace(false, wsItem!.workspace.id, true);
     }
 
     private static async showInExplorer(item: BaseFileItem): Promise<void> {
@@ -381,6 +403,7 @@ export namespace ProjectsCommands {
         commands.registerCommand(PROJECTS.COMMAND.EDIT_DEFAULT_INI, this.editDefaultIni.bind(this)),
         commands.registerCommand(PROJECTS.COMMAND.COMPILE_ALL_IN_GROUP_PROJECT, this.compileAllInGroupProject.bind(this)),
         commands.registerCommand(PROJECTS.COMMAND.RECREATE_ALL_IN_GROUP_PROJECT, this.recreateAllInGroupProject.bind(this)),
+        commands.registerCommand(PROJECTS.COMMAND.COMPILE_ALL_IN_GROUP_PROJECT_FOR_DEBUGGING, this.compileAllInGroupProjectForDebugging.bind(this)),
         commands.registerCommand(PROJECTS.COMMAND.TRANSFER_GROUP_PROJECT, this.transferGroupProject.bind(this)),
         commands.registerCommand(PROJECTS.COMMAND.REFRESH, this.refresh.bind(this)),
       ];
@@ -424,6 +447,10 @@ export namespace ProjectsCommands {
 
     private static async compileAllInGroupProject(item: TreeItem): Promise<void> {
       await Runtime.client.compileAllInGroupProject(false);
+    }
+
+    private static async compileAllInGroupProjectForDebugging(item: TreeItem): Promise<void> {
+      await Runtime.client.compileAllInGroupProject(false, true);
     }
 
     private static async recreateAllInGroupProject(item: TreeItem): Promise<void> {

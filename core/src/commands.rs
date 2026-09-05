@@ -1095,13 +1095,17 @@ pub enum CompileOrAmbiguity {
 /// Compiles a project. If `project_id` is `Some`, that project is compiled
 /// directly **without** changing the active project in state; otherwise the
 /// currently active project is compiled.
+/// `debug_info` forces the full debug artefact set (optimizations off, TD32
+/// debug info, `.rsm`, detailed `.map`) regardless of what the selected build
+/// configuration says, without touching the dproj — what a debugger needs.
 /// Collects compiler broadcast output and returns it as a `CompileOutput`.
 pub async fn cmd_compile(
     rebuild: bool,
+    debug_info: bool,
     project_id: Option<usize>,
     filter: CompileFilterOptions,
 ) -> Result<CompileOutput> {
-    cmd_compile_with_progress(rebuild, project_id, filter, Vec::new(), None).await
+    cmd_compile_with_progress(rebuild, debug_info, project_id, filter, Vec::new(), None).await
 }
 
 /// Compiles a project selected by a reference (project name or numeric id).
@@ -1112,17 +1116,19 @@ pub async fn cmd_compile(
 /// a reference matching nothing is an error.
 pub async fn cmd_compile_ref(
     rebuild: bool,
+    debug_info: bool,
     project: Option<String>,
     filter: CompileFilterOptions,
     extra_msbuild_args: Vec<String>,
 ) -> Result<CompileOrAmbiguity> {
-    cmd_compile_ref_with_progress(rebuild, project, filter, extra_msbuild_args, None).await
+    cmd_compile_ref_with_progress(rebuild, debug_info, project, filter, extra_msbuild_args, None).await
 }
 
 /// Like [`cmd_compile_ref`] but streams each compiler output line to
 /// `on_progress` as it arrives (used by the CLI for live output).
 pub async fn cmd_compile_ref_with_progress(
     rebuild: bool,
+    debug_info: bool,
     project: Option<String>,
     filter: CompileFilterOptions,
     extra_msbuild_args: Vec<String>,
@@ -1147,7 +1153,7 @@ pub async fn cmd_compile_ref_with_progress(
         }
     };
     let output =
-        cmd_compile_with_progress(rebuild, project_id, filter, extra_msbuild_args, on_progress)
+        cmd_compile_with_progress(rebuild, debug_info, project_id, filter, extra_msbuild_args, on_progress)
             .await?;
     Ok(CompileOrAmbiguity::Output(output))
 }
@@ -1156,6 +1162,7 @@ pub async fn cmd_compile_ref_with_progress(
 /// compiler output line as it arrives.
 pub async fn cmd_compile_with_progress(
     rebuild: bool,
+    debug_info: bool,
     project_id: Option<usize>,
     filter: CompileFilterOptions,
     extra_msbuild_args: Vec<String>,
@@ -1186,6 +1193,7 @@ pub async fn cmd_compile_with_progress(
         project_id: resolved_id,
         project_link_id: Some(link_id),
         rebuild,
+        debug_info,
         event_id: "cmd-compile".to_string(),
     };
 
@@ -1217,6 +1225,7 @@ pub async fn cmd_compile_file(
     config: Option<String>,
     platform: Option<String>,
     rebuild: bool,
+    debug_info: bool,
     filter: CompileFilterOptions,
     extra_msbuild_args: Vec<String>,
 ) -> Result<CompileOrAmbiguity> {
@@ -1226,6 +1235,7 @@ pub async fn cmd_compile_file(
         config,
         platform,
         rebuild,
+        debug_info,
         filter,
         extra_msbuild_args,
         None,
@@ -1241,6 +1251,7 @@ pub async fn cmd_compile_file_with_progress(
     config: Option<String>,
     platform: Option<String>,
     rebuild: bool,
+    debug_info: bool,
     filter: CompileFilterOptions,
     extra_msbuild_args: Vec<String>,
     on_progress: Option<CompileProgressCallback>,
@@ -1262,7 +1273,7 @@ pub async fn cmd_compile_file_with_progress(
     };
     if let Some(id) = managed_id {
         let output =
-            cmd_compile_with_progress(rebuild, Some(id), filter, extra_msbuild_args, on_progress)
+            cmd_compile_with_progress(rebuild, debug_info, Some(id), filter, extra_msbuild_args, on_progress)
                 .await?;
         return Ok(CompileOrAmbiguity::Output(output));
     }
@@ -1298,6 +1309,7 @@ pub async fn cmd_compile_file_with_progress(
         project_id,
         project_link_id: Some(link_id),
         rebuild,
+        debug_info,
         event_id: "cmd-compile-file".to_string(),
     };
 

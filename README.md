@@ -56,6 +56,7 @@ ddk compile                            # Compile the active project
 ddk compile <ID|NAME>                  # Compile a project by ID or name (= -p; lists candidates if ambiguous)
 ddk compile -p <ID|NAME>               # Same, explicit flag form
 ddk compile --rebuild -p <ID>          # Rebuild a specific project by ID
+ddk compile --debug-info <ID|NAME>     # Compile with the full debug artefact set (.map/.rsm/TD32, optimizations off)
 ddk compile <PATH>                     # Compile a .dproj/.dpr/.dpk (uses the owning project if managed, else ad-hoc)
 ddk compile <PATH> -c "Delphi 12"      # ...choosing the compiler (key or product name)
 ddk compile <PATH> --config Release --platform Win64   # ...with build overrides
@@ -93,6 +94,14 @@ appended after DDK's own `/p:Config`/`/p:Platform` args, so a `/p:` override
 here wins (MSBuild takes the last value). They have no effect on a bare
 `.dpr`/`.dpk` target, which is compiled with the command-line compiler (`dcc`)
 rather than MSBuild — DDK prints a note when they are ignored.
+
+`ddk compile --debug-info` (MCP: `debug_info: true`; VS Code: the *Compile for
+Debugging* actions) forces the full debug artefact set a debugger needs —
+optimizations off, TD32 debug info in the binary, the `.rsm` remote-debug
+symbols and a detailed `.map` — regardless of what the selected build
+configuration says, so a Release build can be debugged without editing the
+project. The overrides are passed as MSBuild global properties (`/p:DCC_*`), or
+as extra `dcc` switches for a bare `.dpr`/`.dpk`; the dproj is never modified.
 
 `ddk compile --json` (and the MCP compile tools) return a fully machine-coded
 result: structured header fields (`project`, `project_path`, `compiler`,
@@ -246,6 +255,7 @@ in, since there is no extension setting for them to consult.
 ### Project Actions (Available via context menu and keyboard shortcuts)
 * `Compile Selected Project` - Compile the selected project (Ctrl+F9)
 * `Recreate Selected Project` - Clean and rebuild the selected project (Shift+F9)
+* `Compile Selected Project for Debugging` - Compile the selected project with the full debug artefact set (`.map`/`.rsm`/TD32, optimizations off) regardless of its build configuration; also available per project (`Compile for Debugging`), per workspace and per group project
 * `Compile All in Workspace` - Compile all projects in a workspace
 * `Recreate All in Workspace` - Clean and rebuild all projects in a workspace
 * `Compile All in Group Project` - Compile all projects in the loaded group project

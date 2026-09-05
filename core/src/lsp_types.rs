@@ -244,21 +244,44 @@ pub enum CompileProjectParams {
         project_id: usize,
         project_link_id: Option<usize>,
         rebuild: bool,
+        /// Force the full debug artefact set (see `Compiler`'s debug-info
+        /// handling); optional on the wire so older clients keep working.
+        #[serde(default)]
+        debug_info: bool,
         event_id: String,
     },
     AllInWorkspace {
         workspace_id: usize,
         rebuild: bool,
+        #[serde(default)]
+        debug_info: bool,
         event_id: String,
     },
     AllInGroupProject {
         rebuild: bool,
+        #[serde(default)]
+        debug_info: bool,
         event_id: String,
     },
     FromLink {
         project_link_id: usize,
         rebuild: bool,
+        #[serde(default)]
+        debug_info: bool,
         event_id: String,
+    }
+}
+
+impl CompileProjectParams {
+    /// Whether the request asks for the full debug artefact set regardless
+    /// of the build configuration's own settings.
+    pub fn debug_info(&self) -> bool {
+        match self {
+            Self::Project { debug_info, .. }
+            | Self::AllInWorkspace { debug_info, .. }
+            | Self::AllInGroupProject { debug_info, .. }
+            | Self::FromLink { debug_info, .. } => *debug_info,
+        }
     }
 }
 

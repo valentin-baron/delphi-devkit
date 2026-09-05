@@ -84,6 +84,12 @@
         "category": "DDK"
       },
       {
+        "command": "ddk.projects.compileForDebugging",
+        "title": "Compile for Debugging",
+        "icon": "$(debug-alt)",
+        "category": "DDK"
+      },
+      {
         "command": "ddk.projects.showInExplorer",
         "title": "Show in Explorer",
         "icon": "$(folder)",
@@ -140,6 +146,11 @@
         "category": "DDK"
       },
       {
+        "command": "ddk.projects.compileAllInWorkspaceForDebugging",
+        "title": "Compile all in workspace for Debugging",
+        "category": "DDK"
+      },
+      {
         "command": "ddk.projects.setManualPath",
         "title": "Set Path manually",
         "icon": "$(pencil)",
@@ -149,6 +160,12 @@
         "command": "ddk.projects.compileAllInGroupProject",
         "title": "Compile all in group project",
         "icon": "$(sync-ignored)",
+        "category": "DDK"
+      },
+      {
+        "command": "ddk.projects.compileAllInGroupProjectForDebugging",
+        "title": "Compile all in group project for Debugging",
+        "icon": "$(debug-alt)",
         "category": "DDK"
       },
       {
@@ -215,6 +232,12 @@
       {
         "command": "ddk.projects.compileSelectedProject",
         "title": "Compile Selected Project",
+        "when": "ddk:isProjectSelected == true",
+        "category": "DDK"
+      },
+      {
+        "command": "ddk.projects.compileSelectedProjectForDebugging",
+        "title": "Compile Selected Project for Debugging",
         "when": "ddk:isProjectSelected == true",
         "category": "DDK"
       },
@@ -387,6 +410,14 @@
           "when": "false"
         },
         {
+          "command": "ddk.projects.compileForDebugging",
+          "when": "false"
+        },
+        {
+          "command": "ddk.projects.compileAllInGroupProjectForDebugging",
+          "when": "false"
+        },
+        {
           "command": "ddk.projects.showInExplorer",
           "when": "false"
         },
@@ -424,6 +455,10 @@
         },
         {
           "command": "ddk.projects.recreateAllInWorkspace",
+          "when": "false"
+        },
+        {
+          "command": "ddk.projects.compileAllInWorkspaceForDebugging",
           "when": "false"
         },
         {
@@ -500,6 +535,11 @@
           "group": "navigation@1"
         },
         {
+          "command": "ddk.projects.compileAllInGroupProjectForDebugging",
+          "when": "view == ddk.view.projects.groupProject && ddk:isGroupProjectOpened == true",
+          "group": "navigation@1"
+        },
+        {
           "command": "ddk.projects.recreateAllInGroupProject",
           "when": "view == ddk.view.projects.groupProject && ddk:isGroupProjectOpened == true",
           "group": "navigation@2"
@@ -542,6 +582,11 @@
           "group": "2_compiler@2"
         },
         {
+          "command": "ddk.projects.compileForDebugging",
+          "when": "view =~ /^ddk\\.view\\.projects.*/ && (viewItem == ddk.context.projects.project || viewItem == ddk.context.projects.projectFile)",
+          "group": "2_compiler@2"
+        },
+        {
           "command": "ddk.projects.compileAllFromHere",
           "when": "view =~ /^ddk\\.view\\.projects.*/ && (viewItem == ddk.context.projects.project || viewItem == ddk.context.projects.projectFile)",
           "group": "2_compiler@3"
@@ -558,6 +603,11 @@
         },
         {
           "command": "ddk.projects.recreateAllInWorkspace",
+          "when": "view == ddk.view.projects.workspaces",
+          "group": "2_compiler@5"
+        },
+        {
+          "command": "ddk.projects.compileAllInWorkspaceForDebugging",
           "when": "view == ddk.view.projects.workspaces",
           "group": "2_compiler@5"
         },
