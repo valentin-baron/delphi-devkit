@@ -165,6 +165,28 @@ export namespace DELPHILSP {
   }
 }
 
+export namespace DEBUG {
+  /** The debug type DDK starts sessions for. Whichever installed extension
+   *  contributes a `delphi` debugger owns the session; DDK only supplies
+   *  the project reference and, on request, the project's debug target. */
+  export const TYPE = 'delphi';
+  export namespace CONFIG {
+    export const KEY = 'ddk.debug';
+    export const COMPILE_BEFORE_DEBUG = 'compileBeforeDebug';
+  }
+  export namespace COMMAND {
+    export const DEBUG_PROJECT = 'ddk.debug.debugProject';
+    export const ATTACH_PROJECT = 'ddk.debug.attachProject';
+    export const DEBUG_SELECTED_PROJECT = 'ddk.debug.debugSelectedProject';
+    export const ATTACH_SELECTED_PROJECT = 'ddk.debug.attachSelectedProject';
+    /** Public API for other extensions: `executeCommand(id, { project?, compiler? })` returns the `DebugTarget`. */
+    export const GET_DEBUG_TARGET = 'ddk.debug.getDebugTarget';
+  }
+  export namespace CONTEXT {
+    export const AVAILABLE = 'ddk:debuggerAvailable';
+  }
+}
+
 export namespace COMMANDS {
   export const EXPORT_PROJECTS = 'ddk.exportProjects';
   export const IMPORT_PROJECTS = 'ddk.importProjects';

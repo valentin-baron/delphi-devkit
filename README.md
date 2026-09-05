@@ -227,6 +227,21 @@ reference and stays correct when the project's paths change. The same is
 exposed to AI tooling via the MCP `delphi_get_debug_target` tool and to the VS
 Code extension via the `debug/target` LSP request.
 
+In the VS Code extension, debugging goes through whichever installed
+extension contributes the **`delphi` debug type**; DDK itself ships no
+debugger. While one is installed, every project gets **Debug** and **Attach
+Debugger** actions (context menu, command palette, Ctrl+Alt+F9 for the
+selected project) and one dynamic entry per project in the debug dropdown.
+All of them start the two-line configuration `{ "type": "delphi",
+"request": "launch" | "attach", "ddkProject": "<name or id>" }` — the same
+shape a hand-written `launch.json` entry can use — and the debugger extension
+resolves it by asking DDK for the project's debug target through the
+`ddk.debug.getDebugTarget` command (`executeCommand` with
+`{ project?, compiler? }`). A launch first compiles the project for debugging
+(`ddk.debug.compileBeforeDebug`, on by default); an attach never compiles, and
+when several instances of the executable are running the debugger's own
+process picker chooses. DDK never writes a `launch.json`.
+
 ## Demos
 
 ### Add a Workspace and drag in a Project
@@ -285,6 +300,8 @@ Code extension via the `debug/target` LSP request.
 * `Recreate All in Group Project` - Clean and rebuild all projects in the loaded group project
 * `Cancel Compilation` - Cancel the active compilation (Ctrl+F2)
 * `Run Selected Project` - Execute the selected project (F9)
+* `Debug Selected Project` - Start a debug session for the selected project (Ctrl+Alt+F9), compiling it for debugging first unless `ddk.debug.compileBeforeDebug` is off; also `Debug` on any project. Shown only when an extension contributing the `delphi` debug type is installed
+* `Attach Debugger to Selected Project` - Attach the debugger to the running instance of the selected project's executable (or Host Application); also `Attach Debugger` on any project
 * `Set Start Parameters` - Configure command-line arguments passed to the executable when run
 * `Set Host Application` - Configure the executable that hosts the project when run (e.g. the application loading a .dpk package); overrides the dproj's own `Debugger_HostApplication`
 * `Configure/Create .ini` - Create or edit INI configuration files
@@ -293,6 +310,7 @@ Code extension via the `debug/target` LSP request.
 ## Extension Settings
 
 * `ddk.compiler.encoding`: Character encoding used to decode MSBuild output (`oem` by default, use `utf8` if your paths contain non-ASCII characters).
+* `ddk.debug.compileBeforeDebug`: Before a `Debug` session starts, incrementally compile the project with the full debug artefact set, like the Delphi IDE's Run (`true` by default). Disable to debug whatever binaries already exist. Attaching never compiles.
 * `ddk.projects.useDebuggerRunParams`: When running a project, fuse the `.dproj`'s own `Debugger_RunParams` with the saved Start Parameters, dproj first (`true` by default). Disable to always use only the saved Start Parameters.
 
 ## Compiler Configurations

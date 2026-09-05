@@ -123,6 +123,27 @@ export interface DelphiLspConfigResult {
     warnings: string[];
 }
 
+/** Mirrors `ddk_core::debug_target::DebugTarget` — the reply of `debug/target`. */
+export interface DebugTarget {
+    project_id: number | null;
+    project: string;
+    project_file: string;
+    main_source: string | null;
+    kind: 'program' | 'package' | 'library';
+    executable: string;
+    host_application: string | null;
+    compiler: string;
+    config: string;
+    platform: string;
+    bitness: number | null;
+    symbols: { map: string; rsm: string };
+    source_root: string;
+    source_search_paths: string[];
+    modules: { name: string; binary: string | null; map: string | null; rsm: string | null; dcp: string | null }[];
+    args: string[];
+    warnings: string[];
+}
+
 export class DDK_Client {
     private client: LanguageClient;
     private compilerLinkProvider = new CompilerOutputDefinitionProvider();
@@ -317,6 +338,13 @@ export class DDK_Client {
      *  (with a formatted candidate list as the message) when the reference is ambiguous. */
     public async generateDelphiLspConfig(project?: string, compiler?: string, out?: string): Promise<DelphiLspConfigResult> {
         return await this.client.sendRequest('delphilsp/generate', { project, compiler, out });
+    }
+
+    /** Thin wrapper over the `debug/target` custom method. `project` is a project id
+     *  (as a string), name, or path — omit to target the currently active project.
+     *  Throws (with the candidate list as the message) when the reference is ambiguous. */
+    public async debugTarget(project?: string, compiler?: string): Promise<DebugTarget> {
+        return await this.client.sendRequest('debug/target', { project, compiler });
     }
 
     public onCompilerProgress(params: CompilerProgressParams) {
