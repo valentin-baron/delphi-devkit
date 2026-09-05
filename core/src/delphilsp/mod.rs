@@ -995,6 +995,7 @@ mod tests {
                 templates: String::new(),
             },
             generated_by: Some(GENERATED_BY_MARKER.to_string()),
+            dproj_hash: None,
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&file).unwrap()).unwrap();
