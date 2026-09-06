@@ -1,4 +1,5 @@
 pub mod commands;
+pub mod debug_target;
 pub mod delphilsp;
 pub mod projects;
 pub mod lsp_types;

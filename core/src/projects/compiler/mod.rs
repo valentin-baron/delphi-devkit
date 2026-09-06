@@ -176,6 +176,7 @@ impl Compiler {
             projects: vec![project],
             configuration,
             rebuild,
+            debug_info: false,
             only_one_project: true,
             banner: CompBanner::new(
                 format!("Compiling Project {}", project.name),
@@ -210,6 +211,7 @@ impl Compiler {
             projects,
             configuration,
             rebuild,
+            debug_info: false,
             only_one_project: false,
             banner: CompBanner::new(
                 format!("Compiling Workspace {}", workspace.name),
@@ -243,6 +245,7 @@ impl Compiler {
             projects,
             configuration,
             rebuild,
+            debug_info: false,
             only_one_project: false,
             banner: CompBanner::new(
                 format!("Compiling Group Project {}", group_project.name),
@@ -342,6 +345,7 @@ impl Compiler {
             projects,
             configuration,
             rebuild,
+            debug_info: false,
             only_one_project: false,
             banner,
         });
@@ -357,28 +361,33 @@ impl Compiler {
             compiler_state::reset()
         }
 
-        let parameters = match self.params {
+        let mut parameters = match self.params {
             CompileProjectParams::Project {
                 project_id,
                 project_link_id,
                 rebuild,
+                debug_info: _,
                 event_id: _
             } => self.get_project_parameters(project_id, project_link_id, rebuild).await?,
             CompileProjectParams::AllInWorkspace {
                 workspace_id,
                 rebuild,
+                debug_info: _,
                 event_id: _
             } => self.get_all_workspace_parameters(workspace_id, rebuild).await?,
             CompileProjectParams::AllInGroupProject {
                 rebuild,
+                debug_info: _,
                 event_id: _
             } => self.get_all_group_project_parameters(rebuild).await?,
             CompileProjectParams::FromLink {
                 project_link_id,
                 rebuild,
+                debug_info: _,
                 event_id: _,
             } => self.get_from_link_parameters(project_link_id, rebuild).await?,
         };
+        parameters.debug_info = self.params.debug_info();
         clear_stale_diagnostics(self.client.as_ref()).await;
         // Actual compilation process
         let start_lines = if parameters.only_one_project {
@@ -489,9 +498,14 @@ impl Compiler {
                     .arg(format!("/p:Configuration={}", eff_config))
                     .arg(format!("/p:Platform={}", eff_platform))
                     // prevent MSB60002/MSB60003 (32000-character command line limit
-                    .arg("/p:DCC_UseMSBuildExternally=true")
-                    // User passthrough last so a `/p:` override wins.
-                    .args(&self.extra_msbuild_args);
+                    .arg("/p:DCC_UseMSBuildExternally=true");
+                if parameters.debug_info {
+                    // Global properties override the dproj's own values, so the
+                    // debug artefacts are produced whatever the configuration says.
+                    command.args(debug_info_msbuild_properties());
+                }
+                // User passthrough last so a `/p:` override wins.
+                command.args(&self.extra_msbuild_args);
                 command
             } else {
                 if !self.extra_msbuild_args.is_empty() {
@@ -507,7 +521,7 @@ impl Compiler {
                 let mut command = Command::new(dcc_path);
                 command
                     .arg(&project_file)
-                    .args(dcc_arguments(&eff_config, parameters.rebuild));
+                    .args(dcc_arguments(&eff_config, parameters.rebuild, parameters.debug_info));
                 command
             };
 
@@ -744,11 +758,36 @@ fn find_dcc(installation_path: &str, platform: &str) -> Result<PathBuf> {
     );
 }
 
+/// The MSBuild global properties a debug-info build injects for a `.dproj`.
+/// Global properties override the dproj's own values, so the full debug
+/// artefact set is produced regardless of the selected configuration:
+/// optimizations off (otherwise breakpoints land on wrong lines and locals
+/// read as garbage), TD32 debug info in the binary, the `.rsm` remote-debug
+/// symbols (variable and type inspection) and a detailed `.map`. Property
+/// names match those an IDE-authored dproj writes for its Debug configuration.
+fn debug_info_msbuild_properties() -> Vec<String> {
+    [
+        "DCC_Optimize=false",
+        "DCC_DebugInformation=2",
+        "DCC_LocalDebugSymbols=true",
+        "DCC_SymbolReferenceInfo=2",
+        "DCC_GenerateStackFrames=true",
+        "DCC_DebugInfoInExe=true",
+        "DCC_RemoteDebug=true",
+        "DCC_MapFile=3",
+    ]
+    .iter()
+    .map(|property| format!("/p:{property}"))
+    .collect()
+}
+
 /// Build the dcc command-line switches for a bare-source compile. There is no
 /// `.dproj` to carry configuration, so the (Debug|Release) selection is mapped
 /// onto the relevant `-$` compiler directives. `rebuild` adds `-B` to force a
-/// full build of every unit.
-fn dcc_arguments(config: &str, rebuild: bool) -> Vec<String> {
+/// full build of every unit. `debug_info` appends the full debug artefact
+/// switches after the configuration block — later dcc switches win — so they
+/// take effect even on a Release configuration.
+fn dcc_arguments(config: &str, rebuild: bool, debug_info: bool) -> Vec<String> {
     let mut args = vec!["-Q".to_string()]; // quiet: suppress per-unit progress chatter
     if rebuild {
         args.push("-B".to_string()); // build all units, not just out-of-date ones
@@ -766,7 +805,58 @@ fn dcc_arguments(config: &str, rebuild: bool) -> Vec<String> {
         args.push("-$Y+".to_string()); // symbol reference info
         args.push("-V".to_string());   // emit TD32 debug info for the debugger
     }
+    if debug_info {
+        // -V TD32 in the binary, -VN symbol names, -VR the .rsm, -GD detailed map
+        for switch in ["-$O-", "-$D+", "-$L+", "-$Y+", "-V", "-VN", "-VR", "-GD"] {
+            let switch = switch.to_string();
+            if !args.contains(&switch) {
+                args.push(switch);
+            }
+        }
+    }
     args
+}
+
+#[cfg(test)]
+mod compile_arguments_tests {
+    use super::{dcc_arguments, debug_info_msbuild_properties};
+
+    #[test]
+    fn debug_info_properties_cover_the_full_artefact_set() {
+        let props = debug_info_msbuild_properties();
+        for expected in [
+            "/p:DCC_Optimize=false",
+            "/p:DCC_DebugInfoInExe=true",
+            "/p:DCC_RemoteDebug=true",
+            "/p:DCC_MapFile=3",
+        ] {
+            assert!(props.iter().any(|p| p == expected), "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn dcc_debug_info_adds_rsm_and_map_switches_without_duplicates() {
+        let args = dcc_arguments("Debug", false, true);
+        for expected in ["-V", "-VN", "-VR", "-GD", "-$O-"] {
+            assert!(args.iter().any(|a| a == expected), "missing {expected}");
+        }
+        assert_eq!(args.iter().filter(|a| *a == "-V").count(), 1);
+    }
+
+    #[test]
+    fn dcc_debug_info_overrides_release_switches() {
+        let args = dcc_arguments("Release", true, true);
+        let position = |needle: &str| args.iter().position(|a| a == needle);
+        // The debug switches come after the Release block, so dcc lets them win.
+        assert!(position("-$O-").unwrap() > position("-$O+").unwrap());
+        assert!(args.iter().any(|a| a == "-VR"));
+    }
+
+    #[test]
+    fn dcc_without_debug_info_is_unchanged() {
+        let args = dcc_arguments("Release", false, false);
+        assert!(!args.iter().any(|a| a == "-VR" || a == "-GD"));
+    }
 }
 
 fn find_msbuild() -> Result<String> {
@@ -842,6 +932,9 @@ struct CompilationParameters<'compiler> {
     projects: Vec<&'compiler Project>,
     configuration: CompilerConfiguration,
     rebuild: bool,
+    /// Force the full debug artefact set regardless of the build
+    /// configuration's own settings — see [`debug_info_msbuild_properties`].
+    debug_info: bool,
     only_one_project: bool,
     banner: CompBanner,
 }

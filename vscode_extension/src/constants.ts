@@ -32,6 +32,10 @@ export namespace PROJECTS {
     export const REMOVE_PROJECT = `${PROJECTS.CONFIG.KEY}.removeProject`;
     export const COMPILE = `${PROJECTS.CONFIG.KEY}.compile`;
     export const RECREATE = `${PROJECTS.CONFIG.KEY}.recreate`;
+    export const COMPILE_FOR_DEBUGGING = `${PROJECTS.CONFIG.KEY}.compileForDebugging`;
+    export const COMPILE_SELECTED_PROJECT_FOR_DEBUGGING = `${PROJECTS.CONFIG.KEY}.compileSelectedProjectForDebugging`;
+    export const COMPILE_ALL_IN_WORKSPACE_FOR_DEBUGGING = `${PROJECTS.CONFIG.KEY}.compileAllInWorkspaceForDebugging`;
+    export const COMPILE_ALL_IN_GROUP_PROJECT_FOR_DEBUGGING = `${PROJECTS.CONFIG.KEY}.compileAllInGroupProjectForDebugging`;
     export const REFRESH = `${PROJECTS.CONFIG.KEY}.refresh`;
     export const DISCOVER_PROJECT_PATHS = `${PROJECTS.CONFIG.KEY}.discoverProjectPaths`;
     export const SET_MANUAL_PATH = `${PROJECTS.CONFIG.KEY}.setManualPath`;
@@ -158,6 +162,28 @@ export namespace DELPHILSP {
   export namespace EXTERNAL_SETTINGS {
     export const SECTION = 'delphiLsp';
     export const SETTINGS_FILE = 'settingsFile';
+  }
+}
+
+export namespace DEBUG {
+  /** The debug type DDK starts sessions for. Whichever installed extension
+   *  contributes a `delphi` debugger owns the session; DDK only supplies
+   *  the project reference and, on request, the project's debug target. */
+  export const TYPE = 'delphi';
+  export namespace CONFIG {
+    export const KEY = 'ddk.debug';
+    export const COMPILE_BEFORE_DEBUG = 'compileBeforeDebug';
+  }
+  export namespace COMMAND {
+    export const DEBUG_PROJECT = 'ddk.debug.debugProject';
+    export const ATTACH_PROJECT = 'ddk.debug.attachProject';
+    export const DEBUG_SELECTED_PROJECT = 'ddk.debug.debugSelectedProject';
+    export const ATTACH_SELECTED_PROJECT = 'ddk.debug.attachSelectedProject';
+    /** Public API for other extensions: `executeCommand(id, { project?, compiler? })` returns the `DebugTarget`. */
+    export const GET_DEBUG_TARGET = 'ddk.debug.getDebugTarget';
+  }
+  export namespace CONTEXT {
+    export const AVAILABLE = 'ddk:debuggerAvailable';
   }
 }
 

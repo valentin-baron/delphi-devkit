@@ -244,21 +244,44 @@ pub enum CompileProjectParams {
         project_id: usize,
         project_link_id: Option<usize>,
         rebuild: bool,
+        /// Force the full debug artefact set (see `Compiler`'s debug-info
+        /// handling); optional on the wire so older clients keep working.
+        #[serde(default)]
+        debug_info: bool,
         event_id: String,
     },
     AllInWorkspace {
         workspace_id: usize,
         rebuild: bool,
+        #[serde(default)]
+        debug_info: bool,
         event_id: String,
     },
     AllInGroupProject {
         rebuild: bool,
+        #[serde(default)]
+        debug_info: bool,
         event_id: String,
     },
     FromLink {
         project_link_id: usize,
         rebuild: bool,
+        #[serde(default)]
+        debug_info: bool,
         event_id: String,
+    }
+}
+
+impl CompileProjectParams {
+    /// Whether the request asks for the full debug artefact set regardless
+    /// of the build configuration's own settings.
+    pub fn debug_info(&self) -> bool {
+        match self {
+            Self::Project { debug_info, .. }
+            | Self::AllInWorkspace { debug_info, .. }
+            | Self::AllInGroupProject { debug_info, .. }
+            | Self::FromLink { debug_info, .. } => *debug_info,
+        }
     }
 }
 
@@ -289,6 +312,17 @@ pub struct DprojMetadataResponse {
     pub active_configuration: String,
     /// The effective active platform (project override → dproj default).
     pub active_platform: String,
+}
+
+/// Request params for `debug/target` – asks the server to describe a
+/// project's debug target (see `ddk_core::debug_target`). Mirrors
+/// `cmd_debug_target`: `project` is an id, a name or a project-file path,
+/// `None` for the active project; `compiler` only matters for an ad-hoc path.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct DebugTargetParams {
+    pub project: Option<String>,
+    pub compiler: Option<String>,
 }
 
 /// Request params for `delphilsp/generate` – asks the server to (re)write the
