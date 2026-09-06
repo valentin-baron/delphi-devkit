@@ -392,6 +392,33 @@ fn resolve_project_not_found() {
 }
 
 #[test]
+fn resolve_project_prefers_the_linked_one_over_an_orphan_namesake() {
+    let mut data = make_data();
+    // An orphan (linked to no workspace) left behind with the same name and
+    // file as the linked "Alpha": not a real ambiguity, the linked one wins.
+    data.projects[0].dproj = Some(r"C:\src\Alpha.dproj".into());
+    data.projects.push(Project {
+        id: 30,
+        name: "Alpha".into(),
+        directory: r"C:\src".into(),
+        dproj: Some(r"C:\src\Alpha.dproj".into()),
+        ..Default::default()
+    });
+    match resolve_project_reference(&data, "alpha") {
+        ProjectResolution::Single(id) => assert_eq!(id, 1),
+        other => panic!("expected Single(1), got {other:?}"),
+    }
+    match resolve_project_by_path(&data, r"C:\src\Alpha.dproj") {
+        ProjectResolution::Single(id) => assert_eq!(id, 1),
+        other => panic!("expected Single(1), got {other:?}"),
+    }
+    // Two orphans are still an ambiguity: nothing to prefer.
+    data.projects.push(Project { id: 31, name: "Alpha".into(), directory: "d".into(), ..Default::default() });
+    data.workspaces[0].project_links.retain(|link| link.project_id != 1);
+    assert!(matches!(resolve_project_reference(&data, "alpha"), ProjectResolution::Ambiguous(_)));
+}
+
+#[test]
 fn resolve_project_by_path_unique() {
     let mut data = make_data();
     data.projects[0].dproj = Some(r"C:\src\be\D12\be.dproj".into());

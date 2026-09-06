@@ -595,10 +595,29 @@ pub fn resolve_project_reference(data: &ProjectsData, reference: &str) -> Projec
     } else {
         exact
     };
+    resolution_of(data, chosen)
+}
+
+/// Turns the matching projects into a resolution. Several matches are an
+/// ambiguity only when more than one of them is actually usable: a project
+/// linked to no workspace or group project (an orphan left behind by a
+/// removed workspace, or a re-added file) cannot be compiled or described
+/// with its own compiler, so when exactly one candidate is linked, that one
+/// wins instead of the user being asked to pick an id.
+fn resolution_of(data: &ProjectsData, chosen: Vec<&Project>) -> ProjectResolution {
     match chosen.len() {
         0 => ProjectResolution::NotFound,
         1 => ProjectResolution::Single(chosen[0].id),
-        _ => ProjectResolution::Ambiguous(chosen.iter().map(|p| project_ref(data, p)).collect()),
+        _ => {
+            let linked: Vec<&&Project> = chosen
+                .iter()
+                .filter(|p| find_project_link_id(data, p.id).is_some())
+                .collect();
+            if linked.len() == 1 {
+                return ProjectResolution::Single(linked[0].id);
+            }
+            ProjectResolution::Ambiguous(chosen.iter().map(|p| project_ref(data, p)).collect())
+        }
     }
 }
 
@@ -620,11 +639,7 @@ pub fn resolve_project_by_path(data: &ProjectsData, path: &str) -> ProjectResolu
         .iter()
         .filter(|p| owns(&p.dproj) || owns(&p.dpr) || owns(&p.dpk))
         .collect();
-    match chosen.len() {
-        0 => ProjectResolution::NotFound,
-        1 => ProjectResolution::Single(chosen[0].id),
-        _ => ProjectResolution::Ambiguous(chosen.iter().map(|p| project_ref(data, p)).collect()),
-    }
+    resolution_of(data, chosen)
 }
 
 /// Resolve a user-supplied compiler reference to a concrete configuration key.
