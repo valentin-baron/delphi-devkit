@@ -19,15 +19,15 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::projects::MacroMap;
+use crate::projects::{IdeEnvironment, MacroMap};
 use crate::utils::{dir_to_file_uri, path_to_file_uri, trim_trailing_separator};
 
-mod registry;
-pub use registry::IdeLibrarySettings;
+pub mod registry;
+pub use registry::{IdeLibrarySettings, IdeRegistryRoot};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -347,35 +347,10 @@ pub fn generate(request: &GenerationRequest) -> Result<DelphiLspConfigResult> {
     let mut warnings: Vec<String> = Vec::new();
 
     let installation = &request.installation_path;
-    let rsvars_path = installation.join("bin").join("rsvars.bat");
-    if !rsvars_path.exists() {
-        bail!("rsvars.bat not found in compiler installation: {}", rsvars_path.display());
-    }
-    let rsvars = dproj_rs::rsvars::parse_rsvars_file(&rsvars_path)
-        .with_context(|| format!("Failed to parse {}", rsvars_path.display()))?;
-
     let bds_version = request.bds_version.clone();
 
     // ── Build the macro map ────────────────────────────────────────────────
-    let mut macros = MacroMap::new();
-    macros.extend(rsvars);
-    // `rsvars.bat` deliberately blanks PLATFORM; the IDE's library paths use it.
-    macros.remove("PLATFORM");
-    let bds = macros
-        .get("BDS")
-        .cloned()
-        .unwrap_or_else(|| installation.to_string_lossy().to_string());
-    macros.set_default("BDS", bds.clone());
-    macros.set_default("BDSLIB", format!("{bds}\\lib"));
-    macros.set_default("BDSINCLUDE", format!("{bds}\\include"));
-    if let Some(user_dir) = bds_user_dir(&bds_version) {
-        macros.set_default("BDSUSERDIR", user_dir);
-    }
-    if let Some(common_dir) = bds_common_dir(&bds_version) {
-        macros.set_default("BDSCOMMONDIR", common_dir);
-    }
-    // The IDE's own "Environment Variables" overrides win over rsvars/process env.
-    macros.extend(registry::read_ide_environment_variables(&bds_version));
+    let mut macros = IdeEnvironment::read(installation, &bds_version)?.macros(installation);
 
     // ── Resolve configuration / platform ───────────────────────────────────
     let dproj = match &request.dproj_path {
@@ -660,45 +635,6 @@ fn collect_required_packages(dproj: &dproj_rs::Dproj) -> Vec<String> {
                 .flatten()
         })
         .collect()
-}
-
-/// The IDE data folder name under a Documents root: `RAD Studio` for the
-/// D2007–D2010 era (BDS 5.0–7.0), `Embarcadero\Studio` from XE (8.0) on.
-fn bds_documents_subpath(bds_version: &str) -> PathBuf {
-    let major: usize = bds_version.split('.').next().and_then(|n| n.parse().ok()).unwrap_or(0);
-    if major <= 7 {
-        PathBuf::from("RAD Studio")
-    } else {
-        Path::new("Embarcadero").join("Studio")
-    }
-}
-
-/// `<Documents>\Embarcadero\Studio\<version>` (or `<Documents>\RAD Studio\<version>`
-/// for pre-XE versions) — the IDE's `$(BDSUSERDIR)`.
-fn bds_user_dir(bds_version: &str) -> Option<String> {
-    let documents = dirs::document_dir()?;
-    Some(
-        documents
-            .join(bds_documents_subpath(bds_version))
-            .join(bds_version)
-            .to_string_lossy()
-            .to_string(),
-    )
-}
-
-/// The Public Documents counterpart of [`bds_user_dir`] — the IDE's
-/// `$(BDSCOMMONDIR)`. Only a fallback: `rsvars.bat` normally defines the
-/// variable and wins.
-fn bds_common_dir(bds_version: &str) -> Option<String> {
-    let public = std::env::var_os("PUBLIC")?;
-    Some(
-        Path::new(&public)
-            .join("Documents")
-            .join(bds_documents_subpath(bds_version))
-            .join(bds_version)
-            .to_string_lossy()
-            .to_string(),
-    )
 }
 
 /// dcc DLL file-name prefix (and optional suffix) for a target platform.

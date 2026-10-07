@@ -1,0 +1,28 @@
+{
+  "project_id": 7,
+  "project": "Demo",
+  "project_file": "C:/src/Demo.dproj",
+  "main_source": "C:/src/Demo.dpk",
+  "kind": "package",
+  "executable": "C:/host/Host.exe",
+  "host_application": "C:/host/Host.exe",
+  "compiler": "Delphi 12.0 Athens",
+  "config": "Debug",
+  "platform": "Win64",
+  "bitness": 64,
+  "symbols": { "map": "C:/host/Host.map", "rsm": null },
+  "source_root": "C:/src",
+  "source_search_paths": ["C:/src"],
+  "modules": [
+    {
+      "name": "Demo290.bpl",
+      "binary": "C:/bpl/Demo290.bpl",
+      "map": "C:/bpl/Demo290.map",
+      "rsm": "C:/bpl/Demo290.rsm",
+      "dcp": null
+    }
+  ],
+  "args": ["-a"],
+  "warnings": ["No Demo.dcp found"],
+  "notes": ["No IDE Browsing Path is configured"]
+}

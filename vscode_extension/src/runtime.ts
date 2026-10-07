@@ -9,6 +9,7 @@ import { randomUUID, UUID } from 'crypto';
 import { Option } from './types';
 import { McpServerFeature } from './mcp/server';
 import { DelphiLspFeature } from './delphilsp/feature';
+import { DebugFeature } from './debug/feature';
 
 /**
  * Runtime class to manage workspace state and global variables.
@@ -30,6 +31,7 @@ export abstract class Runtime {
   public static runOutputChannel: OutputChannel;
   public static mcp: McpServerFeature;
   public static delphilsp: DelphiLspFeature;
+  public static debug: DebugFeature;
 
   static async initialize(context: ExtensionContext) {
     this.extension = context;
@@ -45,6 +47,10 @@ export abstract class Runtime {
     await this.projects.initialize();
     this.dfm = new DfmFeature();
     await this.dfm.initialize();
+    // Debugging through whichever extension contributes the `delphi` debug
+    // type; inert (no commands, no menu items) until one is installed.
+    this.debug = new DebugFeature();
+    await this.debug.initialize();
     // Register the MCP server (spawns ddk-mcp-server as a STDIO child process
     // when VS Code or another MCP client requests it).
     this.mcp = new McpServerFeature();
@@ -97,8 +103,8 @@ export abstract class Runtime {
     return [...workspaceLinks, ...groupProjectLinks];
   }
 
-  public static async compileProjectLink(link: Entities.ProjectLink, recreate: boolean = false): Promise<boolean> {
-    return await this.client.compileProject(recreate, link.project_id, link.id);
+  public static async compileProjectLink(link: Entities.ProjectLink, recreate: boolean = false, debugInfo: boolean = false): Promise<boolean> {
+    return await this.client.compileProject(recreate, link.project_id, link.id, debugInfo);
   }
 
   public static setContext(name: string, value: any): Thenable<void> {

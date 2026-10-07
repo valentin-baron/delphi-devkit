@@ -66,6 +66,20 @@ enum Commands {
         #[arg(long)]
         rebuild: bool,
 
+        /// Produce the full debug artefact set a debugger needs (optimizations
+        /// off, TD32 debug info in the binary, .rsm remote-debug symbols,
+        /// detailed .map) regardless of the build configuration's own settings.
+        /// The dproj is never modified. For a .dproj this passes the MSBuild
+        /// properties DCC_Optimize=false, DCC_DebugInformation=2,
+        /// DCC_LocalDebugSymbols=true, DCC_SymbolReferenceInfo=2,
+        /// DCC_GenerateStackFrames=true, DCC_DebugInfoInExe=true,
+        /// DCC_RemoteDebug=true and DCC_MapFile=3, ahead of anything after
+        /// `--`, so a /p: override of yours still wins. A bare .dpr/.dpk gets
+        /// the dcc switches -$O- -$D+ -$L+ -$Y+ -V -VN -VR -GD, plus -B so
+        /// every unit is rebuilt with them.
+        #[arg(long)]
+        debug_info: bool,
+
         /// Project to compile: a numeric ID or a project name. A name that
         /// matches several projects lists the candidates instead of compiling.
         #[arg(long, short)]
@@ -171,6 +185,48 @@ enum Commands {
         /// IDE-generated file).
         #[arg(long, short = 'o')]
         out: Option<String>,
+    },
+
+    /// Describe a project's debug target: the executable to launch or attach
+    /// to (the program, or the Host Application of a package/DLL), its
+    /// .map/.rsm, the project's own .bpl/.dll with their symbols, the source
+    /// search paths (dproj + IDE library/browsing paths), the run arguments,
+    /// warnings about what will degrade or break a session, and notes about
+    /// what DDK decided or left out. Every path but the executable's is a
+    /// file that exists; an empty warnings list means ready to debug.
+    /// Debugger-agnostic: a debugger integration maps it onto its own
+    /// launch configuration.
+    ///
+    /// TARGET may be a project ID, a project name, or a path to a
+    /// .dproj/.dpr/.dpk. A path owned by no workspace is described ad-hoc;
+    /// pick its compiler with --compiler.
+    #[command(name = "debug-target", visible_alias = "debug_target")]
+    DebugTarget {
+        /// What to describe: a project ID, a project name, or a path to a
+        /// .dproj/.dpr/.dpk. Omit to use the active project.
+        target: Option<String>,
+
+        /// Compiler configuration for a project that has none of its own —
+        /// a file TARGET that belongs to no workspace, or a managed project
+        /// linked to no workspace or group project: an exact key (e.g.
+        /// "12.0") or product name (e.g. "Delphi 12"). Defaults to the
+        /// newest installed compiler. A linked project builds with its
+        /// workspace's compiler; the option is then ignored, and the target
+        /// notes it.
+        #[arg(long, short = 'c')]
+        compiler: Option<String>,
+
+        /// Build configuration to describe (e.g. "Debug", "Release") instead
+        /// of the project's active one — the same override `compile` takes.
+        /// The executable, the Host Application and the run parameters are
+        /// discovered for that build.
+        #[arg(long)]
+        config: Option<String>,
+
+        /// Target platform to describe (e.g. "Win32", "Win64") instead of
+        /// the project's active one.
+        #[arg(long)]
+        platform: Option<String>,
     },
 
     /// Show environment info for the active project.
@@ -311,6 +367,7 @@ async fn main() -> Result<()> {
         Commands::Compile {
             target,
             rebuild,
+            debug_info,
             project,
             compiler,
             config,
@@ -352,12 +409,12 @@ async fn main() -> Result<()> {
                 let result = match file_path {
                     Some(p) => {
                         commands::cmd_compile_file(
-                            p, compiler, config, platform, rebuild, filter, msbuild_args,
+                            p, compiler, config, platform, rebuild, debug_info, filter, msbuild_args,
                         )
                         .await?
                     }
                     _ => {
-                        commands::cmd_compile_ref(rebuild, project_ref, filter, msbuild_args).await?
+                        commands::cmd_compile_ref(rebuild, debug_info, project_ref, filter, msbuild_args).await?
                     }
                 };
                 match result {
@@ -380,14 +437,14 @@ async fn main() -> Result<()> {
                 let result = match file_path {
                     Some(p) => {
                         commands::cmd_compile_file_with_progress(
-                            p, compiler, config, platform, rebuild, filter, msbuild_args,
+                            p, compiler, config, platform, rebuild, debug_info, filter, msbuild_args,
                             Some(on_progress),
                         )
                         .await?
                     }
                     _ => {
                         commands::cmd_compile_ref_with_progress(
-                            rebuild, project_ref, filter, msbuild_args, Some(on_progress),
+                            rebuild, debug_info, project_ref, filter, msbuild_args, Some(on_progress),
                         )
                         .await?
                     }
@@ -459,6 +516,26 @@ async fn main() -> Result<()> {
                     }
                 }
                 DelphiLspOrAmbiguity::Ambiguity(a) => {
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&a)?);
+                    } else {
+                        print!("{a}");
+                    }
+                }
+            }
+        }
+
+        Commands::DebugTarget { target, compiler, config, platform } => {
+            use commands::DebugTargetOrAmbiguity;
+            match commands::cmd_debug_target(target, compiler, config, platform).await? {
+                DebugTargetOrAmbiguity::Target(result) => {
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&result)?);
+                    } else {
+                        print!("{result}");
+                    }
+                }
+                DebugTargetOrAmbiguity::Ambiguity(a) => {
                     if cli.json {
                         println!("{}", serde_json::to_string_pretty(&a)?);
                     } else {

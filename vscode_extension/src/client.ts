@@ -10,6 +10,7 @@ import { existsSync } from 'fs';
 import { CompilerOutputDefinitionProvider } from './projects/compiler/language';
 import { MergedDiagnostics } from './delphilsp/mergedDiagnostics';
 import { PROJECTS } from './constants';
+import { CompileOutcome, compileOutcomeOf, DebugTarget, isDebugTarget } from './debug/contract';
 
 /**
  * The fields `UpdateProject` accepts server-side — the mirror of Rust's
@@ -122,6 +123,8 @@ export interface DelphiLspConfigResult {
     define_count: number;
     warnings: string[];
 }
+
+export type { CompileOutcome, DebugTarget } from './debug/contract';
 
 export class DDK_Client {
     private client: LanguageClient;
@@ -253,48 +256,80 @@ export class DDK_Client {
         return await Runtime.waitForEvent(changes.event_id);
     }
 
-    public async compileProject(rebuild: boolean, projectId: number, projectLinkId?: number): Promise<boolean> {
-        const event = Runtime.addEvent(0);
-        await this.client.sendRequest('projects/compile', {
+    /** `debugInfo` forces the full debug artefact set (optimizations off, TD32,
+     *  `.rsm`, detailed `.map`) whatever the build configuration says — see
+     *  `CompileProjectParams::debug_info` in `core/src/lsp_types.rs`. */
+    public async compileProject(rebuild: boolean, projectId: number, projectLinkId?: number, debugInfo: boolean = false): Promise<boolean> {
+        return await this.compile({
             type: 'Project',
             project_id: projectId,
             project_link_id: projectLinkId,
             rebuild: rebuild,
-            event_id: event,
+            debug_info: debugInfo,
         });
-        return await Runtime.waitForEvent(event);
     }
 
-    public async compileAllInWorkspace(rebuild: boolean, workspaceId: number): Promise<boolean> {
-        const event = Runtime.addEvent(0);
-        await this.client.sendRequest('projects/compile', {
+    public async compileAllInWorkspace(rebuild: boolean, workspaceId: number, debugInfo: boolean = false): Promise<boolean> {
+        return await this.compile({
             type: 'AllInWorkspace',
             workspace_id: workspaceId,
             rebuild: rebuild,
-            event_id: event,
+            debug_info: debugInfo,
         });
-        return await Runtime.waitForEvent(event);
     }
 
-    public async compileAllInGroupProject(rebuild: boolean): Promise<boolean> {
-        const event = Runtime.addEvent(0);
-        await this.client.sendRequest('projects/compile', {
+    public async compileAllInGroupProject(rebuild: boolean, debugInfo: boolean = false): Promise<boolean> {
+        return await this.compile({
             type: 'AllInGroupProject',
             rebuild: rebuild,
-            event_id: event,
+            debug_info: debugInfo,
         });
-        return await Runtime.waitForEvent(event);
     }
 
-    public async compileFromLink(rebuild: boolean, linkId: number): Promise<boolean> {
-        const event = Runtime.addEvent(0);
-        await this.client.sendRequest('projects/compile', {
+    public async compileFromLink(rebuild: boolean, linkId: number, debugInfo: boolean = false): Promise<boolean> {
+        return await this.compile({
             type: 'FromLink',
             project_link_id: linkId,
             rebuild: rebuild,
-            event_id: event
+            debug_info: debugInfo,
         });
-        return await Runtime.waitForEvent(event);
+    }
+
+    /**
+     * Compiles one project and resolves to the build's outcome — success,
+     * failure or cancellation — for a caller that acts on the difference.
+     * `undefined` when the server reported none (a `ddk-server` older than
+     * this extension).
+     */
+    public async compileProjectForOutcome(
+        rebuild: boolean, projectId: number, projectLinkId?: number, debugInfo: boolean = false
+    ): Promise<CompileOutcome | undefined> {
+        return await this.compileForOutcome({
+            type: 'Project',
+            project_id: projectId,
+            project_link_id: projectLinkId,
+            rebuild: rebuild,
+            debug_info: debugInfo,
+        });
+    }
+
+    /** Whether the build succeeded; an outcome the server did not report counts as a failure. */
+    private async compile(params: Record<string, unknown>): Promise<boolean> {
+        return (await this.compileForOutcome(params))?.success === true;
+    }
+
+    /**
+     * Runs one `projects/compile` request. The server answers only once the
+     * compiler is done, and its reply carries the outcome; the event only
+     * keeps the request's lifetime visible to `Runtime` (it cannot fail a
+     * compile: the server finishes it whatever the compiler said). The reply
+     * is checked, not trusted: see `compileOutcomeOf`.
+     */
+    private async compileForOutcome(params: Record<string, unknown>): Promise<CompileOutcome | undefined> {
+        const event = Runtime.addEvent(0);
+        const reply: unknown = await this.client.sendRequest('projects/compile', { ...params, event_id: event });
+        await Runtime.waitForEvent(event);
+        return compileOutcomeOf(reply);
     }
 
     public async cancelCompilation(): Promise<void> {
@@ -310,6 +345,19 @@ export class DDK_Client {
      *  (with a formatted candidate list as the message) when the reference is ambiguous. */
     public async generateDelphiLspConfig(project?: string, compiler?: string, out?: string): Promise<DelphiLspConfigResult> {
         return await this.client.sendRequest('delphilsp/generate', { project, compiler, out });
+    }
+
+    /** Thin wrapper over the `debug/target` custom method. `project` is a project id
+     *  (as a string), name, or path — omit to target the currently active project.
+     *  `config`/`platform` describe those instead of the project's active ones —
+     *  the same overrides `ddk debug-target` and `ddk compile` take; nothing is
+     *  persisted. Throws (with the candidate list as the message) when the
+     *  reference is ambiguous, and when the reply is not a debug target. */
+    public async debugTarget(project?: string, compiler?: string, config?: string, platform?: string): Promise<DebugTarget> {
+        const reply: unknown = await this.client.sendRequest('debug/target', { project, compiler, config, platform });
+        if (!isDebugTarget(reply))
+            throw new Error('The DDK server did not answer with a debug target (is it older than the extension?).');
+        return reply;
     }
 
     public onCompilerProgress(params: CompilerProgressParams) {

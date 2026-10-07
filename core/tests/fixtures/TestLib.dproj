@@ -1,0 +1,71 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+	<PropertyGroup>
+		<ProjectGuid>{2B3C4D5E-6F70-4A8B-9C0D-1E2F3A4B5C6E}</ProjectGuid>
+		<MainSource>TestLib.dpr</MainSource>
+		<Base>True</Base>
+		<Config Condition="'$(Config)'==''">Debug</Config>
+		<TargetedPlatforms>1</TargetedPlatforms>
+		<AppType>Library</AppType>
+		<FrameworkType>None</FrameworkType>
+		<ProjectVersion>20.3</ProjectVersion>
+		<Platform Condition="'$(Platform)'==''">Win32</Platform>
+		<ProjectName Condition="'$(ProjectName)'==''">TestLib</ProjectName>
+	</PropertyGroup>
+	<PropertyGroup Condition="'$(Config)'=='Base' or '$(Base)'!=''">
+		<Base>true</Base>
+	</PropertyGroup>
+	<PropertyGroup Condition="'$(Config)'=='Release' or '$(Cfg_1)'!=''">
+		<Cfg_1>true</Cfg_1>
+		<CfgParent>Base</CfgParent>
+		<Base>true</Base>
+	</PropertyGroup>
+	<PropertyGroup Condition="'$(Config)'=='Debug' or '$(Cfg_2)'!=''">
+		<Cfg_2>true</Cfg_2>
+		<CfgParent>Base</CfgParent>
+		<Base>true</Base>
+	</PropertyGroup>
+	<PropertyGroup Condition="'$(Base)'!=''">
+		<DCC_ExeOutput>.\out</DCC_ExeOutput>
+		<DCC_DcuOutput>.\$(Platform)\$(Config)</DCC_DcuOutput>
+		<GenDll>true</GenDll>
+		<SanitizedProjectName>TestLib</SanitizedProjectName>
+	</PropertyGroup>
+	<PropertyGroup Condition="'$(Cfg_2)'!=''">
+		<DCC_MapFile>3</DCC_MapFile>
+		<DCC_Optimize>false</DCC_Optimize>
+		<DCC_Define>DEBUG;$(DCC_Define)</DCC_Define>
+		<DCC_RemoteDebug>true</DCC_RemoteDebug>
+		<Debugger_HostApplication>$(ProjectDir)\Host.exe</Debugger_HostApplication>
+	</PropertyGroup>
+	<ItemGroup>
+		<DelphiCompile Include="$(MainSource)">
+			<MainSource>MainSource</MainSource>
+		</DelphiCompile>
+		<BuildConfiguration Include="Base">
+			<Key>Base</Key>
+		</BuildConfiguration>
+		<BuildConfiguration Include="Release">
+			<Key>Cfg_1</Key>
+			<CfgParent>Base</CfgParent>
+		</BuildConfiguration>
+		<BuildConfiguration Include="Debug">
+			<Key>Cfg_2</Key>
+			<CfgParent>Base</CfgParent>
+		</BuildConfiguration>
+	</ItemGroup>
+	<ProjectExtensions>
+		<Borland.Personality>Delphi.Personality.12</Borland.Personality>
+		<Borland.ProjectType>Library</Borland.ProjectType>
+		<BorlandProject>
+			<Delphi.Personality>
+				<Source>
+					<Source Name="MainSource">TestLib.dpr</Source>
+				</Source>
+			</Delphi.Personality>
+			<Platforms>
+				<Platform value="Win32">True</Platform>
+			</Platforms>
+		</BorlandProject>
+		<ProjectFileVersion>12</ProjectFileVersion>
+	</ProjectExtensions>
+</Project>

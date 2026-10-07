@@ -7,3 +7,4 @@ vscode_extension/LICENSE
 *.vsix
 .history
 target
+vscode_extension/out

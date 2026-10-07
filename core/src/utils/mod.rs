@@ -18,16 +18,9 @@ pub fn bds_environment_overrides(bds_major_version: usize) -> Vec<(String, Strin
     use winreg::RegKey;
     use winreg::enums::HKEY_CURRENT_USER;
 
-    // The registry root moved as the product changed hands: Borland up to
-    // BDS 5.0 (Delphi 2007), CodeGear for 6.0/7.0 (2009/2010), Embarcadero
-    // from 8.0 (XE) onwards.
-    let vendor = match bds_major_version {
-        0..=5 => "Borland",
-        6..=7 => "CodeGear",
-        _ => "Embarcadero",
-    };
+    let root = crate::delphilsp::IdeRegistryRoot::for_bds_version(bds_major_version);
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let key_path = format!(r"SOFTWARE\{vendor}\BDS\{bds_major_version}.0\Environment Variables");
+    let key_path = format!(r"{}\Environment Variables", root.key_path());
     let Ok(env_key) = hkcu.open_subkey(key_path) else {
         return Vec::new();
     };

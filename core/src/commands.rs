@@ -1095,13 +1095,17 @@ pub enum CompileOrAmbiguity {
 /// Compiles a project. If `project_id` is `Some`, that project is compiled
 /// directly **without** changing the active project in state; otherwise the
 /// currently active project is compiled.
+/// `debug_info` forces the full debug artefact set (optimizations off, TD32
+/// debug info, `.rsm`, detailed `.map`) regardless of what the selected build
+/// configuration says, without touching the dproj — what a debugger needs.
 /// Collects compiler broadcast output and returns it as a `CompileOutput`.
 pub async fn cmd_compile(
     rebuild: bool,
+    debug_info: bool,
     project_id: Option<usize>,
     filter: CompileFilterOptions,
 ) -> Result<CompileOutput> {
-    cmd_compile_with_progress(rebuild, project_id, filter, Vec::new(), None).await
+    cmd_compile_with_progress(rebuild, debug_info, project_id, filter, Vec::new(), None).await
 }
 
 /// Compiles a project selected by a reference (project name or numeric id).
@@ -1112,17 +1116,19 @@ pub async fn cmd_compile(
 /// a reference matching nothing is an error.
 pub async fn cmd_compile_ref(
     rebuild: bool,
+    debug_info: bool,
     project: Option<String>,
     filter: CompileFilterOptions,
     extra_msbuild_args: Vec<String>,
 ) -> Result<CompileOrAmbiguity> {
-    cmd_compile_ref_with_progress(rebuild, project, filter, extra_msbuild_args, None).await
+    cmd_compile_ref_with_progress(rebuild, debug_info, project, filter, extra_msbuild_args, None).await
 }
 
 /// Like [`cmd_compile_ref`] but streams each compiler output line to
 /// `on_progress` as it arrives (used by the CLI for live output).
 pub async fn cmd_compile_ref_with_progress(
     rebuild: bool,
+    debug_info: bool,
     project: Option<String>,
     filter: CompileFilterOptions,
     extra_msbuild_args: Vec<String>,
@@ -1147,7 +1153,7 @@ pub async fn cmd_compile_ref_with_progress(
         }
     };
     let output =
-        cmd_compile_with_progress(rebuild, project_id, filter, extra_msbuild_args, on_progress)
+        cmd_compile_with_progress(rebuild, debug_info, project_id, filter, extra_msbuild_args, on_progress)
             .await?;
     Ok(CompileOrAmbiguity::Output(output))
 }
@@ -1156,6 +1162,7 @@ pub async fn cmd_compile_ref_with_progress(
 /// compiler output line as it arrives.
 pub async fn cmd_compile_with_progress(
     rebuild: bool,
+    debug_info: bool,
     project_id: Option<usize>,
     filter: CompileFilterOptions,
     extra_msbuild_args: Vec<String>,
@@ -1186,6 +1193,7 @@ pub async fn cmd_compile_with_progress(
         project_id: resolved_id,
         project_link_id: Some(link_id),
         rebuild,
+        debug_info,
         event_id: "cmd-compile".to_string(),
     };
 
@@ -1217,6 +1225,7 @@ pub async fn cmd_compile_file(
     config: Option<String>,
     platform: Option<String>,
     rebuild: bool,
+    debug_info: bool,
     filter: CompileFilterOptions,
     extra_msbuild_args: Vec<String>,
 ) -> Result<CompileOrAmbiguity> {
@@ -1226,6 +1235,7 @@ pub async fn cmd_compile_file(
         config,
         platform,
         rebuild,
+        debug_info,
         filter,
         extra_msbuild_args,
         None,
@@ -1241,6 +1251,7 @@ pub async fn cmd_compile_file_with_progress(
     config: Option<String>,
     platform: Option<String>,
     rebuild: bool,
+    debug_info: bool,
     filter: CompileFilterOptions,
     extra_msbuild_args: Vec<String>,
     on_progress: Option<CompileProgressCallback>,
@@ -1262,33 +1273,14 @@ pub async fn cmd_compile_file_with_progress(
     };
     if let Some(id) = managed_id {
         let output =
-            cmd_compile_with_progress(rebuild, Some(id), filter, extra_msbuild_args, on_progress)
+            cmd_compile_with_progress(rebuild, debug_info, Some(id), filter, extra_msbuild_args, on_progress)
                 .await?;
         return Ok(CompileOrAmbiguity::Output(output));
     }
 
     // Ad-hoc: the file is not part of any managed project.
-    if !std::path::Path::new(&file_path).exists() {
-        bail!("File not found: {file_path}");
-    }
-    let compiler_key = resolve_compiler_key(compiler).await?;
-
-    // Assemble the ephemeral, non-persisted project state.
-    let mut data = ProjectsData::default();
-    data.new_workspace(&"ad-hoc".to_string(), &compiler_key).await?;
-    let workspace_id = data.workspaces[0].id;
-    let ide_env = data.ide_environment_for_workspace(workspace_id).await;
-    data.new_project(&file_path, workspace_id, &ide_env)?;
-    let project = data
-        .projects
-        .last_mut()
-        .ok_or_else(|| anyhow::anyhow!("Failed to create ad-hoc project from: {file_path}"))?;
-    if config.is_some() {
-        project.active_configuration = config;
-    }
-    if platform.is_some() {
-        project.active_platform = platform;
-    }
+    let data = adhoc_project_data(&file_path, compiler, config, platform).await?;
+    let project = data.projects.last().expect("adhoc_project_data holds the project");
     let project_id = project.id;
     let project_name = project.name.clone();
     let link_id = find_project_link_id(&data, project_id)
@@ -1298,6 +1290,7 @@ pub async fn cmd_compile_file_with_progress(
         project_id,
         project_link_id: Some(link_id),
         rebuild,
+        debug_info,
         event_id: "cmd-compile-file".to_string(),
     };
 
@@ -1468,7 +1461,7 @@ pub enum RunOrAmbiguity {
 /// Fuses the dproj's `Debugger_RunParams` with the DDK "Start Parameters"
 /// override: both contribute, base first, joined by a space — neither
 /// silently discards the other. Blank/absent values contribute nothing.
-fn fuse_run_params(base: Option<String>, extra: Option<String>) -> Option<String> {
+pub(crate) fn fuse_run_params(base: Option<String>, extra: Option<String>) -> Option<String> {
     let base = base.filter(|s| !s.trim().is_empty());
     let extra = extra.filter(|s| !s.trim().is_empty());
     match (base, extra) {
@@ -1481,7 +1474,7 @@ fn fuse_run_params(base: Option<String>, extra: Option<String>) -> Option<String
 
 /// Splits a start-parameters string into argv entries, honoring
 /// double-quoted segments (e.g. `-flag "value with spaces"`).
-fn split_run_args(args: &str) -> Vec<String> {
+pub(crate) fn split_run_args(args: &str) -> Vec<String> {
     let re = Regex::new(r#""([^"]*)"|(\S+)"#).unwrap();
     re.captures_iter(args)
         .map(|c| c.get(1).or_else(|| c.get(2)).unwrap().as_str().to_string())
@@ -1625,6 +1618,167 @@ pub async fn cmd_run_path(path: String, args: Option<String>) -> Result<RunOrAmb
 
 /// Whether `value` names a Delphi project source (`.dproj`/`.dpr`/`.dpk`),
 /// case-insensitively and without allocating.
+// ─── Debug target ────────────────────────────────────────────────────────────
+
+/// Result of a debug-target request: the target, or the candidate list when
+/// the reference was ambiguous (mirroring the compile/run commands).
+#[derive(Debug, Clone)]
+pub enum DebugTargetOrAmbiguity {
+    Target(crate::debug_target::DebugTarget),
+    Ambiguity(AmbiguousProjects),
+}
+
+/// Describes the debug target of a project — see [`crate::debug_target`] —
+/// selected by reference: a numeric id, a project name, or a path to a
+/// `.dproj`/`.dpr`/`.dpk`; `None` targets the active project. A path owned by
+/// no managed project is described ad-hoc (nothing is persisted), building
+/// with `compiler` (an exact key or product name; default: the newest
+/// installed). `config`/`platform` describe that configuration and platform
+/// instead of the project's active ones — the same overrides `compile`
+/// takes, so the artefacts described are the ones such a build produces;
+/// nothing is persisted either way. A reference matching several projects
+/// returns the candidate list instead.
+pub async fn cmd_debug_target(
+    reference: Option<String>,
+    compiler: Option<String>,
+    config: Option<String>,
+    platform: Option<String>,
+) -> Result<DebugTargetOrAmbiguity> {
+    let data = PROJECTS_DATA.read().await;
+    let project_id = match &reference {
+        None => match data.active_project_id {
+            Some(id) => id,
+            _ => bail!("No active project selected."),
+        },
+        Some(reference) if is_delphi_project_path(reference) => match resolve_project_by_path(&data, reference) {
+            ProjectResolution::Single(id) => id,
+            ProjectResolution::Ambiguous(matches) => {
+                return Ok(DebugTargetOrAmbiguity::Ambiguity(AmbiguousProjects {
+                    reference: reference.clone(),
+                    matches,
+                }));
+            }
+            ProjectResolution::NotFound => {
+                drop(data);
+                let target = adhoc_debug_target(reference, compiler, config, platform).await?;
+                return Ok(DebugTargetOrAmbiguity::Target(target));
+            }
+        },
+        Some(reference) => match resolve_project_reference(&data, reference) {
+            ProjectResolution::Single(id) => id,
+            ProjectResolution::Ambiguous(matches) => {
+                return Ok(DebugTargetOrAmbiguity::Ambiguity(AmbiguousProjects {
+                    reference: reference.clone(),
+                    matches,
+                }));
+            }
+            ProjectResolution::NotFound => {
+                bail!("No project matches \"{reference}\". Use `list` to see available projects.")
+            }
+        },
+    };
+    let project = match data.get_project(project_id) {
+        Some(p) => p,
+        _ => bail!("Project with ID {project_id} not found."),
+    };
+    // An orphan project (linked to no workspace or group project) has no
+    // compiler of its own; describing it is read-only, so fall back to the
+    // requested or newest compiler and say so rather than refusing. A
+    // linked project builds with its workspace's compiler, whatever was
+    // requested — which is said too, since the argument had no effect.
+    let (compiler, compiler_note) = match data.compiler_for_project(project_id).await {
+        Some(own) => {
+            let note = compiler.map(|requested| {
+                format!(
+                    "`compiler` ({requested}) was ignored: project \"{}\" builds with {}, the compiler of the \
+                     workspace or group project it belongs to.",
+                    project.name, own.product_name
+                )
+            });
+            (own, note)
+        }
+        _ => {
+            let key = resolve_compiler_key(compiler).await?;
+            let compilers = COMPILER_CONFIGURATIONS.read().await;
+            let fallback = compilers
+                .get(&key)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Compiler configuration \"{key}\" not found."))?;
+            let note = format!(
+                "Project \"{}\" is linked to no workspace or group project; described with {} ({key}).",
+                project.name, fallback.product_name
+            );
+            (fallback, Some(note))
+        }
+    };
+    let (described, discovery_warnings) =
+        crate::debug_target::project_to_describe(project, config, platform, &compiler.ide_environment_overrides());
+    let mut target = crate::debug_target::build_debug_target(&described, &compiler)?;
+    target.warnings.splice(0..0, discovery_warnings);
+    target.notes.splice(0..0, compiler_note);
+    Ok(DebugTargetOrAmbiguity::Target(target))
+}
+
+/// The ad-hoc counterpart of [`cmd_debug_target`] for a project file that
+/// belongs to no workspace: the same ephemeral project [`cmd_compile_file`]
+/// builds, described with its compiler.
+async fn adhoc_debug_target(
+    file_path: &str,
+    compiler: Option<String>,
+    config: Option<String>,
+    platform: Option<String>,
+) -> Result<crate::debug_target::DebugTarget> {
+    let data = adhoc_project_data(file_path, compiler, config, platform).await?;
+    let project = data.projects.last().expect("adhoc_project_data holds the project");
+    let compiler = data
+        .compiler_for_project(project.id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("Ad-hoc project link was not created."))?;
+    let mut target = crate::debug_target::build_debug_target(project, &compiler)?;
+    target.project_id = None;
+    Ok(target)
+}
+
+/// The ephemeral, never-persisted project state behind every ad-hoc
+/// command on a project file that belongs to no workspace: one "ad-hoc"
+/// workspace on `compiler` (an exact key or product name; default: the
+/// newest installed) holding the file as its only project — the last entry
+/// of `projects` — with `config`/`platform` overriding the dproj's active
+/// ones where given, and the project's paths discovered for them.
+async fn adhoc_project_data(
+    file_path: &str,
+    compiler: Option<String>,
+    config: Option<String>,
+    platform: Option<String>,
+) -> Result<ProjectsData> {
+    if !std::path::Path::new(file_path).exists() {
+        bail!("File not found: {file_path}");
+    }
+    let compiler_key = resolve_compiler_key(compiler).await?;
+    let mut data = ProjectsData::default();
+    data.new_workspace(&"ad-hoc".to_string(), &compiler_key).await?;
+    let workspace_id = data.workspaces[0].id;
+    let ide_env = data.ide_environment_for_workspace(workspace_id).await;
+    data.new_project(&file_path.to_string(), workspace_id, &ide_env)?;
+    let project = data
+        .projects
+        .last_mut()
+        .ok_or_else(|| anyhow::anyhow!("Failed to create ad-hoc project from: {file_path}"))?;
+    if config.is_none() && platform.is_none() {
+        return Ok(data);
+    }
+    if config.is_some() {
+        project.active_configuration = config;
+    }
+    if platform.is_some() {
+        project.active_platform = platform;
+    }
+    // `new_project` discovered the paths of the dproj's default build; the
+    // executable and the host of the requested one are what is wanted.
+    project.discover_paths(&ide_env)?;
+    Ok(data)
+}
+
 fn is_delphi_project_path(value: &str) -> bool {
     has_extension(value, &["dproj", "dpr", "dpk"])
 }

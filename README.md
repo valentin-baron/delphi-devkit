@@ -56,6 +56,7 @@ ddk compile                            # Compile the active project
 ddk compile <ID|NAME>                  # Compile a project by ID or name (= -p; lists candidates if ambiguous)
 ddk compile -p <ID|NAME>               # Same, explicit flag form
 ddk compile --rebuild -p <ID>          # Rebuild a specific project by ID
+ddk compile --debug-info <ID|NAME>     # Compile with the full debug artefact set (.map/.rsm/TD32, optimizations off)
 ddk compile <PATH>                     # Compile a .dproj/.dpr/.dpk (uses the owning project if managed, else ad-hoc)
 ddk compile <PATH> -c "Delphi 12"      # ...choosing the compiler (key or product name)
 ddk compile <PATH> --config Release --platform Win64   # ...with build overrides
@@ -73,6 +74,9 @@ ddk delphilsp-config                   # Write the active project's .delphilsp.j
 ddk delphilsp-config <ID|NAME|PATH>    # ...for a specific project (lists candidates if ambiguous)
 ddk delphilsp-config <PATH> -c "Delphi 12"   # ...choosing the compiler for an unmanaged path
 ddk delphilsp-config <PATH> -o <FILE>  # ...writing somewhere else instead of next to the project
+ddk debug-target                       # Describe the active project's debug target (exe/host, symbols, sources, args)
+ddk debug-target <ID|NAME|PATH> --json # ...for a specific project, as JSON for a debugger integration
+ddk debug-target <ID|NAME> --config Release --platform Win64  # ...as that configuration/platform would build it
 ddk env                                # Show active project & compiler info
 ddk info                               # Print the DDK README
 ddk --json <command>                   # Output as JSON
@@ -93,6 +97,22 @@ appended after DDK's own `/p:Config`/`/p:Platform` args, so a `/p:` override
 here wins (MSBuild takes the last value). They have no effect on a bare
 `.dpr`/`.dpk` target, which is compiled with the command-line compiler (`dcc`)
 rather than MSBuild — DDK prints a note when they are ignored.
+
+`ddk compile --debug-info` (MCP: `debug_info: true`; VS Code: the *Compile for
+Debugging* actions) forces the full debug artefact set a debugger needs —
+optimizations off, TD32 debug info in the binary, the `.rsm` remote-debug
+symbols and a detailed `.map` — regardless of what the selected build
+configuration says, so a Release build can be debugged without editing the
+project; the dproj is never modified. For a `.dproj` the flag passes exactly
+these MSBuild global properties: `DCC_Optimize=false`,
+`DCC_DebugInformation=2`, `DCC_LocalDebugSymbols=true`,
+`DCC_SymbolReferenceInfo=2`, `DCC_GenerateStackFrames=true`,
+`DCC_DebugInfoInExe=true`, `DCC_RemoteDebug=true`, `DCC_MapFile=3`. They go
+*before* anything passed after `--`, so a `/p:DCC_*` override of yours still
+wins. A bare `.dpr`/`.dpk` gets the `dcc` switches `-$O- -$D+ -$L+ -$Y+ -V -VN
+-VR -GD`, plus `-B` so every unit is rebuilt with them (the MSBuild path cleans
+first for the same reason: an up-to-date DCU from a Release build would
+otherwise be reused as is).
 
 `ddk compile --json` (and the MCP compile tools) return a fully machine-coded
 result: structured header fields (`project`, `project_path`, `compiler`,
@@ -251,6 +271,85 @@ Because the output channel cannot forward keystrokes, a captured program's
 hanging invisibly. Run such a program from a terminal, or disable
 `ddk.projects.runInOutputChannel`.
 
+`ddk debug-target` describes what debugging a project means, independently of
+any particular debugger: the executable to launch or attach to (the program
+itself, or the **Host Application** that loads a package or a DLL), the
+`.map`/`.rsm` symbol files next to it, the project's own `.bpl`/`.dll` module
+with its symbols and `.dcp`, the source search paths (the project directory,
+the dproj's unit and include paths, the IDE's **Library Path** and **Browsing
+Path** for the platform, the compiler's `source` tree — macros expanded
+through `rsvars.bat` and the IDE's environment-variable overrides), the run
+arguments exactly as `Run` passes them, and config/platform/bitness. Nothing
+is written or compiled.
+
+Two rules make the answer safe to act on:
+
+* **A path in it is a file that was found.** `symbols.map`/`symbols.rsm`, and
+  a module's `binary`, `map`, `rsm` and `dcp`, are `null` when the file is not
+  on disk — or is there but cannot belong to the binary: empty, or written by
+  another build (more than five minutes apart from it, either way). The one
+  exception is `executable`, which names the program even before its first
+  build. Search path entries that do not exist are left out.
+* **`warnings` are problems, `notes` are information.** A warning means the
+  session will be degraded or will not work: a missing executable or module,
+  missing, empty or stale symbols, a platform the project does not enable or
+  Windows cannot debug, a value depending on a `$(NAME)` nothing defines, an
+  unreadable dproj or `rsvars.bat`, a different copy of the package sitting
+  in the host's directory. A note explains what DDK decided or left out
+  without harm: the compiler an unlinked project is described with, an IDE
+  path that is not configured, search path entries that do not exist. An
+  empty `warnings` list means ready to debug.
+
+A package or a DLL is named after the project's main source plus its
+`LIBSUFFIX` — the dproj's `DllSuffix` (`$(Auto)` being the compiler's package
+version), else the `{$LIBSUFFIX}` the `.dpk` declares for this compiler and
+platform, conditional directives evaluated — and looked up by that exact name
+in, in order: the dproj's `DCC_BplOutput`, the IDE's *Package DPL Output*,
+`$(BDSCOMMONDIR)\Bpl\<Platform>` (and `$(BDSCOMMONDIR)\Bpl` for Win32, where
+Win32 packages land), the project's `.\<Platform>\<Config>`, and the host's
+directory. The `.dcp` follows the same order through `DCC_DcpOutput`, *Package
+DCP Output* and `$(BDSCOMMONDIR)\Dcp`, ending next to the `.bpl`.
+
+The target resolves like `ddk compile`: an ID, a name, or a path (ad-hoc when
+the path belongs to no workspace). `-c` picks the compiler of a project that
+has none of its own — an ad-hoc path, or a managed project linked to no
+workspace; a linked project builds with its workspace's compiler, and the
+target notes that the option was ignored. `--config`/`--platform` describe
+that configuration and platform instead of the project's active ones: the
+executable, the Host Application and the run parameters are discovered anew
+for that build, so what is described is what such a build produces, never the
+active build's files under another name. `--json` is the form a debugger
+integration consumes: a debug adapter's extension maps it onto its own launch
+attributes, so a hand-written launch configuration shrinks to a project
+reference and stays correct when the project's paths change. The same is
+exposed to AI tooling via the MCP `delphi_get_debug_target` tool and to the VS
+Code extension via the `debug/target` LSP request.
+
+In the VS Code extension, debugging goes through whichever installed
+extension contributes the **`delphi` debug type**; DDK itself ships no
+debugger. While one is installed, every project gets **Debug** and **Attach
+Debugger** actions (context menu, command palette, Ctrl+Alt+F9 for the
+selected project) and one dynamic entry per project in the debug dropdown.
+All of them start the two-line configuration `{ "type": "delphi",
+"request": "launch" | "attach", "ddkProject": "<name or id>" }` — the same
+shape a hand-written `launch.json` entry can use — and the debugger extension
+resolves it by asking DDK for the project's debug target through the
+`ddk.debug.getDebugTarget` command (`executeCommand` with
+`{ project?, compiler?, config?, platform? }`, all optional).
+
+By default a session starts on the binaries as they are: compile when you
+know it is needed (*Compile for Debugging*, or Ctrl+F9). F5 with no
+`launch.json` debugs DDK's active project. With `ddk.debug.compileBeforeDebug`
+on, every launch first compiles the project for debugging, **however the
+session was started**: the context menu, the debug dropdown, a `launch.json`
+entry naming a `ddkProject`, or F5. The session then starts only when that
+build succeeded; a build you cancel cancels the session without an error. The
+setting is off by default because a DDK compile always cleans first, so it
+would rebuild the whole project for every session. An attach never compiles,
+and when several instances of the executable are running the debugger's own
+process picker chooses. Every project is offered, built or not. DDK never
+writes a `launch.json`.
+
 ## Demos
 
 ### Add a Workspace and drag in a Project
@@ -302,12 +401,15 @@ hanging invisibly. Run such a program from a terminal, or disable
 ### Project Actions (Available via context menu and keyboard shortcuts)
 * `Compile Selected Project` - Compile the selected project (Ctrl+F9)
 * `Recreate Selected Project` - Clean and rebuild the selected project (Shift+F9)
+* `Compile Selected Project for Debugging` - Compile the selected project with the full debug artefact set (`.map`/`.rsm`/TD32, optimizations off) regardless of its build configuration; also available per project (`Compile for Debugging`), per workspace and per group project
 * `Compile All in Workspace` - Compile all projects in a workspace
 * `Recreate All in Workspace` - Clean and rebuild all projects in a workspace
 * `Compile All in Group Project` - Compile all projects in the loaded group project
 * `Recreate All in Group Project` - Clean and rebuild all projects in the loaded group project
 * `Cancel Compilation` - Cancel the active compilation (Ctrl+F2)
 * `Run Selected Project` - Execute the selected project (F9)
+* `Debug Selected Project` - Start a debug session for the selected project (Ctrl+Alt+F9), compiling it for debugging first unless `ddk.debug.compileBeforeDebug` is off; also `Debug` on any project. Shown only when an extension contributing the `delphi` debug type is installed
+* `Attach Debugger to Selected Project` - Attach the debugger to the running instance of the selected project's executable (or Host Application); also `Attach Debugger` on any project
 * `Set Start Parameters` - Configure command-line arguments passed to the executable when run
 * `Set Host Application` - Configure the executable that hosts the project when run (e.g. the application loading a .dpk package); overrides the dproj's own `Debugger_HostApplication`
 * `Configure/Create .ini` - Create or edit INI configuration files
@@ -316,6 +418,7 @@ hanging invisibly. Run such a program from a terminal, or disable
 ## Extension Settings
 
 * `ddk.compiler.encoding`: Character encoding used to decode MSBuild output (`oem` by default, use `utf8` if your paths contain non-ASCII characters).
+* `ddk.debug.compileBeforeDebug`: Before a `Debug` session starts, incrementally compile the project with the full debug artefact set, like the Delphi IDE's Run (`true` by default). Disable to debug whatever binaries already exist. Attaching never compiles.
 * `ddk.projects.useDebuggerRunParams`: When running a project, fuse the `.dproj`'s own `Debugger_RunParams` with the saved Start Parameters, dproj first (`true` by default). Disable to always use only the saved Start Parameters.
 * `ddk.projects.runIn`: Where a run sends its output: `terminal` (default, a real console — the program's own colors, following output and keyboard input all work), `output` (piped into the **DDK Run** output channel: searchable text, no colors, no input) or `detached` (output discarded, as before).
 * `ddk.projects.runOutputEncoding`: Encoding used to decode a running project's output in `output` mode (`ansi` by default: Windows' system ANSI codepage, e.g. 1252). Further choices: `auto` (per line UTF-8, falling back to ANSI), `utf8`, `oem` (console codepage), `cp437`/`cp850`/`cp852`, `ibm866`, `windows-1250`/`windows-1252` and the ISO 8859 variants.

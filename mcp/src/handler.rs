@@ -95,6 +95,10 @@ pub struct SetGroupProjectsCompilerArgs {
 pub struct CompileSelectedProjectArgs {
     /// If true, rebuilds the project from scratch. If false, performs an incremental compile.
     pub rebuild: Option<bool>,
+    /// If true, forces the full debug artefact set a debugger needs (optimizations off,
+    /// TD32 debug info, .rsm symbols, detailed .map) regardless of the build configuration.
+    /// The dproj is never modified. Default: false.
+    pub debug_info: Option<bool>,
     /// Project to compile: a numeric ID or a project name. A name matching several
     /// projects returns the candidate list instead of compiling. Takes precedence over project_id.
     pub project: Option<String>,
@@ -137,6 +141,9 @@ pub struct CompileFileArgs {
     pub platform: Option<String>,
     /// If true, rebuilds from scratch. If false/omitted, incremental compile.
     pub rebuild: Option<bool>,
+    /// If true, forces the full debug artefact set (optimizations off, TD32 debug info,
+    /// .rsm symbols, detailed .map) regardless of the build configuration. Default: false.
+    pub debug_info: Option<bool>,
     /// Show warning lines verbatim instead of suppressing them. Default: false.
     pub show_warnings: Option<bool>,
     /// Show hint lines verbatim instead of suppressing them. Default: false.
@@ -267,6 +274,54 @@ pub struct GenerateDelphiLspConfigArgs {
     pub out: Option<String>,
 }
 
+#[macros::mcp_tool(
+    name = "delphi_get_debug_target",
+    description = "Describes what debugging a Delphi project means, independently of any debugger: \
+        the executable to launch or attach to (the program itself, or the Host Application that loads \
+        a package/DLL), the .map/.rsm symbol files next to it, the project's own .bpl/.dll module with \
+        its symbols and .dcp, the source search paths (project directory, dproj unit/include paths, the \
+        IDE's Library and Browsing Paths, the compiler's source tree), the run arguments (dproj Run \
+        Parameters fused with the saved Start Parameters) and config/platform/bitness. \
+        Every path in the answer except `executable` is a file that exists: a symbol file, module or \
+        .dcp that is missing, empty or left by another build is null. `warnings` lists what will \
+        degrade or break a session (missing or stale artefacts, a platform the project does not \
+        enable, a value depending on an undefined $(NAME), an input that could not be read); \
+        `notes` lists what is merely worth knowing. An empty `warnings` list means the project is \
+        ready to debug. \
+        Use it to build a debugger launch or attach configuration, or to check that readiness. \
+        Target it with `project`: a numeric ID, a project name, or a path to a .dproj/.dpr/.dpk \
+        (`project_id` is also accepted for an exact numeric target). \
+        A name matching several projects returns the candidate list instead. \
+        Omit both to describe the currently active project. \
+        `config`/`platform` describe that configuration and platform instead of the project's \
+        active ones — the same overrides the compile tools take — with the executable and the \
+        host discovered for that build; nothing is persisted. \
+        `compiler` (an exact key like \"12.0\" or a product name like \"Delphi 12\"; default: newest \
+        installed) picks the compiler of a project that has none of its own: a path that belongs to \
+        no workspace, described ad-hoc, or a project linked to no workspace. It is ignored, with a \
+        note, for a project that builds with its workspace's compiler. \
+        Nothing is written or compiled: compile with debug_info first if the warnings ask for it."
+)]
+#[derive(Debug, Deserialize, Serialize, macros::JsonSchema)]
+pub struct GetDebugTargetArgs {
+    /// Project to describe: a numeric ID, a project name, or a path to a
+    /// .dproj/.dpr/.dpk. Omit to use the currently active project. Takes
+    /// precedence over project_id.
+    pub project: Option<String>,
+    /// Numeric project ID, as an alternative to `project`.
+    pub project_id: Option<u64>,
+    /// Compiler key (e.g. "12.0") or product name (e.g. "Delphi 12"), used only
+    /// for a project without a compiler of its own: a file path that belongs
+    /// to no workspace, or a project linked to no workspace. Optional.
+    pub compiler: Option<String>,
+    /// Build configuration to describe (e.g. "Debug", "Release") instead of
+    /// the project's active one. Optional; nothing is persisted.
+    pub config: Option<String>,
+    /// Target platform to describe (e.g. "Win32", "Win64") instead of the
+    /// project's active one. Optional; nothing is persisted.
+    pub platform: Option<String>,
+}
+
 rust_mcp_sdk::tool_box!(DdkTools, [
     GetDdkExtensionInfoArgs,
     GetEnvironmentInfoArgs,
@@ -282,6 +337,7 @@ rust_mcp_sdk::tool_box!(DdkTools, [
     AddWorkspaceArgs,
     FormatFileArgs,
     GenerateDelphiLspConfigArgs,
+    GetDebugTargetArgs,
 ]);
 
 // ---------------------------------------------------------------------------
@@ -327,6 +383,7 @@ impl ServerHandler for DdkMcpHandler {
             "delphi_add_workspace"            => add_workspace(&args).await,
             "delphi_format_file"              => format_file(&args).await,
             "delphi_generate_delphilsp_config" => generate_delphilsp_config(&args).await,
+            "delphi_get_debug_target"         => get_debug_target(&args).await,
             _ => format!("Unknown tool: {name}"),
         };
         Ok(CallToolResult::text_content(vec![TextContent::from(result_text)]))
@@ -399,12 +456,14 @@ async fn set_group_projects_compiler(args: &Value) -> String {
 
 async fn compile_project(args: &Value) -> String {
     let arguments = Arguments::new(args);
-    let parsed = (|| -> ArgumentResult<_> { Ok((arguments.flag("rebuild")?, compile_filter(&arguments)?, arguments.project_reference()?)) })();
-    let (rebuild, filter, reference) = match parsed {
+    let parsed = (|| -> ArgumentResult<_> {
+        Ok((arguments.flag("rebuild")?, arguments.flag("debug_info")?, compile_filter(&arguments)?, arguments.project_reference()?))
+    })();
+    let (rebuild, debug_info, filter, reference) = match parsed {
         Ok(parsed) => parsed,
         Err(message) => return message,
     };
-    match commands::cmd_compile_ref(rebuild, reference, filter, Vec::new()).await {
+    match commands::cmd_compile_ref(rebuild, debug_info, reference, filter, Vec::new()).await {
         Ok(commands::CompileOrAmbiguity::Output(output)) => {
             serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string())
         }
@@ -422,14 +481,15 @@ async fn compile_file(args: &Value) -> String {
             arguments.text("config")?,
             arguments.text("platform")?,
             arguments.flag("rebuild")?,
+            arguments.flag("debug_info")?,
             compile_filter(&arguments)?,
         ))
     })();
-    let (file_path, compiler, config, platform, rebuild, filter) = match parsed {
+    let (file_path, compiler, config, platform, rebuild, debug_info, filter) = match parsed {
         Ok(parsed) => parsed,
         Err(message) => return message,
     };
-    match commands::cmd_compile_file(file_path, compiler, config, platform, rebuild, filter, Vec::new()).await {
+    match commands::cmd_compile_file(file_path, compiler, config, platform, rebuild, debug_info, filter, Vec::new()).await {
         Ok(commands::CompileOrAmbiguity::Output(output)) => {
             serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string())
         }
@@ -515,6 +575,24 @@ async fn format_file(args: &Value) -> String {
     };
     match commands::cmd_format_file(file_path, encoding).await {
         Ok(path) => format!("{path}"),
+        Err(e) => format!("{e}"),
+    }
+}
+
+async fn get_debug_target(args: &Value) -> String {
+    let arguments = Arguments::new(args);
+    let parsed = (|| -> ArgumentResult<_> {
+        Ok((arguments.project_reference()?, arguments.text("compiler")?, arguments.text("config")?, arguments.text("platform")?))
+    })();
+    let (project, compiler, config, platform) = match parsed {
+        Ok(parsed) => parsed,
+        Err(message) => return message,
+    };
+    match commands::cmd_debug_target(project, compiler, config, platform).await {
+        Ok(commands::DebugTargetOrAmbiguity::Target(target)) => {
+            serde_json::to_string_pretty(&target).unwrap_or_else(|_| target.to_string())
+        }
+        Ok(commands::DebugTargetOrAmbiguity::Ambiguity(amb)) => amb.to_string(),
         Err(e) => format!("{e}"),
     }
 }

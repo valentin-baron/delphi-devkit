@@ -21,15 +21,21 @@ impl DelphiLsp {
         return DelphiLsp { client }
     }
 
+    /// Answers once the build has run, with its outcome: a caller that must
+    /// not proceed after a failed build reads `success` from the reply.
     async fn projects_compile(
         &self,
         params: CompileProjectParams,
-    ) -> tower_lsp::jsonrpc::Result<()> {
-        if let Err(e) = Compiler::new(self.client.clone(), &params).await.compile().await {
-            lsp_error!(self.client, "Failed to compile project: {}", e);
-            NotifyError::notify(&self.client, format!("Failed to compile project: {}", e), None).await;
-        }
-        try_finish_event!(self.client, params);
+    ) -> tower_lsp::jsonrpc::Result<ddk_core::lsp_types::CompileOutcome> {
+        let outcome = match Compiler::new(self.client.clone(), &params).await.compile().await {
+            Ok(result) => ddk_core::lsp_types::CompileOutcome { success: result.success, cancelled: result.cancelled },
+            Err(e) => {
+                lsp_error!(self.client, "Failed to compile project: {}", e);
+                NotifyError::notify(&self.client, format!("Failed to compile project: {}", e), None).await;
+                ddk_core::lsp_types::CompileOutcome { success: false, cancelled: false }
+            }
+        };
+        try_finish_event!(self.client, params, Ok(outcome));
     }
 
     async fn projects_compile_cancel(
@@ -129,6 +135,22 @@ impl DelphiLsp {
                     data: None,
                 })
             }
+        }
+    }
+
+    /// `debug/target`: the debugger-agnostic description of a project's debug
+    /// target — thin wrapper over `cmd_debug_target`; an ambiguous reference
+    /// is reported as an error carrying the candidate list.
+    async fn debug_target(
+        &self,
+        params: ddk_core::lsp_types::DebugTargetParams,
+    ) -> tower_lsp::jsonrpc::Result<ddk_core::debug_target::DebugTarget> {
+        match ddk_core::commands::cmd_debug_target(params.project, params.compiler, params.config, params.platform).await {
+            Ok(ddk_core::commands::DebugTargetOrAmbiguity::Target(target)) => Ok(target),
+            Ok(ddk_core::commands::DebugTargetOrAmbiguity::Ambiguity(ambiguity)) => {
+                Err(jsonrpc::Error::invalid_params(ambiguity.to_string()))
+            }
+            Err(e) => Err(jsonrpc::Error::invalid_params(format!("{e}"))),
         }
     }
 
@@ -271,6 +293,7 @@ async fn main() -> Result<()> {
         .custom_method("notifications/settings/encoding", DelphiLsp::settings_encoding)
         .custom_method("dproj/metadata", DelphiLsp::dproj_metadata)
         .custom_method("delphilsp/generate", DelphiLsp::delphilsp_generate)
+        .custom_method("debug/target", DelphiLsp::debug_target)
         .finish();
 
     Server::new(stdin(), stdout(), socket).serve(service).await;
