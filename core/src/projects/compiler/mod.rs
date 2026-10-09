@@ -427,8 +427,17 @@ impl Compiler {
         return Ok(compile_result);
     }
 
+    /// The build's outcome is published however the build ends — a project
+    /// that failed is the build's answer just as much when a later one was
+    /// cancelled or could not be started as when every project ran.
     async fn do_compile(&self, parameters: &CompilationParameters<'_>) -> Result<()> {
         let mut outcome = BuildOutcome::default();
+        let result = self.compile_each_project(parameters, &mut outcome).await;
+        outcome.publish();
+        result
+    }
+
+    async fn compile_each_project(&self, parameters: &CompilationParameters<'_>, outcome: &mut BuildOutcome) -> Result<()> {
         for project in &parameters.projects {
             if compiler_state::is_cancelled() {
                 return Err(anyhow::anyhow!("Compilation cancelled by user."));
@@ -633,7 +642,6 @@ impl Compiler {
             }
             result?;
         }
-        outcome.publish();
         return Ok(());
     }
 }
@@ -725,7 +733,7 @@ enum OutputKind {
 
 lazy_static::lazy_static! {
     // Matches Delphi 2007 compiler-progress lines: indented Windows absolute path with no
-    // line-number notation, e.g. "  C:\Delphi\VSS\...\SomeUnit".
+    // line-number notation, e.g. "  C:\Projects\...\SomeUnit".
     static ref PATH_ONLY_LINE_REGEX: regex::Regex =
         regex::Regex::new(r"^\s+[A-Za-z]:\\[^()\r\n]*$").unwrap();
 }
@@ -740,9 +748,9 @@ async fn process_output_lines<R: AsyncRead + Unpin + Send>(
     use tokio::io::AsyncBufReadExt;
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
     let mut last_file = String::new();
-    // Tracks the last emitted (file, line, code) key to deduplicate consecutive identical
-    // diagnostics that Delphi 2007 outputs twice (once wrapped in MSBuild format, once plain).
-    let mut last_diag_key: Option<(String, u32, String)> = None;
+    // Tracks the last emitted CompilerLineDiagnostic::dedup_key to drop the consecutive
+    // repetition Delphi 2007 produces (once wrapped in MSBuild format, once plain).
+    let mut last_diag_key: Option<(String, u32, String, String)> = None;
     let mut buf = Vec::new();
 
     loop {
@@ -760,7 +768,7 @@ async fn process_output_lines<R: AsyncRead + Unpin + Send>(
         if line.trim().is_empty() {
             continue;
         }
-        // Skip path-only compiler-progress lines, e.g. "  C:\Delphi\VSS\...\SomeUnit"
+        // Skip path-only compiler-progress lines, e.g. "  C:\Projects\...\SomeUnit"
         if PATH_ONLY_LINE_REGEX.is_match(&line) {
             continue;
         }
@@ -778,14 +786,18 @@ async fn process_output_lines<R: AsyncRead + Unpin + Send>(
             }
             // Deduplicate: Delphi 2007 emits the same diagnostic twice – once in the
             // Borland.Delphi.Targets MSBuild wrapper and once as a plain indented line.
-            // Skip the second occurrence when it has the same (file, line, code) as the
-            // diagnostic we just emitted.
-            let key = (diagnostic.file.clone(), diagnostic.line, diagnostic.code.clone());
+            // Skip the second occurrence when it repeats the diagnostic we just emitted,
+            // message included: dcc reports several diagnostics with the same code for one
+            // source line, and those differ in nothing else.
+            let key = diagnostic.dedup_key();
             if last_diag_key.as_ref() == Some(&key) {
                 continue;
             }
             last_diag_key = Some(key);
-            if last_file != diagnostic.file && !diagnostics.is_empty() {
+            // Windows paths are case-insensitive, so a differently spelled drive letter
+            // must not flush the batch early – publishing twice for one document would
+            // replace the first batch instead of adding to it.
+            if !last_file.eq_ignore_ascii_case(&diagnostic.file) && !diagnostics.is_empty() {
                 compiler_state::track_diagnosed_file(last_file.clone());
                 publish_diagnostics(client.as_ref(), &last_file, &diagnostics).await;
                 diagnostics.clear();

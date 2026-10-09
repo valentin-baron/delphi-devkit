@@ -426,7 +426,46 @@ fn the_libsuffix_a_dpk_declares_is_the_one_for_this_compiler() {
 
     let undecidable = name_for(b"package Demo;\n{$IFOPT D+}{$LIBSUFFIX 'D'}{$ELSE}{$LIBSUFFIX 'R'}{$ENDIF}\nend.");
     assert_eq!(undecidable.modules[0].name, "Demo.bpl");
-    assert!(warns(&undecidable, &["several {$LIBSUFFIX} values", "'D', 'R'"]), "{:?}", undecidable.warnings);
+    assert!(warns(&undecidable, &["{$LIBSUFFIX}", "it could be 'D' or 'R'"]), "{:?}", undecidable.warnings);
+
+    // Nothing says the declaration is reached at all.
+    let lone = name_for(b"package Demo;\n{$IFDEF VEGA_D12}{$LIBSUFFIX '290'}{$ENDIF}\nend.");
+    assert_eq!(lone.modules[0].name, "Demo.bpl");
+    assert!(warns(&lone, &["it could be no suffix or '290'"]), "{:?}", lone.warnings);
+}
+
+#[test]
+fn unicode_is_defined_from_delphi_2009_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = hosted_package(tmp.path());
+    let source = b"package Demo;\n{$IFDEF UNICODE}{$LIBSUFFIX 'W'}{$ELSE}{$LIBSUFFIX 'A'}{$ENDIF}\nend.";
+    fs::write(project.dpk.clone().unwrap(), source).unwrap();
+    let name_for = |compiler_version| {
+        let compiler = CompilerConfiguration { compiler_version, condition: format!("VER{compiler_version}0"), ..compiler() };
+        build_debug_target_with(&project, &compiler, &FakeIde::new()).unwrap().modules[0].name.clone()
+    };
+
+    assert_eq!(name_for(19), "DemoA.bpl");
+    assert_eq!(name_for(20), "DemoW.bpl");
+}
+
+/// Delphi 2007 declares `VER180` next to `VER185`; a compiler configuration
+/// records one symbol, so below 2009 the family rules nothing out.
+#[test]
+fn a_version_symbol_rules_nothing_out_for_a_compiler_that_declares_two() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = hosted_package(tmp.path());
+    let source = b"package Demo;\n{$IFDEF VER180}{$LIBSUFFIX '110'}{$ELSE}{$LIBSUFFIX '290'}{$ENDIF}\nend.";
+    fs::write(project.dpk.clone().unwrap(), source).unwrap();
+    let target_for = |compiler_version| {
+        let compiler = CompilerConfiguration { compiler_version, condition: format!("VER{compiler_version}0"), ..compiler() };
+        build_debug_target_with(&project, &compiler, &FakeIde::new()).unwrap()
+    };
+
+    let undecided = target_for(19);
+    assert_eq!(undecided.modules[0].name, "Demo.bpl");
+    assert!(warns(&undecided, &["'110'", "'290'"]), "{:?}", undecided.warnings);
+    assert_eq!(target_for(20).modules[0].name, "Demo290.bpl");
 }
 
 #[test]
@@ -552,6 +591,47 @@ fn a_dproj_value_depending_on_an_undefined_variable_is_reported_and_not_used() {
     );
 }
 
+/// A variable a condition tests cannot be seeded with its own reference
+/// without flipping that condition, so dproj-rs still expands it to
+/// nothing. The driveless rooted path it leaves is a real directory of the
+/// server's own drive, and must not pass for the project's output.
+#[test]
+fn a_dproj_value_a_tested_variable_collapsed_out_of_is_reported_and_not_used() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = TEST_PKG_SUFFIX
+        .replace("<PropertyGroup>", r#"<PropertyGroup Condition="'$(SITE_DDK)'==''">"#)
+        .replace(r"<DCC_BplOutput>.\bpl</DCC_BplOutput>", r"<DCC_BplOutput>$(SITE_DDK)\bpl</DCC_BplOutput>");
+    let project = project_from_fixture(tmp.path(), "TestPkgSuffix", &fixture, "TestPkgSuffix.dpk");
+    touch(tmp.path().join("hosts").join("Host.exe"));
+
+    let target = describe(&project, &FakeIde::new());
+
+    assert!(warns(&target, &["no drive"]), "{:?}", target.warnings);
+    assert!(
+        !target.modules.iter().any(|module| module.binary.as_deref().is_some_and(|path| path.contains("/bpl/"))),
+        "{:?}",
+        target.modules
+    );
+}
+
+/// Refusing to describe a target ends the report with it, so what was
+/// found on the way must travel with the refusal: "compile it first" is a
+/// wrong instruction when the real cause is a configuration name the dproj
+/// does not have.
+#[test]
+fn a_refusal_carries_what_was_found_on_the_way() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut project = project_from_fixture(tmp.path(), "TestLib", TEST_LIB, "TestLib.dpr");
+    project.active_configuration = Some("Relase".to_string());
+    project.exe = None;
+
+    let error = build_debug_target_with(&project, &compiler(), &FakeIde::new()).expect_err("no executable");
+    let message = error.to_string();
+
+    assert!(message.contains("Relase"), "{message}");
+    assert!(message.contains("no property group"), "{message}");
+}
+
 #[test]
 fn search_path_entries_that_do_not_exist_are_left_out_with_a_note() {
     let tmp = tempfile::tempdir().unwrap();
@@ -675,6 +755,23 @@ fn a_build_that_cannot_be_discovered_does_not_borrow_the_active_ones_paths() {
     let (described, warnings) = project_to_describe(&project, None, Some("Win64".into()), &[]);
     assert_eq!((described.exe, described.dproj_host_application), (None, None));
     assert!(warnings[0].contains("could not be discovered"), "{warnings:?}");
+}
+
+/// A bare `.dpr` has no dproj to put each build in its own directory, so
+/// `--platform Win64` cannot change where the executable is: what is there
+/// is whatever was compiled last, and saying nothing would describe a
+/// Win32 binary as the Win64 target.
+#[test]
+fn a_bare_source_cannot_tell_one_builds_executable_from_anothers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut project = project(tmp.path(), "App");
+    project.dproj = None;
+    project.dpr = Some(text(tmp.path().join("App.dpr")));
+
+    let (described, warnings) = project_to_describe(&project, None, Some("Win64".into()), &[]);
+
+    assert!(described.exe.is_some(), "the executable is still named");
+    assert!(warnings.iter().any(|warning| warning.contains("one path for every")), "{warnings:?}");
 }
 
 // ─── What callers see ────────────────────────────────────────────────────────

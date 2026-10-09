@@ -368,6 +368,9 @@ impl ServerHandler for DdkMcpHandler {
     ) -> Result<CallToolResult, CallToolError> {
         let name = params.name.as_str();
         let args = Value::Object(params.arguments.clone().unwrap_or_default());
+        if let Err(message) = reject_unknown_arguments(name, &args) {
+            return Ok(CallToolResult::text_content(vec![TextContent::from(message)]));
+        }
         let result_text = match name {
             "get_ddk_extension_info"          => get_ddk_extension_info().await,
             "delphi_get_environment_info"     => get_environment_info().await,
@@ -388,6 +391,36 @@ impl ServerHandler for DdkMcpHandler {
         };
         Ok(CallToolResult::text_content(vec![TextContent::from(result_text)]))
     }
+}
+
+/// Fails when the call carries an argument the tool does not advertise.
+/// A misspelled `rebiuld` would otherwise read as a silent `false` and
+/// `projetc_id` would act on the active project — the quiet substitution
+/// [`crate::arguments`] exists to stop, one letter further out. The
+/// accepted names are the ones the tool publishes in its own schema, so
+/// this cannot disagree with what a client was told.
+fn reject_unknown_arguments(tool: &str, args: &Value) -> Result<(), String> {
+    let Some(given) = args.as_object().filter(|given| !given.is_empty()) else {
+        return Ok(());
+    };
+    let Some(definition) = DdkTools::tools().into_iter().find(|definition| definition.name == tool) else {
+        return Ok(());
+    };
+    let Some(accepted) = definition.input_schema.properties.as_ref() else {
+        return Ok(());
+    };
+    let unknown: Vec<&str> = given.keys().map(String::as_str).filter(|name| !accepted.contains_key(*name)).collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let mut names: Vec<&str> = accepted.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    Err(format!(
+        "Unknown parameter{} for {tool}: {}. It takes: {}.",
+        if unknown.len() == 1 { "" } else { "s" },
+        unknown.join(", "),
+        names.join(", ")
+    ))
 }
 
 async fn get_ddk_extension_info() -> String {
@@ -594,5 +627,35 @@ async fn get_debug_target(args: &Value) -> String {
         }
         Ok(commands::DebugTargetOrAmbiguity::Ambiguity(amb)) => amb.to_string(),
         Err(e) => format!("{e}"),
+    }
+}
+
+#[cfg(test)]
+mod argument_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_misspelled_parameter_is_named_instead_of_ignored() {
+        let message = reject_unknown_arguments("delphi_compile_project", &json!({ "rebiuld": true }))
+            .expect_err("a misspelling the tool does not advertise");
+
+        assert!(message.contains("rebiuld"), "{message}");
+        assert!(message.contains("rebuild"), "the accepted names are offered: {message}");
+    }
+
+    #[test]
+    fn the_parameters_a_tool_advertises_are_accepted() {
+        let call = json!({ "project": "be", "rebuild": true, "debug_info": true });
+
+        assert_eq!(reject_unknown_arguments("delphi_compile_project", &call), Ok(()));
+        assert_eq!(reject_unknown_arguments("delphi_list_projects", &json!({})), Ok(()));
+    }
+
+    /// A tool this dispatcher does not know is answered by the dispatcher
+    /// itself; checking its arguments here would hide that.
+    #[test]
+    fn an_unknown_tool_is_left_to_the_dispatcher() {
+        assert_eq!(reject_unknown_arguments("delphi_no_such_tool", &json!({ "whatever": 1 })), Ok(()));
     }
 }

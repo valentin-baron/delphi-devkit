@@ -142,15 +142,37 @@ fn parses_native_format_with_column_and_multiword_label() {
     assert_eq!(format!("{}", diag.kind), "ERROR");
 }
 
+// The three path spellings below are verbatim dcc32 output, captured by running
+// dcc32 18.5 (Delphi 2007), 35.0, 36.0 (Delphi 12) and 37.0 against a scratch
+// project: the compiler prints the unit exactly as it resolved it – absolute
+// only when the search path was absolute – and does not indent its own output.
+
 #[test]
 fn parses_native_format_with_relative_path_and_no_indent() {
-    // dcc32 invoked directly (bare .dpr build) prints the path as given, unindented.
-    let line = "src\\Unit1.pas(9)Hinweis: H2164 Variable 'x' wurde deklariert, aber nie verwendet";
+    let line = "src\\Unit1.pas(9) Hinweis: H2164 Variable 'x' wurde deklariert, aber nie verwendet";
     let diag = CompilerLineDiagnostic::from_line(line, "dcc32".into()).unwrap();
     assert_eq!(diag.file, r"src\Unit1.pas");
     assert_eq!(diag.line, 9);
     assert_eq!(diag.code, "H2164");
     assert_eq!(format!("{}", diag.kind), "HINT");
+}
+
+#[test]
+fn parses_native_format_with_bare_file_name() {
+    let line = "Unit2.pas(24) Warnung: W1057 Implizite String-Umwandlung von 'AnsiString' zu 'string'";
+    let diag = CompilerLineDiagnostic::from_line(line, "dcc32".into()).unwrap();
+    assert_eq!(diag.file, "Unit2.pas");
+    assert_eq!(diag.line, 24);
+    assert_eq!(diag.code, "W1057");
+}
+
+#[test]
+fn parses_native_format_with_single_word_fatal_label() {
+    let line = "Project4.dpr(4) Schwerwiegend: F2063 Verwendete Unit 'Unit4.pas' kann nicht compiliert werden";
+    let diag = CompilerLineDiagnostic::from_line(line, "dcc32".into()).unwrap();
+    assert_eq!(diag.file, "Project4.dpr");
+    assert_eq!(diag.code, "F2063");
+    assert_eq!(format!("{}", diag.kind), "ERROR");
 }
 
 #[test]
@@ -163,23 +185,132 @@ fn parses_path_containing_parentheses() {
 }
 
 #[test]
-fn native_and_msbuild_form_share_the_dedup_key() {
-    // compiler/mod.rs deduplicates consecutive diagnostics by (file, line, code).
-    // Both spellings of the same diagnostic must therefore produce the same key,
-    // so a build that emits it twice still yields one diagnostic.
-    let native = "  C:\\Projects\\Unit1.pas(205)Warnung: W1057 Implizite String-Umwandlung von 'AnsiString' zu 'WideString'";
-    let msbuild = r"C:\Projects\Unit1.pas(205,12): warning W1057: Implizite String-Umwandlung von 'AnsiString' zu 'WideString' [C:\Projects\MyProject.dproj]";
-    let a = CompilerLineDiagnostic::from_line(native, "dcc32".into()).unwrap();
-    let b = CompilerLineDiagnostic::from_line(msbuild, "dcc32".into()).unwrap();
+fn parses_path_whose_directory_is_a_parenthesised_number() {
+    // The ambiguous case: "(2)" looks exactly like the line-number group, so the
+    // file must be the longest path that still leaves a parsable tail.
+    let line = "  C:\\Builds (2)\\U.pas(205)Warnung: W1057 Implizite String-Umwandlung";
+    let diag = CompilerLineDiagnostic::from_line(line, "dcc32".into()).unwrap();
+    assert_eq!(diag.file, r"C:\Builds (2)\U.pas");
+    assert_eq!(diag.line, 205);
+    assert_eq!(diag.code, "W1057");
+}
+
+#[test]
+fn strips_the_msbuild_node_prefix_from_the_file() {
+    // MSBuild's /m console logger prefixes every line with its node id.
+    let native = "3>  C:\\P\\U.pas(205)Warnung: W1057 Implizite String-Umwandlung";
+    let diag = CompilerLineDiagnostic::from_line(native, "dcc32".into()).unwrap();
+    assert_eq!(diag.file, r"C:\P\U.pas");
+
+    let msbuild = r"12>C:\P\U.pas(205,3): warning W1057: Implizite String-Umwandlung [C:\P\My.dproj]";
+    let diag = CompilerLineDiagnostic::from_line(msbuild, "dcc32".into()).unwrap();
+    assert_eq!(diag.file, r"C:\P\U.pas");
+    assert_eq!(diag.column, Some(3));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Messages ending in brackets – only MSBuild appends "[<project>]"
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn native_message_keeps_its_own_trailing_bracket_group() {
+    // Verbatim dcc32 output: native lines never carry a project suffix, so
+    // nothing may be stripped off the end of the message.
+    let line = "Unit5.pas(4) Warnung: W1054 Variable ist vom Typ array [0..9]";
+    let diag = CompilerLineDiagnostic::from_line(line, "dcc32".into()).unwrap();
+    assert_eq!(diag.message, "Variable ist vom Typ array [0..9]");
+}
+
+#[test]
+fn delphi2007_wrapper_message_keeps_brackets_but_loses_the_project_suffix() {
+    let line = r"C:\WINDOWS\Microsoft.NET\Framework\v2.0.50727\Borland.Delphi.Targets : warning : C:\Projects\Sample\Unit5.pas(4) Warnung: W1054 Variable ist vom Typ array [0..9] [c:\Projects\Sample\Sample.dproj]";
+    let diag = CompilerLineDiagnostic::from_line(line, "dcc32".into()).unwrap();
+    assert_eq!(diag.file, r"C:\Projects\Sample\Unit5.pas");
+    assert_eq!(diag.message, "Variable ist vom Typ array [0..9]");
+}
+
+#[test]
+fn msbuild_message_keeps_brackets_but_loses_the_project_suffix() {
+    // Verbatim MSBuild output for the same unit.
+    let line = r"Unit5.pas(4): warning W1054: Variable ist vom Typ array [0..9] [C:\P\Project5.dproj]";
+    let diag = CompilerLineDiagnostic::from_line(line, "dcc32".into()).unwrap();
+    assert_eq!(diag.message, "Variable ist vom Typ array [0..9]");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Deduplication key (CompilerLineDiagnostic::dedup_key)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn delphi2007_duplicate_output_shares_the_dedup_key() {
+    // Delphi 2007 prints each diagnostic twice with identical text – once through
+    // the Borland.Delphi.Targets wrapper, once plain. Only that pair may collapse.
+    let wrapper = r"C:\WINDOWS\Microsoft.NET\Framework\v2.0.50727\Borland.Delphi.Targets : warning : C:\Projects\Sample\SampleMessage.pas(107) Warnung: W1036 Variable 'aHelpContext' ist moeglicherweise nicht initialisiert worden [c:\Projects\Sample\Sample.dproj]";
+    let plain = "  C:\\Projects\\Sample\\SampleMessage.pas(107) Warnung: W1036 Variable 'aHelpContext' ist moeglicherweise nicht initialisiert worden";
+    let a = CompilerLineDiagnostic::from_line(wrapper, "dcc32".into()).unwrap();
+    let b = CompilerLineDiagnostic::from_line(plain, "dcc32".into()).unwrap();
+    assert_eq!(a.dedup_key(), b.dedup_key());
+}
+
+#[test]
+fn same_code_on_one_line_with_different_messages_keeps_both() {
+    // Verbatim dcc32 output for a call whose two arguments are both converted
+    // implicitly: same file, same line, same code, different message.
+    let first = "Unit3.pas(25) Warnung: W1057 Implizite String-Umwandlung von 'AnsiString' zu 'WideString'";
+    let second = "Unit3.pas(25) Warnung: W1057 Implizite String-Umwandlung von 'ShortString' zu 'WideString'";
+    let a = CompilerLineDiagnostic::from_line(first, "dcc32".into()).unwrap();
+    let b = CompilerLineDiagnostic::from_line(second, "dcc32".into()).unwrap();
     assert_eq!((&a.file, a.line, &a.code), (&b.file, b.line, &b.code));
-    // The column is part of neither the key nor the equality above.
-    assert_eq!(a.column, None);
-    assert_eq!(b.column, Some(12));
+    assert_ne!(a.dedup_key(), b.dedup_key());
+}
+
+#[test]
+fn dedup_key_ignores_the_case_of_the_drive_letter() {
+    let upper = "C:\\P\\U.pas(205) Warnung: W1057 Implizite String-Umwandlung";
+    let lower = "c:\\P\\U.pas(205) Warnung: W1057 Implizite String-Umwandlung";
+    let a = CompilerLineDiagnostic::from_line(upper, "dcc32".into()).unwrap();
+    let b = CompilerLineDiagnostic::from_line(lower, "dcc32".into()).unwrap();
+    assert_ne!(a.file, b.file);
+    assert_eq!(a.dedup_key(), b.dedup_key());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  False-alarm guards: MSBuild's own messages are not Delphi diagnostics
 // ═══════════════════════════════════════════════════════════════════════════════
+
+// The four guards below cover the patterns the relaxed native format newly lets
+// through the door: anything may precede the "(<line>)" group, so the file
+// capture must stop at characters a Windows path cannot contain.
+
+#[test]
+fn rejects_quoted_command_echo_with_parenthesised_number() {
+    let line = r#"  cmd /c "copy a.txt b.txt" (3)Warnung: W0001 irgendwas"#;
+    assert!(CompilerLineDiagnostic::from_line(line, "dcc32".into()).is_none());
+}
+
+#[test]
+fn wrapper_head_never_ends_up_in_the_file_capture() {
+    // MSBuild renders the severity word the task hands it, and
+    // Borland.Delphi.Targets hands it in English – a German "Warnung" in that
+    // position is not a form the wrapper regex is meant to read. The native
+    // regex must then reject the line instead of capturing the wrapper head as
+    // part of the path: a lost diagnostic is recoverable, a diagnostic
+    // published against a file that does not exist is not.
+    let line = r"C:\WINDOWS\x\Borland.Delphi.Targets : Warnung : C:\Projects\X.pas(107) Warnung: W1036 Variable nicht initialisiert [c:\Projects\Sample.dproj]";
+    assert!(CompilerLineDiagnostic::from_line(line, "dcc32".into()).is_none());
+}
+
+#[test]
+fn rejects_native_shape_without_a_colon_after_the_label() {
+    let line = "  C:\\P\\U.pas(205)Warnung W1057 Implizite String-Umwandlung";
+    assert!(CompilerLineDiagnostic::from_line(line, "dcc32".into()).is_none());
+}
+
+#[test]
+fn rejects_line_whose_file_capture_would_be_empty() {
+    let line = "(205) Warnung: W1057 Implizite String-Umwandlung";
+    assert!(CompilerLineDiagnostic::from_line(line, "dcc32".into()).is_none());
+}
 
 #[test]
 fn rejects_msbuild_own_warning_with_msb_code() {

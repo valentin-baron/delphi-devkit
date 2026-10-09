@@ -65,7 +65,16 @@ export class DdkBuildBeforeDebug implements DebugConfigurationProvider {
     this.pickedLink = undefined;
     if (configuration.request !== 'launch' || !compileBeforeDebug()) return configuration;
     const project = projectReferredTo(configuration.ddkProject, allProjects());
-    if (!project) return configuration;
+    if (!project) {
+      // Silence here would be the failure the build exists to prevent: the
+      // session starts on whatever binary is lying there. A name that
+      // matches nothing, matches several projects, or is asked for before
+      // the server has sent its projects all land here.
+      window.showWarningMessage(
+        `No single DDK project matches "${configuration.ddkProject}", so nothing was compiled: the debug session starts on the binary as it is.`
+      );
+      return configuration;
+    }
 
     const pickedLinkId = picked?.project === project.id ? picked.link : undefined;
     const link = linkToCompile(Runtime.getLinksOfProject(project), pickedLinkId);

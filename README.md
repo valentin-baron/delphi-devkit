@@ -338,7 +338,9 @@ resolves it by asking DDK for the project's debug target through the
 `{ project?, compiler?, config?, platform? }`, all optional).
 
 By default a session starts on the binaries as they are: compile when you
-know it is needed (*Compile for Debugging*, or Ctrl+F9). F5 with no
+know it is needed, with *Compile for Debugging* on the project or the
+selected project. Ctrl+F9 is the plain compile and leaves out the debug
+artefacts a debugger needs. F5 with no
 `launch.json` debugs DDK's active project. With `ddk.debug.compileBeforeDebug`
 on, every launch first compiles the project for debugging, **however the
 session was started**: the context menu, the debug dropdown, a `launch.json`
@@ -408,7 +410,7 @@ writes a `launch.json`.
 * `Recreate All in Group Project` - Clean and rebuild all projects in the loaded group project
 * `Cancel Compilation` - Cancel the active compilation (Ctrl+F2)
 * `Run Selected Project` - Execute the selected project (F9)
-* `Debug Selected Project` - Start a debug session for the selected project (Ctrl+Alt+F9), compiling it for debugging first unless `ddk.debug.compileBeforeDebug` is off; also `Debug` on any project. Shown only when an extension contributing the `delphi` debug type is installed
+* `Debug Selected Project` - Start a debug session for the selected project (Ctrl+Alt+F9), compiling it for debugging first only when `ddk.debug.compileBeforeDebug` is on; also `Debug` on any project. Shown only when an extension contributing the `delphi` debug type is installed
 * `Attach Debugger to Selected Project` - Attach the debugger to the running instance of the selected project's executable (or Host Application); also `Attach Debugger` on any project
 * `Set Start Parameters` - Configure command-line arguments passed to the executable when run
 * `Set Host Application` - Configure the executable that hosts the project when run (e.g. the application loading a .dpk package); overrides the dproj's own `Debugger_HostApplication`
@@ -418,7 +420,7 @@ writes a `launch.json`.
 ## Extension Settings
 
 * `ddk.compiler.encoding`: Character encoding used to decode MSBuild output (`oem` by default, use `utf8` if your paths contain non-ASCII characters).
-* `ddk.debug.compileBeforeDebug`: Before a `Debug` session starts, incrementally compile the project with the full debug artefact set, like the Delphi IDE's Run (`true` by default). Disable to debug whatever binaries already exist. Attaching never compiles.
+* `ddk.debug.compileBeforeDebug`: Before a `Debug` session starts, compile the project with the full debug artefact set (`.map`/`.rsm`/TD32, optimizations off), however the session was started — context menu, debug dropdown, `launch.json`, F5 — and start the session only if that build succeeded. `false` by default: a DDK compile cleans first, so this rebuilds the whole project for every session. Attaching never compiles.
 * `ddk.projects.useDebuggerRunParams`: When running a project, fuse the `.dproj`'s own `Debugger_RunParams` with the saved Start Parameters, dproj first (`true` by default). Disable to always use only the saved Start Parameters.
 * `ddk.projects.runIn`: Where a run sends its output: `terminal` (default, a real console — the program's own colors, following output and keyboard input all work), `output` (piped into the **DDK Run** output channel: searchable text, no colors, no input) or `detached` (output discarded, as before).
 * `ddk.projects.runOutputEncoding`: Encoding used to decode a running project's output in `output` mode (`ansi` by default: Windows' system ANSI codepage, e.g. 1252). Further choices: `auto` (per line UTF-8, falling back to ANSI), `utf8`, `oem` (console codepage), `cp437`/`cp850`/`cp852`, `ibm866`, `windows-1250`/`windows-1252` and the ISO 8859 variants.

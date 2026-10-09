@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::delphilsp::{IdeLibrarySettings, IdeRegistryRoot};
-use crate::files::dproj::{has_unresolved_macro, load_with_environment, unresolved_macros};
+use crate::files::dproj::{has_unresolved_macro, load_with_environment, looks_collapsed, unresolved_macros};
 use crate::projects::{CompilerConfiguration, IdeEnvironment, MacroMap, Project};
 use crate::utils::normalize_path;
 use lib_suffix::{BuildSymbols, DeclaredSuffix};
@@ -187,6 +187,39 @@ impl Report {
             names.join(", ")
         ));
     }
+
+    /// What was found wrong on the way, for an error that ends the
+    /// description: the cause is almost always among these, and refusing
+    /// with "compile it first" while holding "the dproj defines no property
+    /// group for Relase/Win32" sends the reader looking in the wrong place.
+    fn diagnosis(&self) -> String {
+        if self.warnings.is_empty() {
+            return String::new();
+        }
+        format!("\n{}", self.warnings.iter().map(|warning| format!("- {warning}")).collect::<Vec<_>>().join("\n"))
+    }
+
+    fn warn_collapsed(&mut self, what: &str, value: &str) {
+        self.warn(format!(
+            "{what} is \"{value}\", a path with no drive: a variable the dproj tests in a condition expanded \
+             to nothing. It was ignored rather than read as a directory of the drive DevKit runs from."
+        ));
+    }
+
+    /// Whether this dproj value cannot serve as a path, saying why: a
+    /// variable nothing defines, or one that collapsed out of it and left a
+    /// driveless rooted path behind.
+    fn unusable_path(&mut self, what: &str, value: &str) -> bool {
+        if has_unresolved_macro(value) {
+            self.warn_unresolved(what, value);
+            return true;
+        }
+        if looks_collapsed(value) {
+            self.warn_collapsed(what, value);
+            return true;
+        }
+        false
+    }
 }
 
 fn push_once(lines: &mut Vec<String>, line: String) {
@@ -222,6 +255,18 @@ pub fn project_to_describe(
         described.active_platform = platform;
     }
     let mut warnings = Vec::new();
+    // A bare source has no dproj to name an output directory per build: it
+    // compiles to one path whatever the configuration and platform, so the
+    // binary described is simply whichever build wrote it last.
+    if described.dproj.is_none() {
+        warnings.push(format!(
+            "Project \"{}\" has no .dproj, so it builds to one path for every configuration and platform: \
+             the executable described is the one the last build left there, which need not be {} {}.",
+            described.name,
+            described.active_configuration.as_deref().unwrap_or("its active configuration"),
+            described.active_platform.as_deref().unwrap_or("its active platform")
+        ));
+    }
     if let Err(error) = described.discover_paths(ide_env) {
         described.exe = None;
         described.dproj_run_params = None;
@@ -295,18 +340,20 @@ pub fn build_debug_target_with(
         (_, Some(host), _) => host.clone(),
         (DebugTargetKind::Program, None, Some(exe)) => exe.clone(),
         (DebugTargetKind::Program, None, None) => bail!(
-            "Project \"{}\" has no executable to debug for {} {}. Compile it first.",
+            "Project \"{}\" has no executable to debug for {} {}. Compile it first.{}",
             project.name,
             context.config,
-            context.platform
+            context.platform,
+            report.diagnosis()
         ),
         (_, None, _) => bail!(
             "{} \"{}\" has no Host Application to debug through for {} {}. Set one via Project > Options > \
-             Debugger in the Delphi IDE, or DevKit's \"Set Host Application\".",
+             Debugger in the Delphi IDE, or DevKit's \"Set Host Application\".{}",
             if kind == DebugTargetKind::Package { "Package" } else { "Library" },
             project.name,
             context.config,
-            context.platform
+            context.platform,
+            report.diagnosis()
         ),
     };
     // The launched executable's own symbols are required only when it is
@@ -394,6 +441,9 @@ enum Directory {
     /// A `$(NAME)` in it has no definition; the expanded text is kept for
     /// the report.
     Unresolved(String),
+    /// A variable expanded to nothing and left a driveless rooted path —
+    /// see [`crate::files::dproj::looks_collapsed`].
+    Collapsed(String),
 }
 
 impl<'a> TargetContext<'a> {
@@ -497,8 +547,7 @@ impl<'a> TargetContext<'a> {
             let Some(host) = host.as_deref().map(str::trim).filter(|host| !host.is_empty()) else {
                 continue;
             };
-            if has_unresolved_macro(host) {
-                report.warn_unresolved(what, host);
+            if report.unusable_path(what, host) {
                 continue;
             }
             return Some(absolutize(host, &self.project.directory).to_string_lossy().to_string());
@@ -507,8 +556,7 @@ impl<'a> TargetContext<'a> {
         if live.is_empty() {
             return None;
         }
-        if has_unresolved_macro(live) {
-            report.warn_unresolved("The dproj's Host Application", live);
+        if report.unusable_path("The dproj's Host Application", live) {
             return None;
         }
         Some(absolutize(live, &self.project.directory).to_string_lossy().to_string())
@@ -568,9 +616,9 @@ impl<'a> TargetContext<'a> {
             DeclaredSuffix::Auto => self.compiler.package_version.to_string(),
             DeclaredSuffix::Ambiguous(candidates) => {
                 report.warn(format!(
-                    "{main_source} declares several {{$LIBSUFFIX}} values ({}) under conditions DevKit cannot \
-                     evaluate; the module name is given without a suffix and may be wrong.",
-                    candidates.join(", ")
+                    "{main_source} decides its {{$LIBSUFFIX}} under conditions DevKit cannot evaluate — it could \
+                     be {}; the module name is given without a suffix and may be wrong.",
+                    candidates.join(" or ")
                 ));
                 String::new()
             }
@@ -578,18 +626,38 @@ impl<'a> TargetContext<'a> {
     }
 
     /// The conditional symbols in effect for this build: the compiler's
-    /// version symbol, the platform's, and the project's own defines.
+    /// version symbol, what its RTL defines, the platform's, and the
+    /// project's own defines.
     fn build_symbols(&self) -> BuildSymbols {
-        let mut defined = vec![self.compiler.condition.clone(), "MSWINDOWS".to_string(), "CONDITIONALEXPRESSIONS".to_string()];
+        let mut defined = vec![self.compiler.condition.clone(), "CONDITIONALEXPRESSIONS".to_string()];
+        // Delphi 2009 (CompilerVersion 20) was the first with Unicode strings.
+        if self.compiler.compiler_version >= 20 {
+            defined.push("UNICODE".to_string());
+        }
         let platform_symbols: &[&str] = match self.platform.to_lowercase().as_str() {
-            "win32" => &["WIN32", "CPUX86", "CPU386", "CPU32BITS"],
-            "win64" | "win64x" => &["WIN64", "CPUX64", "CPU64BITS"],
+            "win32" => &["MSWINDOWS", "WIN32", "CPUX86", "CPU386", "CPU32BITS"],
+            "win64" | "win64x" => &["MSWINDOWS", "WIN64", "CPUX64", "CPU64BITS"],
             _ => &[],
         };
+        // Only for a platform listed here are the compiler's platform
+        // symbols known in full; for any other, a missing one decides nothing.
+        let platform_known = !platform_symbols.is_empty();
         defined.extend(platform_symbols.iter().map(|symbol| symbol.to_string()));
         let project_defines = self.group.as_ref().and_then(|group| group.dcc_options.define.clone()).unwrap_or_default();
         defined.extend(project_defines.split(';').map(str::trim).filter(|symbol| !symbol.is_empty()).map(str::to_string));
-        BuildSymbols { defined, compiler_version: self.compiler.compiler_version as f64 }
+        // A compiler configuration records one `VERxxx`. That is the whole
+        // truth for every release but Delphi 2007 (CompilerVersion 18.5),
+        // which declares `VER180` next to `VER185` for being a non-breaking
+        // release; for it the family decides nothing.
+        let version_symbols_known = self.compiler.compiler_version >= 20;
+        // Every release but Delphi 2007 has a whole-numbered
+        // `CompilerVersion`, which is all a configuration can record; 18.5
+        // is therefore not available and nothing may be concluded from it.
+        let compiler_version = match self.compiler.compiler_version {
+            19 => None,
+            version => Some(version as f64),
+        };
+        BuildSymbols { defined, compiler_version, platform_known, version_symbols_known }
     }
 
     // ─── Modules ─────────────────────────────────────────────────────────
@@ -697,6 +765,7 @@ impl<'a> TargetContext<'a> {
         match self.directory(raw) {
             Directory::Found(dir) => directories.push(dir),
             Directory::Unresolved(value) => report.warn_unresolved(what, &value),
+            Directory::Collapsed(value) => report.warn_collapsed(what, &value),
             Directory::Blank => {}
         }
     }
@@ -712,6 +781,11 @@ impl<'a> TargetContext<'a> {
         let expanded = self.macros.expand(raw);
         if has_unresolved_macro(&expanded) {
             return Directory::Unresolved(expanded);
+        }
+        // A variable that collapsed is as unusable as one still standing:
+        // `\bpl` is a directory of whatever drive the server runs from.
+        if looks_collapsed(&expanded) {
+            return Directory::Collapsed(expanded);
         }
         Directory::Found(absolutize(&expanded, &self.project.directory))
     }
@@ -756,7 +830,9 @@ impl<'a> TargetContext<'a> {
             for entry in list.unwrap_or_default().split(';') {
                 match self.directory(Some(entry)) {
                     Directory::Found(dir) => push_unique(&mut candidates, dir),
-                    Directory::Unresolved(value) => push_once(&mut unresolved, format!("{value} (in {origin})")),
+                    Directory::Unresolved(value) | Directory::Collapsed(value) => {
+                        push_once(&mut unresolved, format!("{value} (in {origin})"))
+                    }
                     Directory::Blank => {}
                 }
             }

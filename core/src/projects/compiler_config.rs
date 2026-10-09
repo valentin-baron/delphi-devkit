@@ -232,3 +232,20 @@ impl FilePath for CompilerConfigurations {
 pub async fn compiler_exists(key: &str) -> bool {
     CompilerConfigurations::get_state().read().await._compilers.contains_key(key)
 }
+#[cfg(test)]
+mod preset_tests {
+    use super::*;
+
+    /// Every preset's `condition` is the `VERxxx` of the compiler that
+    /// builds for Windows, which the debug target reads to evaluate a
+    /// package's `{$LIBSUFFIX}` conditions. Delphi 2007 is the one whose
+    /// Win32 symbol (`VER185`) differs from the .NET compiler's (`VER190`)
+    /// and whose `CompilerVersion` (18.5) no whole number can record.
+    #[test]
+    fn the_delphi_2007_preset_names_the_win32_compiler() {
+        let presets: HashMap<String, CompilerConfiguration> = ron::from_str(DEFAULT_COMPILERS).expect("presets parse");
+        let delphi_2007 = presets.get("2007").expect("a 2007 preset");
+
+        assert_eq!(delphi_2007.condition, "VER185");
+    }
+}

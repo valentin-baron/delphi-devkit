@@ -282,7 +282,10 @@ impl Project {
             .get_exe_path_for(&cfg, &plat)
             .ok()
             .map(normalize_path)
-            .filter(|exe| !crate::files::dproj::has_unresolved_macro(&exe.to_string_lossy()));
+            .filter(|exe| {
+                let path = exe.to_string_lossy();
+                !crate::files::dproj::has_unresolved_macro(&path) && !crate::files::dproj::looks_collapsed(&path)
+            });
         Ok(exe)
     }
 

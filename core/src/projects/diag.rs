@@ -4,33 +4,62 @@ use std::fmt::Display;
 
 // Standard MSBuild / dcc32 format:
 // <file>(<line>[,<col>]): (error|warning|hint|fatal) <CODE>: <message> [<project>]
-const MSBUILD_OUTPUT_REGEX: &str = r"^(?P<file>.*?)[(](?P<line>\d+)(?:,(?P<column>\d+))?[)]:\s+(?P<kind>.*?)\s+(?P<code>[A-Z]\d+):\s+(?P<message>.*?)(?:\s+\[.*\])?$";
-
-// Tail shared by the two native-dcc formats below, starting after the closing
-// parenthesis of the line/column notation:
-//   [whitespace]<localized_label>: <CODE> <message>[ [<project>]]
 //
-// The label is the compiler's localized severity word ("Warning:", "Warnung:",
-// "Hinweis:", "Fatal Error:"). It is therefore matched as "letters and spaces",
-// never by a fixed word list, and the severity is derived from <CODE> alone.
-// Delphi 2007 separates the label from the parenthesis by a space, Delphi 12
-// glues it on ("...pas(205)Warnung: W1057 ..."), so the separator is optional.
-// The label itself is optional too, but it can never start with ':' – that keeps
-// this tail disjoint from the MSBuild format above ("...pas(205): warning W1057:"),
-// whose code is followed by a colon and can never satisfy "<CODE><space>".
-const DCC_NATIVE_TAIL: &str = r"\s*(?:\p{L}[\p{L} ]*)?:\s*(?P<code>[A-Z]\d+)\s+(?P<message>\S.*?)(?:\s+\[[^\]]*\])?\s*$";
+// The trailing project suffix is matched as "[<no closing bracket>]" rather than
+// "[<anything>]": dcc emits messages that end in brackets themselves
+// ("W1054 Variable ist vom Typ array [0..9] [C:\P\My.dproj]"), and a greedy
+// "[.*]" would start at the first bracket and swallow the message's own.
+const MSBUILD_OUTPUT_REGEX: &str = r"^(?P<file>.*?)[(](?P<line>\d+)(?:,(?P<column>\d+))?[)]:\s+(?P<kind>.*?)\s+(?P<code>[A-Z]\d+):\s+(?P<message>.*?)(?:\s+\[[^\]]*\])?\s*$";
+
+// A source file as the compilers print it. The path may be absolute, relative
+// or a bare file name: dcc prints the unit exactly as it resolved it, so
+// "C:\Proj\Unit1.pas", "src\Unit1.pas" and "Unit1.pas" all occur (verified
+// against dcc32 18.5, 35.0, 36.0 and 37.0).
+//
+// What the capture must not do is run backwards over text that is no path, so
+// it is restricted to the characters a Windows path can hold. Excluding
+// `:"<>|*?` is what keeps the `<target> : warning : ` head of the wrapper line
+// below and a quoted command echo (`cmd /c "copy a b" (3)`) out of the file
+// name. Parentheses stay allowed because real paths contain them
+// ("C:\Program Files (x86)", "C:\Builds (2)"); the `(<line>)` group that follows
+// resolves that ambiguity.
+const DIAG_FILE: &str = r#"(?P<file>(?:[A-Za-z]:)?[^:"<>|*?\r\n]+?)"#;
+
+const DIAG_POSITION: &str = r"[(](?P<line>\d+)(?:,(?P<column>\d+))?[)]";
+
+// Tail shared by the two localized dcc formats below, starting after the closing
+// parenthesis of the line/column notation:
+//   [whitespace]<localized_label>: <CODE> <message>
+//
+// The label is the compiler's severity word in the IDE language ("Warnung:",
+// "Hinweis:", "Fehler:", "Schwerwiegend:", "Warning:"). It is therefore matched
+// as "letters and spaces", never by a fixed word list, and the severity is
+// derived from <CODE> alone. Every dcc checked separates the label from the
+// parenthesis by one space; the separator stays optional so a glued spelling
+// ("...pas(205)Warnung: W1057 ...") parses as well. The colon after the label is
+// mandatory and keeps this tail disjoint from the MSBuild format above, where it
+// is the code – not the label – that a colon follows.
+const DCC_LOCALIZED_TAIL: &str = r"\s*(?:\p{L}[\p{L} ]*)?:\s*(?P<code>[A-Z]\d+)\s+(?P<message>\S.*?)";
+
+// MSBuild appends the project file to the diagnostics it formats itself. That is
+// why it is no part of the shared tail: native dcc output never carries it, and
+// stripping it there would truncate the messages that end in brackets.
+const MSBUILD_PROJECT_SUFFIX: &str = r"(?:\s+\[[^\]]*\])?";
 
 // Delphi 2007 / Borland MSBuild wrapper format:
-// <target_file> : (warning|error|hint|fatal) : <source_file>(<line>)<tail>
-const DELPHI2007_MSBUILD_PREFIX: &str =
-    r"^.*?\s+:\s+(?:warning|error|hint|fatal)\s+:\s+(?P<file>.*?)[(](?P<line>\d+)(?:,(?P<column>\d+))?[)]";
+// <target_file> : (warning|error|hint|fatal) : <source_file>(<line>)<tail> [<project>]
+const DELPHI2007_MSBUILD_HEAD: &str = r"^.*?\s+:\s+(?:warning|error|hint|fatal)\s+:\s+";
 
-// Native compiler output without MSBuild wrapper (Delphi 2007 duplicate line as
-// well as the Delphi 12 dcc output MSBuild passes through verbatim), optionally
-// indented:
-//   <source_file>(<line>[,<col>])<tail>
-const DCC_NATIVE_PREFIX: &str =
-    r"^\s*(?P<file>\S.*?)[(](?P<line>\d+)(?:,(?P<column>\d+))?[)]";
+// Native compiler output without MSBuild wrapper: dcc32/dcc64 called directly
+// for a bare .dpr as well as the raw dcc lines MSBuild passes through. The
+// indentation is optional because only the pass-through is indented.
+const DCC_NATIVE_HEAD: &str = r"^\s*";
+
+// MSBuild's multi-processor console logger prefixes every line with the id of
+// the node that wrote it ("3>  C:\…"). It is removed before matching instead of
+// being tolerated inside each format: '>' cannot occur in a path, so a leading
+// "<digits>>" is never part of a diagnostic.
+const MSBUILD_NODE_PREFIX_REGEX: &str = r"^\s*\d+>";
 
 #[derive(Debug)]
 pub enum DiagnosticKind {
@@ -84,10 +113,13 @@ impl Display for CompilerLineDiagnostic {
 
 lazy_static::lazy_static! {
     pub static ref COMPILER_OUTPUT_REGEX: regex::Regex = regex::Regex::new(MSBUILD_OUTPUT_REGEX).unwrap();
-    static ref DELPHI2007_MSBUILD_OUTPUT_REGEX: regex::Regex =
-        regex::Regex::new(&format!("{DELPHI2007_MSBUILD_PREFIX}{DCC_NATIVE_TAIL}")).unwrap();
-    static ref DCC_NATIVE_OUTPUT_REGEX: regex::Regex =
-        regex::Regex::new(&format!("{DCC_NATIVE_PREFIX}{DCC_NATIVE_TAIL}")).unwrap();
+    static ref DELPHI2007_MSBUILD_OUTPUT_REGEX: regex::Regex = regex::Regex::new(&format!(
+        r"{DELPHI2007_MSBUILD_HEAD}{DIAG_FILE}{DIAG_POSITION}{DCC_LOCALIZED_TAIL}{MSBUILD_PROJECT_SUFFIX}\s*$"
+    )).unwrap();
+    static ref DCC_NATIVE_OUTPUT_REGEX: regex::Regex = regex::Regex::new(&format!(
+        r"{DCC_NATIVE_HEAD}{DIAG_FILE}{DIAG_POSITION}{DCC_LOCALIZED_TAIL}\s*$"
+    )).unwrap();
+    static ref MSBUILD_NODE_PREFIX: regex::Regex = regex::Regex::new(MSBUILD_NODE_PREFIX_REGEX).unwrap();
 }
 
 fn build_from_captures(captures: regex::Captures, compiler_name: String) -> Option<CompilerLineDiagnostic> {
@@ -132,16 +164,38 @@ impl CompilerLineDiagnostic {
     /// The severity is always derived from the message code, never from the
     /// label, which the compiler emits in the IDE's UI language.
     pub fn from_line(line: &str, compiler_name: String) -> Option<Self> {
-        if let Some(captures) = COMPILER_OUTPUT_REGEX.captures(line) {
+        let line = MSBUILD_NODE_PREFIX.replace(line, "");
+        if let Some(captures) = COMPILER_OUTPUT_REGEX.captures(&line) {
             return build_from_captures(captures, compiler_name);
         }
-        if let Some(captures) = DELPHI2007_MSBUILD_OUTPUT_REGEX.captures(line) {
+        if let Some(captures) = DELPHI2007_MSBUILD_OUTPUT_REGEX.captures(&line) {
             return build_from_captures(captures, compiler_name);
         }
-        if let Some(captures) = DCC_NATIVE_OUTPUT_REGEX.captures(line) {
+        if let Some(captures) = DCC_NATIVE_OUTPUT_REGEX.captures(&line) {
             return build_from_captures(captures, compiler_name);
         }
         None
+    }
+
+    /// Key that identifies a diagnostic for the "same as the previous one"
+    /// check in the output reader.
+    ///
+    /// Delphi 2007 reports every diagnostic twice – once through the
+    /// Borland.Delphi.Targets MSBuild wrapper and once as a plain dcc line –
+    /// with character-identical text, which is why the message is part of the
+    /// key: dcc legitimately reports several diagnostics with the same code for
+    /// one source line (one W1057 per implicitly converted argument of a call),
+    /// and those differ in nothing but the message.
+    ///
+    /// The file is lowercased because Windows paths are case-insensitive and the
+    /// two spellings of one diagnostic need not agree on the drive letter.
+    pub fn dedup_key(&self) -> (String, u32, String, String) {
+        (
+            self.file.to_lowercase(),
+            self.line,
+            self.code.clone(),
+            self.message.clone(),
+        )
     }
 }
 

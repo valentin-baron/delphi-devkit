@@ -1390,6 +1390,12 @@ async fn run_compile_collecting(
                     }
                 },
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                // Known gap: the broadcast has no backpressure, so a producer that
+                // outruns this loop by more than the channel capacity overwrites the
+                // oldest events, and the diagnostics they carried are missing from the
+                // JSON without a trace. Closing it means giving the compiler output a
+                // channel that blocks instead of dropping – a change to the shared
+                // CompilerProgress broadcast and therefore its own slice.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
             }
         }
@@ -1398,6 +1404,12 @@ async fn run_compile_collecting(
     let compile_result = compiler.compile().await;
 
     // Brief settling window for in-flight broadcasts, then stop collector.
+    // Known gap: compile() has already joined the output readers, so everything is
+    // sent by now – but the collector may still be working through the backlog, and
+    // the abort cuts whatever it has not processed after 100 ms. A deterministic end
+    // needs the loop to drain until the channel is empty rather than race a timer;
+    // the broadcast's sender is a process-wide OnceLock and never closes, so that
+    // needs a termination signal of its own and is left to its own slice.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     collect_handle.abort();
     let _ = collect_handle.await;
@@ -1711,9 +1723,24 @@ pub async fn cmd_debug_target(
             (fallback, Some(note))
         }
     };
-    let (described, discovery_warnings) =
-        crate::debug_target::project_to_describe(project, config, platform, &compiler.ide_environment_overrides());
-    let mut target = crate::debug_target::build_debug_target(&described, &compiler)?;
+    // Everything from here on is synchronous filesystem work — a dproj
+    // parse, an `is_dir` per search path entry, a `metadata` per artefact —
+    // and one entry on a disconnected share blocks it for the SMB timeout.
+    // The project is copied and the lock released first, so a slow describe
+    // costs its own caller and not every other reader and writer; the work
+    // itself goes to a blocking thread rather than parking a worker.
+    let project = project.clone();
+    drop(data);
+    let target = tokio::task::spawn_blocking(move || {
+        let (described, discovery_warnings) =
+            crate::debug_target::project_to_describe(&project, config, platform, &compiler.ide_environment_overrides());
+        crate::debug_target::build_debug_target(&described, &compiler).map(|target| (target, discovery_warnings))
+    })
+    .await;
+    let (mut target, discovery_warnings) = match target {
+        Ok(described) => described?,
+        Err(error) => bail!("Describing the debug target did not finish: {error}"),
+    };
     target.warnings.splice(0..0, discovery_warnings);
     target.notes.splice(0..0, compiler_note);
     Ok(DebugTargetOrAmbiguity::Target(target))

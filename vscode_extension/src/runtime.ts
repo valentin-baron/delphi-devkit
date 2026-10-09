@@ -63,7 +63,8 @@ export abstract class Runtime {
   }
 
   public static get activeProject(): Option<Entities.Project> {
-    return this.projectsData.projects.find((p) => p.id === this.projectsData.active_project_id);
+    // F5 can reach this before the server has sent anything.
+    return this.projectsData?.projects?.find((p) => p.id === this.projectsData.active_project_id);
   }
 
   /** Update VS Code context keys that govern keybinding `when` clauses.

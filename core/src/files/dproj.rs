@@ -85,12 +85,32 @@ lazy_static::lazy_static! {
     static ref MACRO_REFERENCE: regex::Regex = regex::Regex::new(r"\$\(([^()\s]+)\)").unwrap();
     /// The expression of a `Condition="…"` attribute.
     static ref CONDITION: regex::Regex = regex::Regex::new(r#"Condition\s*=\s*"([^"]*)""#).unwrap();
+    /// The name of an element the dproj opens, i.e. a property it declares.
+    static ref PROPERTY_ELEMENT: regex::Regex = regex::Regex::new(r"<([A-Za-z_][\w.-]*)[\s>]").unwrap();
 }
 
 /// Whether `value` still holds a `$(Name)` that nothing resolved — see
 /// [`seed_environment`]. Such a value is not a usable path.
 pub fn has_unresolved_macro(value: &str) -> bool {
     value.contains("$(")
+}
+
+/// Whether `value` is a path a variable collapsed out of. The names a
+/// `Condition` tests cannot be seeded with their own reference — see
+/// [`seed_environment`] — so for those, dproj-rs still expands `$(VEGADIR)`
+/// to nothing and `$(VEGADIR)\bpl` arrives as `\bpl`: rooted, with no drive
+/// and no host, which is a directory that exists on whatever drive the
+/// server happens to run from. The collapse is visible in the shape of the
+/// result whichever variable caused it, and a dproj has no reason to name a
+/// driveless rooted path otherwise. A UNC path (`\\host\share`) is not one.
+pub fn looks_collapsed(value: &str) -> bool {
+    let path = value.trim();
+    let mut characters = path.chars();
+    match (characters.next(), characters.next()) {
+        (Some('\\'), Some('\\')) | (Some('/'), Some('/')) => false,
+        (Some('\\'), _) | (Some('/'), _) => true,
+        _ => false,
+    }
 }
 
 /// The names of the `$(Name)` references left in `value`.
@@ -120,9 +140,19 @@ pub fn unresolved_macros(value: &str) -> Vec<String> {
 ///
 /// Names the dproj defines as properties (`$(DCC_UnitSearchPath)` inside its
 /// own definition, `$(Base)`, `$(Cfg_1)`) keep MSBuild's semantics — empty
-/// until defined — and so do names a `Condition` tests, whose truth must not
-/// change.
+/// until defined — since the dproj fills them itself as it is evaluated.
+/// That covers the machinery the build configurations are selected with,
+/// whose truth must not change.
+///
+/// So do the names a `Condition` tests, and that carve-out is not optional:
+/// the IDE guards its own property groups with flags it tests before it
+/// declares them (`'$(Cfg_2_Win64)'!=''`), and a seeded `$(Cfg_2_Win64)` is
+/// a non-empty string, which makes every such group merge and the wrong
+/// build configuration win. The cost is that a value under a variable that
+/// a condition also tests still collapses — `$(VEGADIR)\bpl` to `\bpl` —
+/// where dproj-rs offers one environment for conditions and values alike.
 pub fn seed_environment(mut environment: HashMap<String, String>, dproj_source: &str) -> HashMap<String, String> {
+    let declared = declared_properties(dproj_source);
     let tested_by_a_condition: Vec<String> = CONDITION
         .captures_iter(dproj_source)
         .flat_map(|condition| unresolved_macros(&condition[1]))
@@ -139,14 +169,22 @@ pub fn seed_environment(mut environment: HashMap<String, String>, dproj_source: 
             environment.insert(name, value);
             continue;
         }
-        let is_a_property_of_the_dproj = dproj_source.contains(&format!("<{name}>")) || dproj_source.contains(&format!("<{name} "));
+        let is_declared = declared.iter().any(|property| property.eq_ignore_ascii_case(&name));
         let is_tested = tested_by_a_condition.iter().any(|tested| tested.eq_ignore_ascii_case(&name));
-        if is_a_property_of_the_dproj || is_tested || name.starts_with("MSBuild") {
+        if is_declared || is_tested || name.starts_with("MSBuild") {
             continue;
         }
         environment.insert(name.clone(), format!("$({name})"));
     }
     environment
+}
+
+/// The property names the dproj declares as elements of its own. Matched
+/// whatever their casing, as MSBuild resolves them: a dproj that writes
+/// `$(DCC_UNITSEARCHPATH)` for the `<DCC_UnitSearchPath>` it declares two
+/// lines above means the same property.
+fn declared_properties(dproj_source: &str) -> Vec<String> {
+    PROPERTY_ELEMENT.captures_iter(dproj_source).map(|element| element[1].to_string()).collect()
 }
 
 /// Parses the dproj at `dproj_path`, evaluating it with `environment`
@@ -192,11 +230,46 @@ mod environment_tests {
     }
 
     #[test]
-    fn properties_of_the_dproj_and_tested_names_keep_msbuild_semantics() {
+    fn properties_the_dproj_declares_keep_msbuild_semantics() {
         let seeded = seed_environment(environment(&[]), DPROJ);
-        for untouched in ["DCC_UnitSearchPath", "Base", "OnlyTested", "MSBuildProjectName"] {
+        for untouched in ["DCC_UnitSearchPath", "Base", "MSBuildProjectName"] {
             assert!(!seeded.contains_key(untouched), "{untouched} must stay undefined");
         }
+    }
+
+    /// A property is the dproj's own whatever casing the reference uses;
+    /// otherwise the dproj's own value for it is dropped as unresolved.
+    #[test]
+    fn a_property_is_recognised_whatever_casing_the_reference_uses() {
+        const SHOUTED: &str = r#"<Project>
+            <PropertyGroup>
+                <DCC_UnitSearchPath>$(DCC_UNITSEARCHPATH);src</DCC_UnitSearchPath>
+            </PropertyGroup>
+        </Project>"#;
+        let seeded = seed_environment(environment(&[]), SHOUTED);
+
+        assert!(!seeded.contains_key("DCC_UNITSEARCHPATH"), "the dproj declares it, whatever the casing");
+    }
+
+    /// The IDE guards its property groups with flags it tests before it
+    /// declares them; a seeded one is a non-empty string and would make
+    /// every such group merge.
+    #[test]
+    fn a_name_a_condition_tests_keeps_msbuild_semantics() {
+        let seeded = seed_environment(environment(&[]), DPROJ);
+
+        assert!(!seeded.contains_key("OnlyTested"), "a tested name must stay undefined");
+    }
+
+    #[test]
+    fn a_path_a_variable_collapsed_out_of_is_recognised() {
+        assert!(looks_collapsed(r"\bpl"));
+        assert!(looks_collapsed(r"\Host.exe"));
+        assert!(looks_collapsed("/usr/lib"), "a forward-slash root collapses the same way");
+        assert!(!looks_collapsed(r"\\server\share\bpl"), "a UNC path is a real one");
+        assert!(!looks_collapsed(r"C:\bpl"));
+        assert!(!looks_collapsed(r".\Win64\Debug"));
+        assert!(!looks_collapsed(""));
     }
 
     #[test]

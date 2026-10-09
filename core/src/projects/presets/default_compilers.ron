@@ -234,7 +234,10 @@
         ]
     ),
     "2007": (
-        condition: "VER190",
+        // The Win32 compiler of Delphi 2007 declares VER185 (and VER180
+        // besides, being a non-breaking release). VER190 is the 2007
+        // compiler for .NET, which no Win32 build defines.
+        condition: "VER185",
         product_name: "Delphi 2007",
         product_version: 5,
         package_version: 110,
