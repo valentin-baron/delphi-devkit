@@ -56,6 +56,10 @@ export class DdkBuildBeforeDebug implements DebugConfigurationProvider {
     const picked = this.pickedLink;
     this.pickedLink = undefined;
     if (configuration.request !== 'launch' || !compileBeforeDebug()) return configuration;
+    // A `delphi` configuration that names no project is not DDK's to build:
+    // the debugger extension owns the type, and a hand-written entry may
+    // launch an executable directly.
+    if (configuration.ddkProject === undefined || configuration.ddkProject === null) return configuration;
     const project = projectReferredTo(configuration.ddkProject, allProjects());
     if (!project) {
       // Silence here would be the failure the build exists to prevent: the

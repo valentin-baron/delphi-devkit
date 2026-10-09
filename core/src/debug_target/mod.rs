@@ -167,10 +167,11 @@ impl Report {
         format!("\n{}", self.warnings.iter().map(|warning| format!("- {warning}")).collect::<Vec<_>>().join("\n"))
     }
 
-    fn warn_collapsed(&mut self, what: &str, value: &str) {
+    fn warn_collapsed(&mut self, what: &str, value: &str, resolved: &Path) {
         self.warn(format!(
-            "{what} is \"{value}\", a path with no drive: a variable the dproj tests in a condition expanded \
-             to nothing. It was ignored rather than read as a directory of the drive DevKit runs from."
+            "{what} is \"{value}\", a path with no drive — either the dproj means the project's own drive, \
+             or a variable in it expanded to nothing. It was read as \"{}\"; check that is the intended one.",
+            resolved.display()
         ));
     }
 
@@ -178,10 +179,6 @@ impl Report {
     fn unusable_path(&mut self, what: &str, value: &str) -> bool {
         if has_unresolved_macro(value) {
             self.warn_unresolved(what, value);
-            return true;
-        }
-        if looks_collapsed(value) {
-            self.warn_collapsed(what, value);
             return true;
         }
         false
@@ -208,24 +205,24 @@ pub fn project_to_describe(
     ide_env: &[(String, String)],
 ) -> (Project, Vec<String>) {
     let mut described = project.clone();
+    let mut warnings = Vec::new();
+    // True of the active build as much as of a requested one, so it is said
+    // before the overrides are considered at all.
+    if described.dproj.is_none() {
+        warnings.push(format!(
+            "Project \"{}\" has no .dproj, so it builds to one path for every configuration and platform: \
+             the executable described is whichever build last wrote it.",
+            described.name
+        ));
+    }
     if config.is_none() && platform.is_none() {
-        return (described, Vec::new());
+        return (described, warnings);
     }
     if config.is_some() {
         described.active_configuration = config;
     }
     if platform.is_some() {
         described.active_platform = platform;
-    }
-    let mut warnings = Vec::new();
-    if described.dproj.is_none() {
-        warnings.push(format!(
-            "Project \"{}\" has no .dproj, so it builds to one path for every configuration and platform: \
-             the executable described is the one the last build left there, which need not be {} {}.",
-            described.name,
-            described.active_configuration.as_deref().unwrap_or("its active configuration"),
-            described.active_platform.as_deref().unwrap_or("its active platform")
-        ));
     }
     if let Err(error) = described.discover_paths(ide_env) {
         described.exe = None;
@@ -393,9 +390,10 @@ enum Directory {
     Found(PathBuf),
     /// A `$(NAME)` in it has no definition.
     Unresolved(String),
-    /// A variable expanded to nothing and left a driveless rooted path —
-    /// see [`crate::files::dproj::looks_collapsed`].
-    Collapsed(String),
+    /// Rooted with no drive: the dproj's own meaning and a variable that
+    /// expanded to nothing look identical here. Carries the value as
+    /// written and the path it was resolved to, which is used.
+    Doubtful(String, PathBuf),
 }
 
 impl<'a> TargetContext<'a> {
@@ -596,9 +594,13 @@ impl<'a> TargetContext<'a> {
         // `VER180` beside `VER185`, being a non-breaking release.
         let version_symbols_known = self.compiler.compiler_version >= 20;
         // A configuration can only record a whole-numbered `CompilerVersion`,
-        // so Delphi 2007's 18.5 is unavailable and decides nothing.
+        // so Delphi 2007's 18.5 is unavailable and decides nothing. Keyed on
+        // the era rather than on 19 exactly: the preset's number for that
+        // release is itself disputable (19 is the .NET compiler, 18 would be
+        // a truncated 18.5), and either spelling must withhold the value
+        // rather than answer with a wrong one.
         let compiler_version = match self.compiler.compiler_version {
-            19 => None,
+            version if version < 20 => None,
             version => Some(version as f64),
         };
         BuildSymbols { defined, compiler_version, platform_known, version_symbols_known }
@@ -707,7 +709,10 @@ impl<'a> TargetContext<'a> {
         match self.directory(raw) {
             Directory::Found(dir) => directories.push(dir),
             Directory::Unresolved(value) => report.warn_unresolved(what, &value),
-            Directory::Collapsed(value) => report.warn_collapsed(what, &value),
+            Directory::Doubtful(value, dir) => {
+                report.warn_collapsed(what, &value, &dir);
+                directories.push(dir);
+            }
             Directory::Blank => {}
         }
     }
@@ -723,12 +728,17 @@ impl<'a> TargetContext<'a> {
         if has_unresolved_macro(&expanded) {
             return Directory::Unresolved(expanded);
         }
-        // As unusable as a macro still standing: `\bpl` is a directory of
-        // whatever drive the server runs from.
+        // A driveless root is either a dproj that means the project's drive
+        // — which `absolutize` gives it, correctly — or a variable that
+        // expanded to nothing, which dproj-rs does before this layer ever
+        // sees the value, so the two cannot be told apart here. The path is
+        // used either way and the doubt is reported: dropping it would lose
+        // the first case, trusting it silently would ship the second.
+        let resolved = absolutize(&expanded, &self.project.directory);
         if looks_collapsed(&expanded) {
-            return Directory::Collapsed(expanded);
+            return Directory::Doubtful(expanded, resolved);
         }
-        Directory::Found(absolutize(&expanded, &self.project.directory))
+        Directory::Found(resolved)
     }
 
     /// `$(BDSCOMMONDIR)\<kind>\<platform>`, plus the root
@@ -761,12 +771,15 @@ impl<'a> TargetContext<'a> {
         ];
         let mut candidates = vec![normalize_path(&self.project.directory)];
         let mut unresolved: Vec<String> = Vec::new();
+        let mut collapsed: Vec<String> = Vec::new();
         for (origin, list) in lists {
             for entry in list.unwrap_or_default().split(';') {
                 match self.directory(Some(entry)) {
                     Directory::Found(dir) => push_unique(&mut candidates, dir),
-                    Directory::Unresolved(value) | Directory::Collapsed(value) => {
-                        push_once(&mut unresolved, format!("{value} (in {origin})"))
+                    Directory::Unresolved(value) => push_once(&mut unresolved, format!("{value} (in {origin})")),
+                    Directory::Doubtful(value, dir) => {
+                        push_once(&mut collapsed, format!("{value} (in {origin})"));
+                        push_unique(&mut candidates, dir);
                     }
                     Directory::Blank => {}
                 }
@@ -777,6 +790,17 @@ impl<'a> TargetContext<'a> {
                 "{} source search path entries depend on a $(NAME) nothing defines and were left out: {}.",
                 unresolved.len(),
                 summary(&unresolved)
+            ));
+        }
+        // Kept apart from the above: these were used, and the variable
+        // behind them is defined-but-empty rather than undefined, so
+        // "nothing defines it" would send the reader after the wrong thing.
+        if !collapsed.is_empty() {
+            report.warn(format!(
+                "{} source search path entries are rooted with no drive and were read against the project's: \
+                 {}. Either the dproj means that, or a variable in them expanded to nothing.",
+                collapsed.len(),
+                summary(&collapsed)
             ));
         }
         let (existing, missing): (Vec<PathBuf>, Vec<PathBuf>) = candidates.into_iter().partition(|dir| dir.is_dir());

@@ -237,10 +237,15 @@ mod environment_tests {
     fn a_path_a_variable_collapsed_out_of_is_recognised() {
         assert!(looks_collapsed(r"\bpl"));
         assert!(looks_collapsed(r"\Host.exe"));
-        assert!(looks_collapsed("/usr/lib"), "a forward-slash root collapses the same way");
+        assert!(looks_collapsed("/usr/lib"), "a forward-slash root reads the same way");
+        // The shapes a false alarm would come from.
         assert!(!looks_collapsed(r"\\server\share\bpl"), "a UNC path is a real one");
+        assert!(!looks_collapsed(r"\\?\C:\bpl"), "an extended-length path is a real one");
+        assert!(!looks_collapsed(r"\\?\UNC\server\share"), "so is its UNC form");
+        assert!(!looks_collapsed(r"\\.\pipe\x"), "so is a device path");
         assert!(!looks_collapsed(r"C:\bpl"));
         assert!(!looks_collapsed(r".\Win64\Debug"));
+        assert!(!looks_collapsed("  "), "blank is not a path at all");
         assert!(!looks_collapsed(""));
     }
 

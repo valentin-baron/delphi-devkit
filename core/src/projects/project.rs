@@ -261,10 +261,12 @@ impl Project {
             .get_exe_path_for(&cfg, &plat)
             .ok()
             .map(normalize_path)
-            .filter(|exe| {
-                let path = exe.to_string_lossy();
-                !crate::files::dproj::has_unresolved_macro(&path) && !crate::files::dproj::looks_collapsed(&path)
-            });
+            // A collapsed path is deliberately not filtered here: `Project`
+            // has no report to say so with, and dropping the executable
+            // silently leaves the debug target refusing with "compile it
+            // first" for a project that is compiled. The describe holds the
+            // raw value and warns there.
+            .filter(|exe| !crate::files::dproj::has_unresolved_macro(&exe.to_string_lossy()));
         Ok(exe)
     }
 

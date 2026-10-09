@@ -1570,15 +1570,24 @@ pub async fn cmd_debug_target(
     // release the lock first, so a slow describe costs only its own caller.
     let project = project.clone();
     drop(data);
-    let target = tokio::task::spawn_blocking(move || {
+    let described = tokio::task::spawn_blocking(move || {
         let (described, discovery_warnings) =
             crate::debug_target::project_to_describe(&project, config, platform, &compiler.ide_environment_overrides());
-        crate::debug_target::build_debug_target(&described, &compiler).map(|target| (target, discovery_warnings))
+        (crate::debug_target::build_debug_target(&described, &compiler), discovery_warnings)
     })
     .await;
-    let (mut target, discovery_warnings) = match target {
-        Ok(described) => described?,
+    let (target, discovery_warnings) = match described {
+        Ok(described) => described,
         Err(error) => bail!("Describing the debug target did not finish: {error}"),
+    };
+    // The discovery warnings travel with a refusal too: they are the ones
+    // that name the build being described, and refusing without them is how
+    // "compile it first" ends up standing in for "that platform has no
+    // output directory".
+    let mut target = match target {
+        Ok(target) => target,
+        Err(error) if discovery_warnings.is_empty() => return Err(error),
+        Err(error) => bail!("{error}\n{}", discovery_warnings.iter().map(|w| format!("- {w}")).collect::<Vec<_>>().join("\n")),
     };
     target.warnings.splice(0..0, discovery_warnings);
     target.notes.splice(0..0, compiler_note);

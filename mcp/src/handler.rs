@@ -356,8 +356,11 @@ impl ServerHandler for DdkMcpHandler {
     ) -> Result<CallToolResult, CallToolError> {
         let name = params.name.as_str();
         let args = Value::Object(params.arguments.clone().unwrap_or_default());
+        // Returned as an error result, not as text: a `CallToolResult` with
+        // no `isError` is a success on the wire, so a client branching on it
+        // would read "the call was fine" about a call that did nothing.
         if let Err(message) = reject_unknown_arguments(name, &args) {
-            return Ok(CallToolResult::text_content(vec![TextContent::from(message)]));
+            return Ok(CallToolResult::with_error(CallToolError::from_message(message)));
         }
         let result_text = match name {
             "get_ddk_extension_info"          => get_ddk_extension_info().await,
@@ -375,7 +378,9 @@ impl ServerHandler for DdkMcpHandler {
             "delphi_format_file"              => format_file(&args).await,
             "delphi_generate_delphilsp_config" => generate_delphilsp_config(&args).await,
             "delphi_get_debug_target"         => get_debug_target(&args).await,
-            _ => format!("Unknown tool: {name}"),
+            // Also an error result: a name the server does not serve is a
+            // protocol failure, not an answer.
+            _ => return Ok(CallToolResult::with_error(CallToolError::unknown_tool(name))),
         };
         Ok(CallToolResult::text_content(vec![TextContent::from(result_text)]))
     }
@@ -401,11 +406,14 @@ fn reject_unknown_arguments(tool: &str, args: &Value) -> Result<(), String> {
     }
     let mut names: Vec<&str> = accepted.keys().map(String::as_str).collect();
     names.sort_unstable();
+    let takes = match names.is_empty() {
+        true => "It takes none.".to_string(),
+        false => format!("It takes: {}.", names.join(", ")),
+    };
     Err(format!(
-        "Unknown parameter{} for {tool}: {}. It takes: {}.",
+        "Unknown parameter{} for {tool}: {}. {takes}",
         if unknown.len() == 1 { "" } else { "s" },
-        unknown.join(", "),
-        names.join(", ")
+        unknown.join(", ")
     ))
 }
 
@@ -633,7 +641,17 @@ mod argument_tests {
         let call = json!({ "project": "be", "rebuild": true, "debug_info": true });
 
         assert_eq!(reject_unknown_arguments("delphi_compile_project", &call), Ok(()));
-        assert_eq!(reject_unknown_arguments("delphi_list_projects", &json!({})), Ok(()));
+    }
+
+    /// A tool that takes nothing still has to reject something, and say so
+    /// without trailing an empty list.
+    #[test]
+    fn a_tool_that_takes_no_parameters_rejects_one_it_is_given() {
+        let message = reject_unknown_arguments("delphi_list_projects", &json!({ "bogus": 1 }))
+            .expect_err("a tool with no parameters accepts none");
+
+        assert!(message.contains("bogus"), "{message}");
+        assert!(message.contains("takes none"), "{message}");
     }
 
     /// An unknown tool is answered by the dispatcher; checking its arguments

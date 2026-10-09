@@ -592,11 +592,13 @@ fn a_dproj_value_depending_on_an_undefined_variable_is_reported_and_not_used() {
 }
 
 /// A variable a condition tests cannot be seeded with its own reference
-/// without flipping that condition, so dproj-rs still expands it to
-/// nothing. The driveless rooted path it leaves is a real directory of the
-/// server's own drive, and must not pass for the project's output.
+/// without flipping that condition, so dproj-rs expands it to nothing
+/// before this layer sees the value. The driveless root it leaves is then
+/// indistinguishable from a dproj that means the project's own drive, so
+/// the path is used — against the project's drive, which is what the
+/// compiler would do — and the doubt is reported rather than swallowed.
 #[test]
-fn a_dproj_value_a_tested_variable_collapsed_out_of_is_reported_and_not_used() {
+fn a_dproj_value_rooted_without_a_drive_is_used_and_reported() {
     let tmp = tempfile::tempdir().unwrap();
     let fixture = TEST_PKG_SUFFIX
         .replace("<PropertyGroup>", r#"<PropertyGroup Condition="'$(SITE_DDK)'==''">"#)
@@ -607,10 +609,11 @@ fn a_dproj_value_a_tested_variable_collapsed_out_of_is_reported_and_not_used() {
     let target = describe(&project, &FakeIde::new());
 
     assert!(warns(&target, &["no drive"]), "{:?}", target.warnings);
+    // Reported, and still searched: a dproj may legitimately mean this.
     assert!(
-        !target.modules.iter().any(|module| module.binary.as_deref().is_some_and(|path| path.contains("/bpl/"))),
+        target.warnings.iter().any(|warning| warning.contains("DCC_BplOutput")),
         "{:?}",
-        target.modules
+        target.warnings
     );
 }
 
@@ -628,8 +631,10 @@ fn a_refusal_carries_what_was_found_on_the_way() {
     let error = build_debug_target_with(&project, &compiler(), &FakeIde::new()).expect_err("no executable");
     let message = error.to_string();
 
-    assert!(message.contains("Relase"), "{message}");
+    // Not that the configuration is named — the bail! interpolates it
+    // either way — but that the report gathered before the refusal is on it.
     assert!(message.contains("no property group"), "{message}");
+    assert!(message.lines().count() > 1, "the diagnosis is listed under the refusal: {message}");
 }
 
 #[test]
