@@ -1,8 +1,7 @@
 /**
- * What the extension exchanges with `ddk-server` and with debugger
- * extensions for the debug feature, and the decisions that depend only on
- * those values. Nothing here touches the `vscode` API, so all of it is
- * testable as plain functions.
+ * What the extension exchanges with `ddk-server` and with debugger extensions,
+ * and the decisions depending only on those values. Nothing here touches the
+ * `vscode` API, so all of it is testable as plain functions.
  */
 
 /** The reply to `projects/compile`: the build's outcome, once it has run. */
@@ -14,11 +13,10 @@ export interface CompileOutcome {
 }
 
 /**
- * Mirrors `ddk_core::debug_target::DebugTarget`, the reply to `debug/target`.
- * Both sides are checked against `core/tests/fixtures/debug_target.sample.json`.
- * Every path but `executable` is a file that exists; what is missing is said
- * in `warnings`. `warnings` are problems (empty means ready to debug),
- * `notes` are information.
+ * Mirrors `ddk_core::debug_target::DebugTarget`, the reply to `debug/target`;
+ * both sides are checked against `core/tests/fixtures/debug_target.sample.json`.
+ * Every path but `executable` is a file that exists. `warnings` are problems
+ * (empty means ready to debug), `notes` are information.
  */
 export interface DebugTarget {
   project_id: number | null;
@@ -54,17 +52,14 @@ function isStringArray(value: unknown): value is string[] {
 }
 
 /**
- * The outcome a `projects/compile` reply carries, or `undefined` when the
- * reply is not one — a `ddk-server` older than this extension answers
- * `null`. The caller decides what an unknown outcome means; it must never be
- * read as a property of whatever came back.
+ * `undefined` when the reply carries no outcome — a `ddk-server` older than
+ * this extension answers `null`. The caller decides what that means.
  */
 export function compileOutcomeOf(reply: unknown): CompileOutcome | undefined {
   if (!isRecord(reply) || typeof reply.success !== 'boolean') return undefined;
   return { success: reply.success, cancelled: reply.cancelled === true };
 }
 
-/** Whether `value` has the shape of a [`DebugTarget`]. */
 export function isDebugTarget(value: unknown): value is DebugTarget {
   if (!isRecord(value)) return false;
   const kinds = ['program', 'package', 'library'];
@@ -102,9 +97,8 @@ export function isDebugTarget(value: unknown): value is DebugTarget {
 }
 
 /**
- * Whether an extension's `package.json` contributes a debugger of `type`.
- * The manifest belongs to another extension: any shape other than the
- * expected one means "no", never an exception.
+ * The manifest belongs to another extension: any shape other than the expected
+ * one means "no", never an exception.
  */
 export function contributesDebugger(packageJson: unknown, type: string): boolean {
   if (!isRecord(packageJson) || !isRecord(packageJson.contributes)) return false;
@@ -124,19 +118,16 @@ function hasNamesake(project: NamedProject, all: readonly NamedProject[]): boole
 }
 
 /**
- * How a debug configuration refers to `project`: by name when that is
- * unique among `all`, else by id. Both resolve through
- * `ddk.debug.getDebugTarget`; a name reads better and survives a reset of
- * DDK's project list, an id is unambiguous.
+ * By name when that is unique among `all`, else by id — both resolve through
+ * `ddk.debug.getDebugTarget`. A name survives a reset of DDK's project list.
  */
 export function projectReference(project: NamedProject, all: readonly NamedProject[]): string {
   return hasNamesake(project, all) ? String(project.id) : project.name;
 }
 
 /**
- * The name a project's debug configuration is listed under. Projects of the
- * same name are told apart by their id, so the list never shows one label
- * twice.
+ * The label a project's debug configuration is listed under. Projects sharing
+ * a name are told apart by their id, so no label appears twice.
  */
 export function configurationName(request: 'launch' | 'attach', project: NamedProject, all: readonly NamedProject[]): string {
   const verb = request === 'launch' ? 'Debug' : 'Attach to';
@@ -145,9 +136,8 @@ export function configurationName(request: 'launch' | 'attach', project: NamedPr
 }
 
 /**
- * The project a `ddkProject` reference names among `all`: by id when the
- * reference is a number that is one, else by name when exactly one project
- * bears it. `undefined` when none or several do — a reference DDK's own
+ * By id when the reference is a number that is one, else by name when exactly
+ * one project bears it. `undefined` when none or several do — which DDK's own
  * configurations never produce, but a hand-written one can.
  */
 export function projectReferredTo<P extends NamedProject>(reference: unknown, all: readonly P[]): P | undefined {
@@ -166,12 +156,10 @@ export interface IdentifiedLink {
 }
 
 /**
- * The link a project is compiled through before a debug session: the one
- * the user acted on when it is among the project's links (a project linked
- * in two workspaces builds with the compiler of the workspace it was picked
- * in), else the project's first link — the rule the *Selected Project*
- * commands follow. `undefined` when the project has no link: it cannot be
- * compiled.
+ * The link a project is compiled through: the one the user acted on when it is
+ * among the project's links, so a project linked in two workspaces builds with
+ * the compiler of the workspace it was picked in; else the first link, as the
+ * *Selected Project* commands do. `undefined` means it cannot be compiled.
  */
 export function linkToCompile<L extends IdentifiedLink>(links: readonly L[], pickedLinkId?: number): L | undefined {
   return links.find((link) => link.id === pickedLinkId) ?? links[0];

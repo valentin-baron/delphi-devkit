@@ -27,13 +27,13 @@ export function getColumnInLine(lineText: string, message: string): number {
   const quotedString = message.match(/'(.*?)'/); // '%s' usually points to some symbol
   if (quotedString) {
     const quotedContent = quotedString ? quotedString[1] : '';
-    const dotIndex = quotedContent.indexOf('.'); // if the quoted content is referencing Class.Member, slice to just Member
+    const dotIndex = quotedContent.indexOf('.'); // a quoted Class.Member is searched for as Member
     const contentToFind = (dotIndex > 0 ? quotedContent.slice(dotIndex + 1) : quotedContent).toLowerCase();
     const targetLine = lineText.toLowerCase();
     if (contentToFind.length > 0 && targetLine.indexOf(contentToFind) >= 0)
       return Math.max(targetLine.indexOf(contentToFind) + 1, 1);
   }
-  return 1; // Default to column 1 if nothing found
+  return 1;
 }
 
 export class CompilerOutputDefinitionProvider implements DocumentLinkProvider {
@@ -44,7 +44,7 @@ export class CompilerOutputDefinitionProvider implements DocumentLinkProvider {
     document: TextDocument,
     token: CancellationToken
   ): Promise<DocumentLink[]> {
-    if (this.compilerIsActive) return []; // Don't provide links while compiler is running
+    if (this.compilerIsActive) return [];
     const text = document.getText();
     let lines = text.split(/\r?\n/g);
     const matches = (
@@ -104,5 +104,5 @@ export class CompilerOutputDefinitionProvider implements DocumentLinkProvider {
   public resolveDocumentLink(
     link: DocumentLink,
     token: CancellationToken
-  ): undefined {} // Dont do anything with incomplete links
+  ): undefined {} // Links are returned with their target set, so nothing resolves here.
 }

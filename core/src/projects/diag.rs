@@ -5,24 +5,21 @@ use std::fmt::Display;
 // Standard MSBuild / dcc32 format:
 // <file>(<line>[,<col>]): (error|warning|hint|fatal) <CODE>: <message> [<project>]
 //
-// The trailing project suffix is matched as "[<no closing bracket>]" rather than
-// "[<anything>]": dcc emits messages that end in brackets themselves
-// ("W1054 Variable ist vom Typ array [0..9] [C:\P\My.dproj]"), and a greedy
-// "[.*]" would start at the first bracket and swallow the message's own.
+// The trailing project suffix is matched as "[<no closing bracket>]": dcc
+// messages may end in brackets themselves ("W1054 ... array [0..9]"), which a
+// greedy "[.*]" would swallow along with the suffix.
 const MSBUILD_OUTPUT_REGEX: &str = r"^(?P<file>.*?)[(](?P<line>\d+)(?:,(?P<column>\d+))?[)]:\s+(?P<kind>.*?)\s+(?P<code>[A-Z]\d+):\s+(?P<message>.*?)(?:\s+\[[^\]]*\])?\s*$";
 
-// A source file as the compilers print it. The path may be absolute, relative
-// or a bare file name: dcc prints the unit exactly as it resolved it, so
-// "C:\Proj\Unit1.pas", "src\Unit1.pas" and "Unit1.pas" all occur (verified
-// against dcc32 18.5, 35.0, 36.0 and 37.0).
+// A source file as the compilers print it: dcc prints the unit exactly as it
+// resolved it, so "C:\Proj\Unit1.pas", "src\Unit1.pas" and "Unit1.pas" all
+// occur (verified against dcc32 18.5, 35.0, 36.0 and 37.0).
 //
-// What the capture must not do is run backwards over text that is no path, so
-// it is restricted to the characters a Windows path can hold. Excluding
-// `:"<>|*?` is what keeps the `<target> : warning : ` head of the wrapper line
-// below and a quoted command echo (`cmd /c "copy a b" (3)`) out of the file
-// name. Parentheses stay allowed because real paths contain them
-// ("C:\Program Files (x86)", "C:\Builds (2)"); the `(<line>)` group that follows
-// resolves that ambiguity.
+// Restricted to the characters a Windows path can hold so the capture cannot
+// run backwards over text that is no path: excluding `:"<>|*?` keeps the
+// `<target> : warning : ` head of the wrapper line below and a quoted command
+// echo (`cmd /c "copy a b" (3)`) out of the file name. Parentheses stay allowed
+// because real paths contain them ("C:\Program Files (x86)"); the `(<line>)`
+// group that follows resolves that ambiguity.
 const DIAG_FILE: &str = r#"(?P<file>(?:[A-Za-z]:)?[^:"<>|*?\r\n]+?)"#;
 
 const DIAG_POSITION: &str = r"[(](?P<line>\d+)(?:,(?P<column>\d+))?[)]";
@@ -32,17 +29,15 @@ const DIAG_POSITION: &str = r"[(](?P<line>\d+)(?:,(?P<column>\d+))?[)]";
 //   [whitespace]<localized_label>: <CODE> <message>
 //
 // The label is the compiler's severity word in the IDE language ("Warnung:",
-// "Hinweis:", "Fehler:", "Schwerwiegend:", "Warning:"). It is therefore matched
-// as "letters and spaces", never by a fixed word list, and the severity is
-// derived from <CODE> alone. Every dcc checked separates the label from the
-// parenthesis by one space; the separator stays optional so a glued spelling
-// ("...pas(205)Warnung: W1057 ...") parses as well. The colon after the label is
+// "Hinweis:", "Schwerwiegender Fehler:", "Warning:"), so it is matched as
+// "letters and spaces" rather than by a word list and the severity comes from
+// <CODE> alone. The separator before it is optional because dcc also emits the
+// glued spelling ("...pas(205)Warnung: W1057 ..."). The colon after the label is
 // mandatory and keeps this tail disjoint from the MSBuild format above, where it
 // is the code – not the label – that a colon follows.
 const DCC_LOCALIZED_TAIL: &str = r"\s*(?:\p{L}[\p{L} ]*)?:\s*(?P<code>[A-Z]\d+)\s+(?P<message>\S.*?)";
 
-// MSBuild appends the project file to the diagnostics it formats itself. That is
-// why it is no part of the shared tail: native dcc output never carries it, and
+// Only MSBuild appends the project file; native dcc output never carries it, so
 // stripping it there would truncate the messages that end in brackets.
 const MSBUILD_PROJECT_SUFFIX: &str = r"(?:\s+\[[^\]]*\])?";
 
@@ -51,14 +46,13 @@ const MSBUILD_PROJECT_SUFFIX: &str = r"(?:\s+\[[^\]]*\])?";
 const DELPHI2007_MSBUILD_HEAD: &str = r"^.*?\s+:\s+(?:warning|error|hint|fatal)\s+:\s+";
 
 // Native compiler output without MSBuild wrapper: dcc32/dcc64 called directly
-// for a bare .dpr as well as the raw dcc lines MSBuild passes through. The
-// indentation is optional because only the pass-through is indented.
+// for a bare .dpr as well as the raw dcc lines MSBuild passes through. Only the
+// pass-through is indented, so the indentation is optional.
 const DCC_NATIVE_HEAD: &str = r"^\s*";
 
 // MSBuild's multi-processor console logger prefixes every line with the id of
-// the node that wrote it ("3>  C:\…"). It is removed before matching instead of
-// being tolerated inside each format: '>' cannot occur in a path, so a leading
-// "<digits>>" is never part of a diagnostic.
+// the node that wrote it ("3>  C:\…"). Stripped before matching: '>' cannot
+// occur in a path, so a leading "<digits>>" is never part of a diagnostic.
 const MSBUILD_NODE_PREFIX_REGEX: &str = r"^\s*\d+>";
 
 #[derive(Debug)]
@@ -150,19 +144,12 @@ fn build_from_captures(captures: regex::Captures, compiler_name: String) -> Opti
 }
 
 impl CompilerLineDiagnostic {
-    /// Try to parse a raw compiler output line into a [`CompilerLineDiagnostic`].
+    /// Tries three formats in order: MSBuild / dcc32, the Delphi 2007
+    /// Borland.Delphi.Targets wrapper, then native dcc output.
     ///
-    /// Attempts three formats in order:
-    /// 1. Standard MSBuild / dcc32 format
-    /// 2. Delphi 2007 Borland.Delphi.Targets MSBuild wrapper
-    /// 3. Native dcc output (Delphi 2007 duplicate line, Delphi 12 pass-through)
-    ///
-    /// The wrapper format is tried before the native one because its line also
-    /// ends in the native shape – matching natively first would make the file
-    /// capture swallow the `<target> : warning : ` prefix.
-    ///
-    /// The severity is always derived from the message code, never from the
-    /// label, which the compiler emits in the IDE's UI language.
+    /// The wrapper comes before the native format because its line also ends in
+    /// the native shape – matching natively first would make the file capture
+    /// swallow the `<target> : warning : ` prefix.
     pub fn from_line(line: &str, compiler_name: String) -> Option<Self> {
         let line = MSBUILD_NODE_PREFIX.replace(line, "");
         if let Some(captures) = COMPILER_OUTPUT_REGEX.captures(&line) {
@@ -177,18 +164,13 @@ impl CompilerLineDiagnostic {
         None
     }
 
-    /// Key that identifies a diagnostic for the "same as the previous one"
-    /// check in the output reader.
-    ///
-    /// Delphi 2007 reports every diagnostic twice – once through the
-    /// Borland.Delphi.Targets MSBuild wrapper and once as a plain dcc line –
-    /// with character-identical text, which is why the message is part of the
-    /// key: dcc legitimately reports several diagnostics with the same code for
-    /// one source line (one W1057 per implicitly converted argument of a call),
-    /// and those differ in nothing but the message.
-    ///
-    /// The file is lowercased because Windows paths are case-insensitive and the
-    /// two spellings of one diagnostic need not agree on the drive letter.
+    /// Key for the "same as the previous one" check in the output reader:
+    /// Delphi 2007 reports every diagnostic twice with character-identical text,
+    /// once through the Borland.Delphi.Targets wrapper and once as a plain dcc
+    /// line. The message is part of the key because dcc legitimately reports
+    /// several diagnostics with the same code for one source line (one W1057 per
+    /// implicitly converted argument), differing in nothing else. The file is
+    /// lowercased: the two spellings need not agree on the drive letter's case.
     pub fn dedup_key(&self) -> (String, u32, String, String) {
         (
             self.file.to_lowercase(),

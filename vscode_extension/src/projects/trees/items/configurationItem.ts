@@ -2,10 +2,6 @@ import { TreeItem, TreeItemCollapsibleState, ThemeIcon } from 'vscode';
 import { PROJECTS } from '../../../constants';
 import { DprojMetadata } from '../../../client';
 
-/**
- * Collapsible group node shown under a DprojFileItem.
- * Lists the available build configurations (Debug, Release, …).
- */
 export class ConfigurationGroupItem extends TreeItem {
   public readonly projectId: number;
   public readonly projectLinkId: number;
@@ -28,10 +24,6 @@ export class ConfigurationGroupItem extends TreeItem {
   }
 }
 
-/**
- * Collapsible group node shown under a DprojFileItem.
- * Lists the available target platforms (Win32, Win64, …).
- */
 export class PlatformGroupItem extends TreeItem {
   public readonly projectId: number;
   public readonly projectLinkId: number;
@@ -54,9 +46,6 @@ export class PlatformGroupItem extends TreeItem {
   }
 }
 
-/**
- * Leaf item representing a single build configuration (e.g. "Debug").
- */
 export class ConfigurationItem extends TreeItem {
   public readonly projectId: number;
   public readonly projectLinkId: number;
@@ -77,9 +66,6 @@ export class ConfigurationItem extends TreeItem {
   }
 }
 
-/**
- * Leaf item representing a single target platform (e.g. "Win32").
- */
 export class PlatformItem extends TreeItem {
   public readonly projectId: number;
   public readonly projectLinkId: number;

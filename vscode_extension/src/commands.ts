@@ -24,8 +24,6 @@ export class GeneralCommands {
     return join(osEnv.APPDATA || osEnv.HOME || '', 'ddk');
   }
 
-  // ─── Export / Import Projects ──────────────────────────────────────────
-
   private static async exportProjects(): Promise<void> {
     const sourcePath = join(this.ddkDir, 'projects.ron');
     try {
@@ -74,8 +72,6 @@ export class GeneralCommands {
     }
   }
 
-  // ─── Export / Import Compilers ─────────────────────────────────────────
-
   private static async exportCompilers(): Promise<void> {
     const sourcePath = join(this.ddkDir, 'compilers.ron');
     try {
@@ -123,8 +119,6 @@ export class GeneralCommands {
       window.showErrorMessage(`Failed to import compiler configurations: ${error}`);
     }
   }
-
-  // ─── Direct file editing ──────────────────────────────────────────────
 
   private static async editCompilerConfigurations(): Promise<void> {
     const path = join(osEnv.APPDATA || osEnv.HOME || '', 'ddk', 'compilers.ron');

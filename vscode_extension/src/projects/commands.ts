@@ -16,13 +16,9 @@ import { ConfigurationItem, PlatformItem } from './trees/items/configurationItem
 import { ConfigurationTreeView } from './trees/configurationTreeView';
 
 export namespace ProjectsCommands {
-  /**
-   * The parameters to launch a project's executable with: the dproj's own
-   * `Debugger_RunParams` and the saved Start Parameters are fused together
-   * (dproj first), matching the Delphi IDE's Run button plus whatever extra
-   * parameters were saved on top — unless `ddk.projects.useDebuggerRunParams`
-   * is disabled, in which case only the saved Start Parameters are used.
-   */
+  /** The dproj's `Debugger_RunParams` fused with the saved Start Parameters
+   *  (dproj first), like the Delphi IDE's Run button;
+   *  `ddk.projects.useDebuggerRunParams` drops the dproj half. */
   function resolveEffectiveStartParameters(entity: Entities.Project): Option<string> {
     const useDebuggerRunParams = workspace.getConfiguration(PROJECTS.CONFIG.KEY).get<boolean>(PROJECTS.CONFIG.USE_DEBUGGER_RUN_PARAMS, true);
     return Entities.resolveEffectiveStartParameters(entity, useDebuggerRunParams);
@@ -46,9 +42,8 @@ export namespace ProjectsCommands {
       ];
     }
 
-    /** Incremental compile with the full debug artefact set (optimizations
-     *  off, TD32, `.rsm`, detailed `.map`), whatever the build configuration
-     *  says — like the Delphi IDE's Run-with-debugger build. */
+    /** Incremental compile forcing the full debug artefact set (optimizations
+     *  off, TD32, `.rsm`, detailed `.map`) whatever the build configuration says. */
     private static async compileSelectedProjectForDebugging() {
       await this.selectedProjectAction(async (link) => {
         await Runtime.compileProjectLink(link, false, true);
@@ -133,7 +128,6 @@ export namespace ProjectsCommands {
 
     private static async showInExplorer(item: BaseFileItem): Promise<void> {
       try {
-        // Focus the file in VS Code explorer
         await commands.executeCommand('revealInExplorer', item.resourceUri);
       } catch (error) {
         window.showErrorMessage(`Failed to show in explorer: ${error}`);
@@ -142,7 +136,6 @@ export namespace ProjectsCommands {
 
     private static async openInFileExplorer(item: BaseFileItem): Promise<void> {
       try {
-        // Open the file's location in Windows Explorer (or OS file manager)
         await commands.executeCommand('revealFileInOS', item.resourceUri);
       } catch (error) {
         window.showErrorMessage(`Failed to open in file explorer: ${error}`);
@@ -213,8 +206,6 @@ export namespace ProjectsCommands {
     }
 
     private static async createIniFile(item: BaseFileItem): Promise<void> {
-      // File doesn't exist, create it
-      // Try to use default.ini if it exists
       if (!assertError(item.projectExe, `No executable for: ${item.label} - cannot create INI file.`)) return;
       let iniPath = join(dirname(item.projectExe!.fsPath), `${basenameNoExt(item.projectExe!.fsPath)}.ini`);
       let content = `; ${iniPath}\n[CmdLineParam]\n`;
@@ -246,12 +237,11 @@ export namespace ProjectsCommands {
       if (item.projectIni)
         try {
           await fs.access(item.projectIni.fsPath);
-          // File exists, open it for editing
           await commands.executeCommand('vscode.open', item.projectIni);
           window.showInformationMessage(`Opened existing INI file: ${item.projectIni.fsPath}`);
           return;
         } catch {
-          // File doesn't exist, fall through to create it
+          // `access` throwing is the file-absent branch: fall through and create it.
         }
 
       await this.createIniFile(item);
@@ -360,7 +350,6 @@ export namespace ProjectsCommands {
         return;
       }
 
-      // we need to use both keys and values, so we map them to an array of objects
       const items = Object.entries(configurations).sort(([keyA, configA], [keyB, configB]) =>
         configB.compiler_version - configA.compiler_version
       ).map(([key, config]) => ({
@@ -643,8 +632,6 @@ export namespace ProjectsCommands {
       window.showInformationMessage(`Renamed workspace ${ws.name} to: ${newName!.trim()}`);
     }
 
-    // ─── Configuration / Platform overrides ──────────────────────────────
-
     private static async setProjectConfiguration(item: ConfigurationItem): Promise<void> {
       await Runtime.client.applyChanges([
         { type: 'SetProjectConfiguration', project_id: item.projectId, config: item.configName }
@@ -660,7 +647,6 @@ export namespace ProjectsCommands {
     private static async setWorkspaceConfiguration(item: WorkspaceItem): Promise<void> {
       const ws = item.workspace;
       try {
-        // Get configs from first project in workspace that has a dproj
         const firstLink = ws.project_links[0];
         if (!firstLink) return;
         const project = Runtime.getProjectOfLink(firstLink);

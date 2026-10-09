@@ -16,43 +16,35 @@
 //! condition could leave in force is kept — "none at all" among them — and
 //! reported as ambiguous when they disagree, rather than guessed at.
 
-/// What the evaluation needs to know about the build.
 #[derive(Debug, Clone, Default)]
 pub struct BuildSymbols {
     /// Conditional symbols in effect (`VER360`, `WIN64`, `DEBUG`, …), any casing.
     pub defined: Vec<String>,
-    /// The value of `CompilerVersion` and `RTLVersion` (`36.0` for Delphi 12),
-    /// where the build knows it exactly. A compiler configuration records a
-    /// whole number, so the one release with a fractional version — Delphi
-    /// 2007, at `18.5` — has none to offer and comparisons over it decide
-    /// nothing.
+    /// `CompilerVersion` and `RTLVersion` (`36.0` for Delphi 12), where the
+    /// build knows it exactly. A configuration records a whole number, so
+    /// Delphi 2007 at `18.5` has none and comparisons over it decide nothing.
     pub compiler_version: Option<f64>,
-    /// Whether `defined` carries the symbols of the target platform, which
-    /// only the platforms the builder knows do. Without them the platform
-    /// family is undecided, not absent.
+    /// Whether `defined` carries the target platform's symbols, as only the
+    /// platforms the builder knows do. Without them the platform family is
+    /// undecided, not absent.
     pub platform_known: bool,
-    /// Whether `defined` carries every `VERxxx` the compiler declares. A
-    /// release may declare more than one — Delphi 2007 is both `VER180` and
-    /// `VER185`, being a non-breaking release — and the pre-XE compiler
-    /// configurations record a single one, so there the family decides
-    /// nothing.
+    /// Whether `defined` carries every `VERxxx` the compiler declares. Delphi
+    /// 2007 declares `VER180` beside `VER185`, being a non-breaking release,
+    /// and pre-XE configurations record a single one.
     pub version_symbols_known: bool,
 }
 
 /// Symbols the compiler settles from its own version, whatever is built.
 const VERSION_DECIDED: [&str; 2] = ["CONDITIONALEXPRESSIONS", "UNICODE"];
 
-/// Symbols the compiler settles from the target platform — its OS and CPU.
-/// It defines exactly those of them that hold for the target, so for a
-/// platform the builder knows, a name from this list that is missing from
-/// `defined` is certainly absent. Two kinds are deliberately absent from it:
-/// symbols that follow from the project rather than the platform (`CONSOLE`
-/// from the application type, `DEBUG`/`RELEASE` from the configuration),
-/// which an include file or the command line reaches; and the toolchain
-/// markers (`EXTERNALLINKER`, `ALIGN_STACK`, `PC_MAPPED_EXCEPTIONS`,
-/// `UNDERSCOREIMPORTNAME`), whose Windows status differs between the
-/// classic and the LLVM back end — `win64x` is the latter and shares this
-/// list. They decide no suffix worth a wrong answer.
+/// Symbols the compiler settles from the target's OS and CPU: it defines
+/// exactly those that hold, so for a platform the builder knows, a name from
+/// this list missing from `defined` is certainly absent. Two kinds stay out:
+/// symbols that follow from the project (`CONSOLE`, `DEBUG`/`RELEASE`), which
+/// an include file or the command line reaches; and the toolchain markers
+/// (`EXTERNALLINKER`, `ALIGN_STACK`, `PC_MAPPED_EXCEPTIONS`,
+/// `UNDERSCOREIMPORTNAME`), whose Windows status differs between the classic
+/// and the LLVM back end — `win64x` is the latter and shares this list.
 const PLATFORM_DECIDED: [&str; 29] = [
     "MSWINDOWS",
     "WIN32",
@@ -86,11 +78,10 @@ const PLATFORM_DECIDED: [&str; 29] = [
 ];
 
 impl BuildSymbols {
-    /// A symbol of the build is true; a missing one is false only where its
-    /// absence is knowable — the `VERxxx` family where the build records all
-    /// of them, and the symbols the compiler itself settles for this target.
-    /// Any other name may come from an include file or the command line and
-    /// stays unknown.
+    /// A missing symbol is false only where its absence is knowable: the
+    /// `VERxxx` family where the build records all of them, and what the
+    /// compiler settles for this target. Any other name may come from an
+    /// include file or the command line and stays unknown.
     fn truth_of(&self, symbol: &str) -> Truth {
         if self.defined.iter().any(|known| known.eq_ignore_ascii_case(symbol)) {
             return Truth::True;
@@ -167,7 +158,6 @@ impl Symbols<'_> {
     }
 }
 
-/// The suffix a main source declares.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeclaredSuffix {
     /// No `{$LIBSUFFIX}` applies.
@@ -182,8 +172,7 @@ pub enum DeclaredSuffix {
     Ambiguous(Vec<String>),
 }
 
-/// The truth of a conditional block: known, or depending on something this
-/// reader does not evaluate.
+/// `Unknown` means it depends on something this reader does not evaluate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Truth {
     True,
@@ -244,11 +233,9 @@ pub fn declared_suffix(source: &str, symbols: &BuildSymbols) -> DeclaredSuffix {
     let mut blocks: Vec<Block> = Vec::new();
     // What can be in force here; before the first declaration, nothing is.
     let mut possible = vec![DeclaredSuffix::None];
-    // Every suffix the source names, and whether its conditional structure
-    // came out even. A branch directive with nothing open means the block
-    // was opened somewhere this reader does not see — an `{$I}` include, as
-    // a rule — so the structure is unknown and nothing in the file can be
-    // held to apply for certain.
+    // A branch directive with nothing open means the block was opened out of
+    // sight — an `{$I}` include, as a rule — so the structure is unknown and
+    // nothing in the file can be held to apply for certain.
     let mut declared: Vec<DeclaredSuffix> = Vec::new();
     let mut structure_understood = true;
 
@@ -291,9 +278,7 @@ pub fn declared_suffix(source: &str, symbols: &BuildSymbols) -> DeclaredSuffix {
             "LIBSUFFIX" => {
                 let Some(suffix) = suffix_of(argument) else { continue };
                 declared.push(suffix.clone());
-                // Read as if the branch around it were taken, the
-                // declaration replaces what held before it — the compiler
-                // keeps the last one it meets.
+                // The compiler keeps the last declaration it meets.
                 if state(&blocks) != Truth::False {
                     possible = vec![suffix];
                 }
@@ -302,10 +287,8 @@ pub fn declared_suffix(source: &str, symbols: &BuildSymbols) -> DeclaredSuffix {
         }
     }
 
-    // A block the source never closed was not understood to its end; it is
-    // closed here so that what it may have left behind still counts as
-    // possible, rather than the last declaration inside it passing for the
-    // one in force.
+    // Close a block the source never did, so that what it may have left
+    // behind still counts as possible rather than as the one in force.
     while let Some(block) = blocks.pop() {
         close_block(block, &mut possible);
     }
@@ -323,11 +306,10 @@ pub fn declared_suffix(source: &str, symbols: &BuildSymbols) -> DeclaredSuffix {
     DeclaredSuffix::Ambiguous(possible.iter().map(describe).collect())
 }
 
-/// Ends a block: what it leaves possible is what its taken branches leave,
-/// plus — unless one branch is certainly taken — what held when it was
-/// entered. Deduplicating here and not only at the end is what keeps the
-/// set the size of the distinct suffixes: without it every undecidable
-/// block doubles it, whether or not it declares anything.
+/// What a block leaves possible is what its taken branches leave, plus —
+/// unless one branch is certainly taken — what held when it was entered.
+/// Deduplicating here rather than only at the end keeps the set at the
+/// distinct suffixes; without it every undecidable block doubles it.
 fn close_block(mut block: Block, possible: &mut Vec<DeclaredSuffix>) {
     end_branch(&mut block, possible);
     *possible = match block.conditions {
@@ -449,7 +431,6 @@ enum Token {
     Close,
 }
 
-/// A value inside an expression: a truth, a number, or something unknown.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Value {
     Truth(Truth),
@@ -596,8 +577,7 @@ impl Parser<'_> {
             Token::Word(word) if word.eq_ignore_ascii_case("CompilerVersion") || word.eq_ignore_ascii_case("RTLVersion") => {
                 match self.symbols.build.compiler_version {
                     Some(version) => Value::Number(version),
-                    // The build does not know it to the precision the
-                    // comparison needs; deciding it would be a guess.
+                    // Not known to the precision the comparison needs.
                     _ => Value::Truth(Truth::Unknown),
                 }
             }
@@ -678,8 +658,7 @@ mod tests {
         }
     }
 
-    /// Delphi 12 for a platform the builder does not know, which therefore
-    /// contributes none of its symbols.
+    /// Delphi 12 for a platform contributing none of its symbols.
     fn unknown_platform() -> BuildSymbols {
         BuildSymbols {
             defined: vec!["VER360".into(), "UNICODE".into()],
@@ -832,9 +811,8 @@ mod tests {
         assert_eq!(suffix(source), ambiguous(["A", "B"]));
     }
 
-    /// Delphi 2007 declares `VER180` next to `VER185`, and the pre-XE
-    /// compiler configurations record one symbol: the family settles
-    /// nothing there, however confident the single recorded value looks.
+    /// Delphi 2007 declares `VER180` beside `VER185` while the configuration
+    /// records one symbol, so the family settles nothing there.
     #[test]
     fn a_version_symbol_decides_nothing_where_the_build_may_declare_more() {
         let source = "{$IFDEF VER180}{$LIBSUFFIX '110'}{$ELSE}{$LIBSUFFIX '290'}{$ENDIF}";
@@ -844,8 +822,6 @@ mod tests {
         assert_eq!(declared_suffix(source, &delphi_2007()), literal("110"));
     }
 
-    /// A block the source never closes leaves its declaration conditional;
-    /// answering with it would be the guess this reader exists to avoid.
     #[test]
     fn a_block_the_source_never_closes_decides_nothing() {
         let source = "{$LIBSUFFIX 'A'}{$IFDEF SOMETHING}{$LIBSUFFIX 'B'}";
@@ -855,9 +831,8 @@ mod tests {
         assert_eq!(suffix(source), literal("B"));
     }
 
-    /// Undecidable blocks that declare nothing must not multiply the
-    /// outcomes: the set is the distinct suffixes, not two per block.
-    /// Without that, 24 blocks are already 16.7 million candidates.
+    /// Two outcomes per block would make these 24 blocks 16.7 million
+    /// candidates.
     #[test]
     fn blocks_that_declare_nothing_do_not_multiply_the_outcomes() {
         let mut source = String::new();
@@ -868,8 +843,8 @@ mod tests {
         assert_eq!(suffix(&source), literal("290"));
     }
 
-    /// A branch directive with nothing open means an enclosing block was
-    /// opened out of sight, in an include this reader does not follow.
+    /// The enclosing block was opened in an include this reader does not
+    /// follow.
     #[test]
     fn a_branch_with_nothing_open_puts_the_whole_structure_in_doubt() {
         let source = "{$LIBSUFFIX 'A'}{$ELSE}{$LIBSUFFIX 'B'}";
@@ -880,8 +855,6 @@ mod tests {
         assert_eq!(suffix(source), DeclaredSuffix::Literal("B".into()));
     }
 
-    /// The compiler reads one identifier and ignores the rest of the line,
-    /// which the stock `.dpk` template depends on.
     #[test]
     fn a_directive_names_one_symbol_and_the_rest_is_prose() {
         let source = "{$IFDEF VER360 This IFDEF should not be used by users}{$LIBSUFFIX 'A'}{$ELSE}{$LIBSUFFIX 'B'}{$ENDIF}";

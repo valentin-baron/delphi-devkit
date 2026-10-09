@@ -2,7 +2,6 @@ import { TreeItem, EventEmitter, Event, workspace, ConfigurationChangeEvent, Tre
 import { BaseFileItem } from './items/baseFile';
 import { DelphiProjectTreeItemType } from '../../types';
 import { ProjectItem } from './items/project';
-// import { DelphiProjectsDragAndDropController } from "./DragAndDropController";
 import { Runtime } from '../../runtime';
 import { PROJECTS } from '../../constants';
 import { TreeItemDecorator } from './treeItemDecorator';
@@ -88,7 +87,6 @@ export abstract class DelphiProjectsTreeView implements TreeDataProvider<TreeIte
 
     if (displayMode === 'off') return fileChildren;
 
-    // Fetch dproj metadata and add config/platform groups if there are options
     const configItems: TreeItem[] = [];
     try {
       const metadata = await Runtime.client.dprojMetadata(project.entity.id);
@@ -100,7 +98,7 @@ export abstract class DelphiProjectsTreeView implements TreeDataProvider<TreeIte
         configItems.push(new PlatformGroupItem(project.entity.id, project.link.id, metadata));
       }
     } catch {
-      // If metadata fetch fails, just show the file children
+      // No metadata: show the file children alone rather than no node at all.
     }
 
     return displayMode === 'belowFiles'

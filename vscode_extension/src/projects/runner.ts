@@ -18,16 +18,12 @@ import { launchExecutable, splitCommandLineArgs } from '../utils';
 import { Runtime } from '../runtime';
 
 /**
- * Runs a project's run target inside VS Code instead of letting it disappear
- * into a detached process (or a console window that closes on exit).
- *
- * By default that is a terminal, because a terminal *is* a console: a program
- * coloring its output through the Windows console API — DUnitX's test runner,
- * say — only produces those colors when it has a real console screen buffer to
- * paint, and ConPTY then re-encodes them as escape sequences the terminal
- * renders. Piping the output into an output channel (`runIn: "output"`) makes it
- * searchable text instead, at the price of those colors: they are never written
- * to the stream, so no reader can recover them.
+ * Runs a project's run target inside VS Code rather than as a detached process.
+ * A terminal by default: a program coloring through the Windows console API
+ * emits those colors only with a real console screen buffer, which ConPTY then
+ * re-encodes as escape sequences. `runIn: "output"` pipes into an output channel
+ * instead — searchable text, but the colors are never written to the stream and
+ * no reader can recover them.
  */
 export namespace ProjectRunner {
   /** Runs whose process is still alive. Output is only labelled while more than one is running. */
@@ -62,15 +58,10 @@ export namespace ProjectRunner {
   }
 
   /**
-   * Runs the target in a terminal, as a task. VS Code hosts it in a
-   * pseudoconsole, so console colors, the output following along and keyboard
-   * input all come for free.
-   *
-   * A task rather than a plain `createTerminal`: a terminal whose own process is
-   * the executable is disposed the moment that process ends — with the output of
-   * a short-lived program gone with it — while a task terminal stays open on the
-   * finished output until it is closed or the next run reuses it. `Dedicated`
-   * gives each project its own terminal, cleared on re-run.
+   * A task, not `createTerminal`: a terminal whose own process is the executable
+   * is disposed the moment that process ends, taking a short-lived program's
+   * output with it, while a task terminal stays open on the finished output.
+   * `Dedicated` gives each project its own terminal, cleared on re-run.
    */
   function runInTerminal(target: string, args: string[], label: string): void {
     const task = new Task(
@@ -78,8 +69,7 @@ export namespace ProjectRunner {
       workspace.getWorkspaceFolder(Uri.file(target)) ?? TaskScope.Workspace,
       label,
       PROJECTS.TASK.RUN_SOURCE,
-      // ProcessExecution, not ShellExecution: arguments reach the program as
-      // given, with no shell to quote or expand them.
+      // ProcessExecution, not ShellExecution: no shell to quote or expand the arguments.
       new ProcessExecution(target, args, { cwd: dirname(target) })
     );
     task.presentationOptions = {
@@ -100,9 +90,7 @@ export namespace ProjectRunner {
     const channel = Runtime.runOutputChannel;
     const started = Date.now();
 
-    // A run starts from a clean channel (like a compile does), which also keeps
-    // the output short enough to stay in view. Output of a run still going is
-    // never thrown away.
+    // Never clear while another run is still writing into the channel.
     if (active.size === 0) channel.clear();
     else channel.appendLine('');
 
@@ -112,18 +100,14 @@ export namespace ProjectRunner {
     channel.appendLine(`▶ ${label} · ${timestamp()}`);
     channel.appendLine(`▷ ${[target, ...args].map(quoted).join(' ')}`);
 
-    // Everything that could throw is done: from the spawn on, nothing must come
-    // between the child and its listeners, or a failing spawn would emit an
-    // unhandled `error` event.
-    //
-    // Not detached, so the child's stdout/stderr can be piped here at all.
+    // Nothing may come between the spawn and its listeners below: a failing
+    // spawn would emit an unhandled `error` event.
     // `windowsHide` suppresses the console window a console application would
-    // otherwise pop up (the extension host has no console of its own to
-    // inherit, so Windows would create a fresh — and, with the output piped
-    // here, empty — one); it leaves a VCL form visible, since the VCL ignores
-    // the hidden show-command it passes along. stdin stays unconnected: an
-    // output channel cannot forward keystrokes, so a program reading input
-    // sees EOF rather than hanging invisibly.
+    // otherwise pop up; a VCL form stays visible, as the VCL ignores the hidden
+    // show-command passed along to it. stdin is unconnected: an output channel
+    // cannot forward keystrokes, so a program reading input sees EOF rather
+    // than hanging invisibly. Not detached, or the child's stdout and stderr
+    // could not be piped here at all.
     const child = spawn(target, args, {
       cwd: dirname(target),
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -163,20 +147,16 @@ export namespace ProjectRunner {
 
   /** OSC sequence (a window title and friends), terminated by BEL or ST. */
   const ANSI_OSC = /\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)?/g;
-  /**
-   * CSI sequence (colors, cursor movement, erases), a two-character Fe escape,
-   * or a charset designation such as ESC ( B.
-   */
+  /** CSI sequence (colors, cursor movement, erases), a two-character Fe escape, or a charset designation such as ESC ( B. */
   const ANSI_CSI = /\u001b\[[0-?]*[ -\/]*[@-~]|\u001b[@-Z\\-_]|\u001b[ -\/]*[0-~]/g;
   /** Control characters left over afterwards: tab survives, the newlines are handled by the caller. */
   const CONTROL_CHARS = /[\u0000-\u0008\u000b-\u001f\u007f]/g;
 
   /**
-   * Removes what an output channel cannot render but a console would act on:
-   * ANSI escape sequences (the channel has no ANSI support, so they would
-   * show up as `←[32m` litter), carriage-return overwrites (a progress
-   * line rewriting itself keeps only its final state, the way it would look
-   * on screen) and the control characters left over after that.
+   * Removes what an output channel cannot render but a console would act on: an
+   * output channel has no ANSI support, so escape sequences would show up as
+   * `←[32m` litter, and a self-rewriting progress line keeps only the state
+   * after its last carriage return, the way it would look on screen.
    */
   function sanitize(text: string): string {
     const plain = text.replace(ANSI_OSC, '').replace(ANSI_CSI, '');
@@ -195,14 +175,11 @@ export namespace ProjectRunner {
   }
 
   /**
-   * Buffers raw process bytes and writes whole lines to the channel.
-   *
-   * Splitting on newlines *before* decoding keeps a multi-byte character that
-   * straddles two chunks intact (a character never spans a line break) and lets
-   * every line be decoded independently — which is what makes `auto` detection
-   * per line possible. A line that stays unterminated (a prompt, a progress
-   * counter) is flushed once the process goes quiet, so it does not sit
-   * invisibly in the buffer.
+   * Buffers raw process bytes and writes whole lines to the channel. Splitting
+   * on newlines *before* decoding keeps a multi-byte character straddling two
+   * chunks intact and lets every line be decoded on its own, which is what makes
+   * per-line `auto` detection possible. An unterminated line (a prompt, a
+   * progress counter) is flushed once the process goes quiet.
    */
   class RunWriter {
     private static readonly IDLE_FLUSH_MS = 400;
@@ -237,7 +214,6 @@ export namespace ProjectRunner {
       this.scheduleIdleFlush();
     }
 
-    /** Flush whatever is buffered and close the block with `footer`. */
     public finish(footer: string): void {
       this.clearIdleFlush();
       if (this.pending.length > 0) {
@@ -284,10 +260,9 @@ export namespace ProjectRunner {
   type Decoder = (bytes: Buffer) => string;
 
   /**
-   * Upper half (0x80-0xFF) of the DOS/OEM codepages a Delphi console
-   * application writes on a Western/Central European or Cyrillic Windows.
-   * `TextDecoder` covers every Windows-125x and ISO-8859-x codepage but none of
-   * these, so they are decoded from a table.
+   * Upper half (0x80-0xFF) of the DOS/OEM codepages a Delphi console application
+   * writes on a Western/Central European or Cyrillic Windows. `TextDecoder`
+   * decodes none of these, so they come from a table.
    */
   const OEM_UPPER_HALF: Record<number, string> = {
     437: 'ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■ ',
@@ -343,18 +318,15 @@ export namespace ProjectRunner {
     const upperHalf = OEM_UPPER_HALF[codePage];
     if (upperHalf) return tableDecoder(upperHalf);
     const label = TEXT_DECODER_CODE_PAGES[codePage];
-    // An exotic OEM codepage still shares its ASCII range and most of its
-    // Western accents with CP437, which beats mojibake from a wrong guess.
+    // An unknown OEM codepage still shares ASCII and most Western accents with CP437.
     return label ? labelDecoder(label) : tableDecoder(OEM_UPPER_HALF[437]);
   }
 
   /**
-   * Resolves the `runOutputEncoding` setting to a decoder. `ansi` (the default)
-   * is Windows' own default charset for non-Unicode text, which is what a
-   * program writing to a redirected handle normally produces; `oem` is the
-   * console codepage a program gets when it writes to a real console instead;
-   * `auto` takes a line as UTF-8 when it *is* valid UTF-8 (all pure-ASCII output
-   * included) and as the ANSI codepage otherwise.
+   * `ansi` (the default) is what a program writing to a redirected handle
+   * normally produces; `oem` is the console codepage it would get writing to a
+   * real console; `auto` takes a line as UTF-8 when it is valid UTF-8 and as the
+   * ANSI codepage otherwise.
    */
   function decoderFor(encoding: string): Decoder {
     const value = encoding.trim().toLowerCase();
@@ -379,11 +351,8 @@ export namespace ProjectRunner {
   let cachedSystemCodePage: Option<number>;
 
   /**
-   * Windows' system ANSI codepage (`GetACP`, e.g. 1252 on a Western European
-   * install) — the OS default charset for non-Unicode text, and what a program
-   * writing to a redirected handle normally emits. Read once from the registry
-   * value the API itself is backed by; CP1252 is the fallback when that fails or
-   * off Windows.
+   * Windows' system ANSI codepage (`GetACP`), read once from the registry value
+   * the API itself is backed by. CP1252 when that fails or off Windows.
    */
   function systemCodePage(): number {
     if (cachedSystemCodePage !== undefined) return cachedSystemCodePage!;
@@ -403,11 +372,10 @@ export namespace ProjectRunner {
   let cachedConsoleCodePage: Option<number>;
 
   /**
-   * The codepage a spawned console process writes in when it targets a console:
-   * the extension host has no console of its own, so a child gets a fresh one
-   * running at the system OEM codepage — which is what `chcp` reports when asked
-   * the same way. Queried once; CP437 is the fallback when the query fails or
-   * off Windows.
+   * The codepage a spawned console process writes in: the extension host has no
+   * console of its own, so a child gets a fresh one at the system OEM codepage,
+   * which is what `chcp` reports when asked the same way. Queried once; CP437
+   * when the query fails or off Windows.
    */
   function consoleCodePage(): number {
     if (cachedConsoleCodePage !== undefined) return cachedConsoleCodePage!;

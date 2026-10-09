@@ -6,13 +6,10 @@ import { DELPHILSP } from '../constants';
 import { Option } from '../types';
 
 /**
- * Keeps generated `.delphilsp.json` files out of version control by managing a
- * `*.delphilsp.json` entry in the owning repository's `.git/info/exclude`
- * (the local, never-committed counterpart of `.gitignore`).
- *
- * Only the entry DDK itself wrote (recognised by its marker comment) is ever
- * touched: a user's own `*.delphilsp.json` line is left alone when the setting
- * is turned off, and nothing is added when the pattern is already excluded.
+ * Keeps generated `.delphilsp.json` files out of version control through the
+ * repository's `.git/info/exclude`, the local counterpart of `.gitignore`.
+ * Only the entry DDK wrote (recognised by its marker comment) is ever touched,
+ * and nothing is added when the pattern is already excluded.
  */
 export namespace DelphiLspGitExclude {
   const MARKER = '# Managed by Delphi DevKit (ddk.delphilsp.autoIgnoreDelphiLspFiles)';
@@ -22,10 +19,8 @@ export namespace DelphiLspGitExclude {
     return workspace.getConfiguration(DELPHILSP.CONFIG.KEY).get<boolean>(DELPHILSP.CONFIG.AUTO_IGNORE, true);
   }
 
-  /** Walk up from `startDir` to the repository root and resolve its
-   *  `info/exclude` path — following a `.git` *file* (linked worktree or
-   *  submodule) to the real git dir, and a worktree's `commondir` to the
-   *  shared one, where `info/exclude` actually lives. */
+  /** A `.git` *file* (linked worktree or submodule) points at the real git dir,
+   *  and a worktree's `commondir` at the shared one, where `info/exclude` lives. */
   async function findGitInfoExcludePath(startDir: string): Promise<Option<string>> {
     let dir = startDir;
     for (;;) {
@@ -87,8 +82,7 @@ export namespace DelphiLspGitExclude {
     if (stripped !== content) await fs.writeFile(excludePath, stripped);
   }
 
-  /** Excludes the repository owning `generatedFilePath`, when the setting is
-   *  on. Called after every settings-file generation/sync. */
+  /** Called after every settings-file generation or sync. */
   export async function ensureExcludedFor(generatedFilePath: string): Promise<void> {
     if (!isAutoIgnoreEnabled()) return;
     try {
@@ -99,9 +93,7 @@ export namespace DelphiLspGitExclude {
     }
   }
 
-  /** Applies a settings toggle to the repositories of every managed project:
-   *  append the entry when enabled, remove the DDK-managed entry when
-   *  disabled. */
+  /** Applies the setting to the repository of every managed project. */
   export async function onSettingChanged(): Promise<void> {
     const enabled = isAutoIgnoreEnabled();
     const projectDirs = (Runtime.projectsData?.projects ?? [])

@@ -11,21 +11,18 @@ import { DelphiLspGitExclude } from './gitExclude';
 
 /**
  * Keeps DelphiLSP's active `settingsFile` pointed at DDK's active project.
- *
- * Runs whenever `DelphiLspFeature.onProjectsUpdated` is invoked (project
- * state reload / update notification); it only actually does anything the
- * first time it sees a given `active_project_id`, so unrelated project
- * updates (compile results, discovery, …) don't cause repeated churn.
+ * Runs on every project-state update but acts only when `active_project_id`
+ * changes, so compile results and discovery cause no churn.
  */
 export namespace DelphiLspAutoSync {
-  // `undefined` means "never observed yet" — distinct from `null`/no active project,
-  // so the very first project selection after activation still triggers a sync.
+  // `undefined` is "never observed yet", distinct from no active project, so the
+  // first project selection after activation still triggers a sync.
   let lastSyncedProjectId: Option<number> = undefined;
 
   /** `<dir>\<stem>.delphilsp.json` next to the project's `.dpr`/`.dpk` main
-   *  source — replicates `delphilsp::default_out_path` in `core`. Deliberately
-   *  keyed off the main source's own directory rather than `project.directory`,
-   *  since that is what the generator itself writes next to. */
+   *  source, replicating `delphilsp::default_out_path` in `core`. Keyed off the
+   *  main source's directory, not `project.directory`: that is where the
+   *  generator itself writes. */
   function expectedSettingsFilePath(project: Entities.Project): Option<string> {
     const mainSource = project.dpr || project.dpk;
     if (!mainSource) return undefined;
@@ -51,14 +48,11 @@ export namespace DelphiLspAutoSync {
     }
   }
 
-  /** A DDK-owned settings file is stale once the `.dproj` it was derived from
-   *  has different content: its stored `dprojHash` (SHA-256 of the dproj
-   *  bytes, written by the generator in `core`) no longer matches. Content is
-   *  compared instead of timestamps because mtimes are unreliable on Windows
-   *  and a rewritten-but-identical `.dproj` must not trigger a regeneration.
-   *  A DDK file without the hash predates it — regenerate once to stamp it.
-   *  Projects with no `.dproj` (bare `.dpr`/`.dpk`) have nothing to compare
-   *  against, so an existing file is always kept. */
+  /** Stale once the stored `dprojHash` (SHA-256 of the dproj bytes, written by
+   *  the generator in `core`) no longer matches. Content, not mtime: mtimes are
+   *  unreliable on Windows and a rewritten-but-identical `.dproj` must not
+   *  regenerate. A file without the hash predates it; a project without a
+   *  `.dproj` has nothing to compare, so its file is always kept. */
   async function isStale(markers: SettingsFileMarkers, project: Entities.Project): Promise<boolean> {
     if (!project.dproj) return false;
     if (!markers.dprojHash) return true;
@@ -70,9 +64,8 @@ export namespace DelphiLspAutoSync {
     }
   }
 
-  /** Ensures the expected `.delphilsp.json` exists and is current, generating
-   *  it through the server when needed. Returns the file path to point
-   *  DelphiLSP at, or `undefined` when nothing could be determined/generated. */
+  /** The `.delphilsp.json` to point DelphiLSP at, generated through the server
+   *  when missing or stale; `undefined` when it could not be. */
   async function ensureSettingsFile(project: Entities.Project): Promise<Option<string>> {
     const filePath = expectedSettingsFilePath(project);
     if (!filePath) return undefined;
@@ -114,8 +107,7 @@ export namespace DelphiLspAutoSync {
     }
   }
 
-  /** How long the DelphiLSP server is given to load the pushed settings
-   *  (its client expands and forwards them right after the update) before
+  /** How long the DelphiLSP server is given to load the pushed settings before
    *  the open editors are re-opened against the new project context. */
   const CONFIG_LOAD_GRACE_MS = 1500;
 
@@ -128,20 +120,15 @@ export namespace DelphiLspAutoSync {
   }
 
   /**
-   * DelphiLSP's server applies a `settingsFile` change to FUTURE validations
-   * but never spontaneously re-validates documents that are already open —
-   * not on the configuration push, and (verified via its raw LSP logs) not
-   * even after a full server restart with `didOpen` replay; its own "Select
-   * project settings" command has the same limitation, leaving stale
-   * diagnostics around until each file is edited. The only trigger it honors
-   * is a `didOpen` arriving AFTER the new settings are loaded, so: wait for
-   * the pushed settings to land, then briefly flip each open Delphi
-   * document's language (objectpascal → plaintext → back). The language flip
-   * makes VS Code re-emit `didClose`/`didOpen` for the document — which the
-   * LSP client relays, triggering a re-validation under the new project —
-   * while the editor tab, focus, cursor, dirty state and undo history stay
-   * completely untouched (it is the same text buffer; only its language
-   * label round-trips, with a barely visible syntax-highlight blink).
+   * DelphiLSP applies a `settingsFile` change to future validations only; the
+   * sole trigger for an already-open document is a `didOpen` arriving AFTER the
+   * new settings are loaded (a server restart replays `didOpen` before them).
+   * So wait for the settings to land, then flip each open Delphi document's
+   * language and back: that is the only VS Code API re-emitting
+   * `didClose`/`didOpen` on the same buffer, leaving tab, focus, cursor, dirty
+   * state and undo history untouched. DelphiLSP's own "Select project
+   * settings" command has the same limitation (verified in its raw LSP logs),
+   * leaving stale diagnostics until each file is edited.
    */
   async function revalidateOpenDocuments(): Promise<void> {
     if (!isRevalidateEnabled()) return;
@@ -152,15 +139,6 @@ export namespace DelphiLspAutoSync {
     await new Promise((resolve) => setTimeout(resolve, CONFIG_LOAD_GRACE_MS));
     for (const document of delphiDocuments)
       try {
-        // Temporary language round-trip, NOT a cosmetic accident: changing a
-        // document's language is the only VS Code API that re-emits
-        // didClose/didOpen for an open document without touching the editor
-        // (tab, focus, cursor, dirty flag, undo stack all survive — it is the
-        // same text buffer). The didOpen this produces is what finally makes
-        // DelphiLSP re-validate the file under the just-switched project;
-        // nothing else works: the server ignores configuration pushes for
-        // already-open files and even a full server restart re-plays didOpen
-        // BEFORE the settings arrive (verified via its raw LSP logs).
         const originalLanguage = document.languageId;
         const reopened = await languages.setTextDocumentLanguage(document, 'plaintext');
         await languages.setTextDocumentLanguage(reopened, originalLanguage);

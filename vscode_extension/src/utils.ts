@@ -23,7 +23,6 @@ export function assertError(condition: any, message: string): boolean {
   return !!condition || (window.showErrorMessage(message), false);
 }
 
-// Splits a start-parameters string into argv entries, honoring double-quoted segments.
 export function splitCommandLineArgs(input: string): string[] {
   const args: string[] = [];
   const regex = /"([^"]*)"|(\S+)/g;
@@ -32,7 +31,7 @@ export function splitCommandLineArgs(input: string): string[] {
   return args;
 }
 
-// Fuses two start-parameters strings (base first) rather than one replacing the other; blank/absent values contribute nothing.
+// Base first, then extra: the two are concatenated, never one overriding the other.
 export function fuseStartParameters(base?: string | null, extra?: string | null): string | undefined {
   const parts = [base, extra].filter((s): s is string => !!s && s.trim().length > 0);
   return parts.length > 0 ? parts.join(' ') : undefined;

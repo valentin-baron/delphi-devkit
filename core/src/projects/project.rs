@@ -5,14 +5,11 @@ use crate::projects::*;
 use crate::files::dproj::{find_dproj_file, get_main_source};
 use crate::utils::normalize_path;
 
-/// Build configurations offered for a bare-source project (no `.dproj`).
-/// DevKit synthesises these because there is no project file to enumerate, and
-/// they map onto the dcc switches produced by the compiler for such projects.
+/// Synthesised for a bare-source project: there is no `.dproj` to enumerate.
 pub const BARE_CONFIGURATIONS: [&str; 2] = ["Debug", "Release"];
-/// Target platforms offered for a bare-source project. Limited to the two the
-/// command-line compiler can produce directly: `Win32` → dcc32, `Win64` → dcc64.
+/// The two platforms the command-line compiler produces directly: `Win32` →
+/// dcc32, `Win64` → dcc64.
 pub const BARE_PLATFORMS: [&str; 2] = ["Win32", "Win64"];
-/// Default configuration/platform when a bare project has no override set.
 pub const BARE_DEFAULT_CONFIGURATION: &str = "Debug";
 pub const BARE_DEFAULT_PLATFORM: &str = "Win32";
 
@@ -58,28 +55,19 @@ pub struct Project {
     pub dpk: Option<String>,
     pub exe: Option<String>,
     pub ini: Option<String>,
-    /// Per-project build configuration override (e.g. "Debug", "Release").
-    /// `None` means use the `.dproj` file default.
+    /// `None` means the `.dproj` file default.
     pub active_configuration: Option<String>,
-    /// Per-project build platform override (e.g. "Win32", "Win64").
-    /// `None` means use the `.dproj` file default.
+    /// `None` means the `.dproj` file default.
     pub active_platform: Option<String>,
-    /// Command-line arguments passed to the executable when run via RunProgram.
     pub start_parameters: Option<String>,
-    /// `Debugger_RunParams` read from the dproj's active property group (the
-    /// "Run Parameters" set via Project > Options > Run in the Delphi IDE).
-    /// Refreshed on [`Self::discover_paths`]; used as the fallback when
-    /// `start_parameters` is unset. `None` for bare (dproj-less) projects.
+    /// The dproj's `Debugger_RunParams` (Project > Options > Run in the IDE),
+    /// refreshed on [`Self::discover_paths`]. `None` for bare projects.
     pub dproj_run_params: Option<String>,
-    /// `Debugger_HostApplication` read from the dproj's active property group
-    /// (the "Host application" set via Project > Options > Debugger in the
-    /// Delphi IDE). Common project macros are expanded and a relative path is
-    /// resolved against the project directory. Refreshed on
-    /// [`Self::discover_paths`]; `None` for bare (dproj-less) projects.
+    /// The dproj's `Debugger_HostApplication` (Project > Options > Debugger),
+    /// macros expanded and relative paths resolved against the project
+    /// directory. Refreshed on [`Self::discover_paths`].
     pub dproj_host_application: Option<String>,
-    /// DevKit-side Host Application override: the executable RunProgram
-    /// launches to host this project (e.g. the application loading a `.dpk`
-    /// package or a DLL). Takes precedence over
+    /// DevKit-side override, taking precedence over
     /// [`Self::dproj_host_application`].
     pub host_application: Option<String>,
 }
@@ -106,9 +94,7 @@ impl Default for Project {
 }
 
 impl Project {
-    /// Resolve the effective (configuration, platform) for this project.
-    /// Falls back to the dproj file's defaults when the project-level
-    /// override is `None`.
+    /// The project-level override, else the dproj's defaults.
     pub fn effective_config_platform(&self, dproj: &dproj_rs::Dproj) -> (String, String) {
         let config = self.active_configuration.clone()
             .or_else(|| dproj.active_configuration().ok())
@@ -119,11 +105,9 @@ impl Project {
         (config, platform)
     }
 
-    /// The executable that hosts this project at run time, when one is
-    /// configured: the DevKit override wins over the dproj's own
-    /// `Debugger_HostApplication`. Blank values count as absent, and so does
-    /// a value still containing an unresolved `$(...)` macro — it is not a
-    /// launchable path, and must never shadow the project's own exe.
+    /// The DevKit override wins over the dproj's `Debugger_HostApplication`.
+    /// A blank value counts as absent, and so does one still holding a `$(…)`
+    /// macro: it is no launchable path and must not shadow the project's exe.
     pub fn effective_host_application(&self) -> Option<String> {
         let usable = |s: &String| !s.trim().is_empty() && !s.contains("$(");
         self.host_application.clone()
@@ -131,26 +115,24 @@ impl Project {
             .or_else(|| self.dproj_host_application.clone().filter(usable))
     }
 
-    /// `ide_env` is the set of IDE environment-variable overrides of the
-    /// compiler configuration this project builds with — see
-    /// [`CompilerConfiguration::ide_environment_overrides`]; callers that
-    /// have no compiler context pass the fallback
-    /// [`crate::utils::ide_environment_overrides`].
+    /// `ide_env` holds the IDE environment-variable overrides of this
+    /// project's compiler — see
+    /// [`CompilerConfiguration::ide_environment_overrides`]; without a
+    /// compiler context, [`crate::utils::ide_environment_overrides`].
     pub fn discover_paths(&mut self, ide_env: &[(String, String)]) -> Result<()> {
         let config = self.active_configuration.clone();
         let platform = self.active_platform.clone();
         self.discover_paths_inner(config.as_deref(), platform.as_deref(), ide_env)
     }
 
-    /// Discover paths using an explicit config/platform override.
     pub fn discover_paths_for(&mut self, config: &str, platform: &str, ide_env: &[(String, String)]) -> Result<()> {
         self.discover_paths_inner(Some(config), Some(platform), ide_env)
     }
 
     fn discover_paths_inner(&mut self, config: Option<&str>, platform: Option<&str>, ide_env: &[(String, String)]) -> Result<()> {
         if self.dproj.is_none() {
-            // A sibling `.dproj` may exist next to the main source; adopt it if so.
-            // Its absence is not an error: a bare `.dpr`/`.dpk` is a valid project.
+            // Adopt a sibling `.dproj` if there is one; its absence is no
+            // error, a bare `.dpr`/`.dpk` being a valid project.
             if let Some(dpr_path) = &self.dpr {
                 if let Ok(dproj_path) = find_dproj_file(&PathBuf::from(dpr_path)) {
                     self.dproj = Some(normalize_path(&dproj_path).to_string_lossy().to_string());
@@ -162,12 +144,9 @@ impl Project {
             }
         }
         if self.dproj.is_none() {
-            // No `.dproj`: resolve paths straight from the bare source. A `.dpr`
-            // yields an executable (and matching `.ini`) alongside the source;
-            // a `.dpk` produces a package with no standalone executable.
-            // Without a dproj there is nothing to source the dproj-derived
-            // fields from: clear them so values from a previously-present
-            // dproj cannot linger and affect run-target resolution.
+            // A `.dpr` yields an exe (and matching `.ini`) beside the source;
+            // a `.dpk` has no standalone executable. The dproj-derived fields
+            // are cleared so values of a dproj since removed cannot linger.
             if let Some(dpr_path) = &self.dpr {
                 let exe = PathBuf::from(dpr_path).with_extension("exe");
                 self.ini = Some(exe.with_extension("ini").to_string_lossy().to_string());

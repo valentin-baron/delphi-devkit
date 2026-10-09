@@ -60,12 +60,10 @@ export namespace Entities {
   };
 
   /**
-   * The configured hosting executable: the DevKit "Set Host Application"
-   * override first, then the dproj's own `Debugger_HostApplication`. Blank
-   * values count as absent, and so does a value still containing an
-   * unresolved `$(...)` macro — not a launchable path, and it must never
-   * shadow the project's own exe. Mirrors `Project::effective_host_application`
-   * on the Rust side.
+   * The DevKit override first, then the dproj's `Debugger_HostApplication`.
+   * A value still containing an unresolved `$(...)` macro counts as absent:
+   * it is no launchable path and must not shadow the project's own exe.
+   * Mirrors `Project::effective_host_application` on the Rust side.
    */
   export function effectiveHostApplication(entity: Project): string | undefined {
     const usable = (value?: Option<string>) => {
@@ -76,20 +74,15 @@ export namespace Entities {
   }
 
   /**
-   * The executable RunProgram launches for a project: a configured Host
-   * Application wins over the project's exe, matching the Delphi IDE's Run
-   * behaviour — it is what makes a `.dpk` package or DLL project runnable
-   * at all.
+   * A configured Host Application wins over the project's exe, as the Delphi
+   * IDE's Run does; it is what makes a `.dpk` or DLL project runnable at all.
    */
   export function resolveRunTarget(entity: Project): string | undefined {
     return effectiveHostApplication(entity) ?? notBlank(entity.exe);
   }
 
-  /**
-   * The effective command-line parameters RunProgram passes: the dproj's
-   * `Debugger_RunParams` fused with the saved Start Parameters (dproj first)
-   * when `useDprojRunParams` is enabled, otherwise only the saved value.
-   */
+  /** The dproj's `Debugger_RunParams` fused with the saved Start Parameters,
+   *  dproj first — or only the saved value when `useDprojRunParams` is off. */
   export function resolveEffectiveStartParameters(entity: Project, useDprojRunParams: boolean): string | undefined {
     if (useDprojRunParams) return fuseStartParameters(entity.dproj_run_params, entity.start_parameters);
     return entity.start_parameters ?? undefined;

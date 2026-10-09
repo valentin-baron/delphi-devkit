@@ -21,8 +21,7 @@ impl DelphiLsp {
         return DelphiLsp { client }
     }
 
-    /// Answers once the build has run, with its outcome: a caller that must
-    /// not proceed after a failed build reads `success` from the reply.
+    /// Answers only once the build has run; the reply carries `success`.
     async fn projects_compile(
         &self,
         params: CompileProjectParams,
@@ -71,9 +70,8 @@ impl DelphiLsp {
         &self,
         params: CustomDocumentFormat,
     ) -> tower_lsp::jsonrpc::Result<DocumentFormatEdit> {
-        // The formatter always runs over the whole document — it needs the full
-        // context to indent and lay out correctly. For a range request we then
-        // map the selection onto the formatted text (see `format::range`).
+        // The formatter needs the whole document to indent correctly, so a range
+        // request formats everything and maps the selection back afterwards.
         let original = params.content.clone();
         let formatter = Formatter::new(params.content)
             .map_err(|error| {
@@ -91,8 +89,6 @@ impl DelphiLsp {
             ))
         })?;
 
-        // A range request maps the selection onto the formatted text; a
-        // whole-document request replaces everything.
         if let Some(range) = params.range {
             let edit =
                 ddk_core::format::range::map_range(&original, &formatted, range.start, range.end);
@@ -110,9 +106,6 @@ impl DelphiLsp {
         })
     }
 
-    /// Thin wrapper over `commands::cmd_delphilsp_config` so the VS Code
-    /// extension can regenerate a project's DelphiLSP settings file without
-    /// shelling out to the CLI.
     async fn delphilsp_generate(
         &self,
         params: DelphiLspGenerateParams,
@@ -138,9 +131,8 @@ impl DelphiLsp {
         }
     }
 
-    /// `debug/target`: the debugger-agnostic description of a project's debug
-    /// target — thin wrapper over `cmd_debug_target`; an ambiguous reference
-    /// is reported as an error carrying the candidate list.
+    /// An ambiguous project reference is reported as an error carrying the
+    /// candidate list.
     async fn debug_target(
         &self,
         params: ddk_core::lsp_types::DebugTargetParams,
@@ -167,11 +159,9 @@ impl DelphiLsp {
                     params.project_id
                 ))
             })?;
-        // A bare `.dpr`/`.dpk` has no `.dproj` to enumerate configurations or
-        // platforms from. Such projects are compiled directly with dcc32/dcc64,
-        // so DevKit offers a synthetic set the command-line compiler supports.
-        // The user can still pick a platform; the choice is stored as the
-        // project's `active_platform` override and honoured at compile time.
+        // A bare `.dpr`/`.dpk` has no `.dproj` to enumerate configurations and
+        // platforms from; it is compiled directly with dcc32/dcc64, so offer the
+        // synthetic set those support instead.
         let Some(dproj_path) = project.dproj.as_ref() else {
             return Ok(DprojMetadataResponse {
                 configurations: ddk_core::projects::BARE_CONFIGURATIONS
@@ -243,7 +233,7 @@ impl LanguageServer for DelphiLsp {
             }
         }
         return Ok(InitializeResult {
-            capabilities: ServerCapabilities::default(), // none
+            capabilities: ServerCapabilities::default(),
             server_info: Some(ServerInfo {
                 name: "DDK - Delphi Server".to_string(),
                 version: Some("0.1.0".to_string()),

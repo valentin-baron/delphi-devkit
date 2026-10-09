@@ -10,12 +10,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-/// What seeds the macro map of one Delphi installation: the variables its
-/// `rsvars.bat` sets, the IDE's own *Environment Variables* overrides, and the
-/// per-user data directories the IDE derives (`$(BDSUSERDIR)`,
-/// `$(BDSCOMMONDIR)`). Gathered once by [`IdeEnvironment::read`] — the only
-/// place that touches disk and registry — so that everything downstream, and
-/// every test, can work from a value.
+/// What seeds the macro map of one Delphi installation. [`IdeEnvironment::read`]
+/// is the only place that touches disk and registry, so everything downstream —
+/// tests included — works from a value.
 #[derive(Debug, Clone, Default)]
 pub struct IdeEnvironment {
     /// The variables `bin\rsvars.bat` exports (`BDS`, `BDSLIB`, `BDSCOMMONDIR`, …).
@@ -31,9 +28,9 @@ pub struct IdeEnvironment {
 }
 
 impl IdeEnvironment {
-    /// Reads the environment of the installation at `installation` for the
-    /// BDS version `bds_version` (`"23.0"`). Fails when `rsvars.bat` is
-    /// missing or unparsable: without it no `$(BDS)`-relative path resolves.
+    /// `bds_version` is the BDS version string (`"23.0"`). Fails when
+    /// `rsvars.bat` is missing or unparsable: without it no `$(BDS)`-relative
+    /// path resolves.
     pub fn read(installation: &Path, bds_version: &str) -> Result<Self> {
         let rsvars_path = installation.join("bin").join("rsvars.bat");
         if !rsvars_path.exists() {
@@ -49,13 +46,11 @@ impl IdeEnvironment {
         })
     }
 
-    /// The macro map an IDE-launched build effectively sees, in the IDE's
-    /// order of precedence: `rsvars.bat` first, the derived `$(BDS…)`
-    /// defaults only where nothing defined them, the IDE's own overrides
-    /// last (they win over `rsvars.bat`). `PLATFORM` is dropped because
-    /// `rsvars.bat` deliberately blanks it while the IDE's library paths use
-    /// it; the caller sets `Platform` together with `Config` once it knows
-    /// them.
+    /// The macro map an IDE-launched build sees, in the IDE's order of
+    /// precedence: `rsvars.bat` first, the derived `$(BDS…)` defaults only
+    /// where nothing defined them, the IDE's own overrides last. `PLATFORM` is
+    /// dropped because `rsvars.bat` blanks it while the IDE's library paths use
+    /// it; the caller sets `Platform` with `Config` once it knows them.
     pub fn macros(&self, installation: &Path) -> MacroMap {
         let mut macros = MacroMap::new();
         macros.extend(self.rsvars.iter().map(|(k, v)| (k.clone(), v.clone())));
@@ -134,7 +129,6 @@ impl MacroMap {
         Self::default()
     }
 
-    /// Insert a variable, overwriting any previous value.
     pub fn set(&mut self, key: impl AsRef<str>, value: impl Into<String>) {
         let key = key.as_ref();
         let value = value.into();
@@ -142,14 +136,13 @@ impl MacroMap {
         self.original_case.insert(key.to_string(), value);
     }
 
-    /// Insert a variable only when that name is not already defined.
     pub fn set_default(&mut self, key: impl AsRef<str>, value: impl Into<String>) {
         if self.get(key.as_ref()).is_none() {
             self.set(key, value);
         }
     }
 
-    /// Forget a variable, whatever casing it was defined with.
+    /// Removes the variable whatever casing it was defined with.
     pub fn remove(&mut self, key: &str) {
         let upper = key.to_ascii_uppercase();
         self.vars.remove(&upper);
@@ -203,7 +196,6 @@ impl MacroMap {
                     let name: String = bytes[i + 2..close].iter().collect();
                     match self.get(&name) {
                         Some(resolved) => out.push_str(resolved),
-                        // Unknown: keep the token so the caller can warn.
                         _ => out.push_str(&format!("$({name})")),
                     }
                     i = close + 1;

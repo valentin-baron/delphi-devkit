@@ -60,9 +60,7 @@ pub fn encode_string(s: &str, label: &str) -> Vec<u8> {
     }
 }
 
-/// Encode a string to the system OEM codepage using `WideCharToMultiByte`.
-///
-/// On non-Windows platforms, falls back to returning the raw UTF-8 bytes.
+/// Encode to the system OEM codepage; raw UTF-8 bytes off Windows.
 #[cfg(windows)]
 fn encode_oem(s: &str) -> Vec<u8> {
     // CP_OEMCP = 1 — the current system OEM codepage.
@@ -145,30 +143,22 @@ pub fn decode_line(bytes: &[u8]) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// OEM codepage auto-detection (Windows)
-// ---------------------------------------------------------------------------
-
-/// Detect the system OEM codepage and decode accordingly.
-/// Used for file reads (e.g. `format`), where the relevant codepage is the
-/// system OEM codepage rather than the console codepage.
+/// Decodes bytes in the system OEM codepage. For file reads (`format`),
+/// where the relevant codepage is the system's rather than the console's.
 fn decode_oem(bytes: &[u8]) -> String {
     decode_cp(bytes, oem_codepage())
 }
 
-/// Decode bytes using a specific Windows codepage number.
 fn decode_cp(bytes: &[u8], cp: u32) -> String {
     match cp {
         65001 => String::from_utf8_lossy(bytes).to_string(),
         850 => decode_single_byte(bytes, &CP850_HIGH),
         437 => decode_single_byte(bytes, &CP437_HIGH),
         _ => {
-            // Try mapping the codepage number to an encoding_rs label.
             if let Some(enc) = codepage_to_encoding(cp) {
                 let (decoded, _, _) = enc.decode(bytes);
                 decoded.into_owned()
             } else {
-                // Last resort: lossy UTF-8
                 String::from_utf8_lossy(bytes).to_string()
             }
         }
@@ -196,7 +186,6 @@ fn oem_codepage() -> u32 {
 /// console (`GetConsoleOutputCP` returns 0), e.g. a detached LSP server.
 #[cfg(windows)]
 fn console_output_codepage() -> u32 {
-    // kernel32!GetConsoleOutputCP – always available, no additional crate needed.
     unsafe extern "system" {
         fn GetConsoleOutputCP() -> u32;
     }
@@ -209,7 +198,6 @@ fn console_output_codepage() -> u32 {
     65001 // UTF-8
 }
 
-/// Map a Windows codepage number to an `encoding_rs` encoding (where possible).
 fn codepage_to_encoding(cp: u32) -> Option<&'static Encoding> {
     let label: &[u8] = match cp {
         866 => b"ibm866",
@@ -247,10 +235,6 @@ fn codepage_to_encoding(cp: u32) -> Option<&'static Encoding> {
     };
     Encoding::for_label(label)
 }
-
-// ---------------------------------------------------------------------------
-// Single-byte OEM codepage decode (CP850, CP437)
-// ---------------------------------------------------------------------------
 
 /// Decode bytes using a 128-entry high-half table (indices 0x80..0xFF).
 /// Bytes 0x00..0x7F are ASCII-identical for all OEM codepages.
@@ -309,18 +293,12 @@ static CP437_HIGH: [char; 128] = [
     '≡', '±', '≥', '≤', '⌠', '⌡', '÷', '≈', '°', '∙', '·', '√', 'ⁿ', '²', '■', '\u{00A0}',
 ];
 
-// ---------------------------------------------------------------------------
-// UTF-32 decode
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Regression for the "compiler output decoded as the wrong codepage" bug:
-    // whatever the active console output codepage, the child writes `ü` in THAT
-    // codepage, and `decode_cp` with the matching codepage must recover `ü`.
-    // Byte values mirror the spec's measurement table.
+    // A child process writes `ü` in the active console output codepage, so
+    // `decode_cp` with that codepage must recover it.
     #[test]
     fn decode_cp_recovers_u_umlaut_across_codepages() {
         // chcp 850  → child emits CP850 byte 0x81

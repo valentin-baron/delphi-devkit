@@ -8,10 +8,6 @@ import { env as osEnv } from 'process';
 import { PROJECTS } from '../../constants';
 import { Runtime } from '../../runtime';
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-/** Ensure the file (and its parent directory) exist, creating them with
- *  `defaultContent` when missing.  Returns the absolute path. */
 async function ensureFile(filePath: string, defaultContent: string = ''): Promise<string> {
   try {
     await fs.access(filePath);
@@ -24,8 +20,6 @@ async function ensureFile(filePath: string, defaultContent: string = ''): Promis
 }
 
 const DEFAULT_INI_CONTENT = `; Default INI template – used as the starting content\n; when DDK creates a new .ini file for a project.\n[CmdLineParam]\n`;
-
-// ─── Item definitions ────────────────────────────────────────────────────────
 
 class ConfigFileItem extends TreeItem {
   constructor(
@@ -44,8 +38,6 @@ class ConfigFileItem extends TreeItem {
     };
   }
 }
-
-// ─── Tree data provider ──────────────────────────────────────────────────────
 
 export class ConfigurationTreeView implements TreeDataProvider<TreeItem> {
   private changeEmitter = new EventEmitter<void>();
@@ -104,7 +96,6 @@ export class ConfigurationTreeView implements TreeDataProvider<TreeItem> {
         async () => {
           const target = join(ddkDir, 'ddk_formatter.config');
           try { await fs.access(target); } catch {
-            // Seed from the bundled default shipped with the extension
             const bundled = Runtime.extension.asAbsolutePath('dist/ddk_formatter.config');
             try {
               const content = await fs.readFile(bundled, 'utf8');

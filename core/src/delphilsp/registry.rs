@@ -3,11 +3,9 @@
 //! default package output directories) and the user-defined **environment
 //! variable** overrides (`$(VEGADIR)`, `$(DXVCL)`, …).
 //!
-//! Both live under `HKCU\SOFTWARE\<vendor>\BDS\<version>`. That root is
-//! modelled explicitly ([`IdeRegistryRoot`]) because it is not a constant:
-//! the vendor segment changed with the product's owner. Everything here
-//! degrades gracefully: a missing key yields empty data plus a warning from
-//! the caller rather than an error, and non-Windows builds compile to stubs.
+//! Both live under `HKCU\SOFTWARE\<vendor>\BDS\<version>`, whose vendor segment
+//! changed with the product's owner — hence [`IdeRegistryRoot`]. A missing key
+//! yields empty data rather than an error; non-Windows builds are stubs.
 
 /// Where one Delphi installation keeps its IDE settings in `HKCU`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,9 +21,6 @@ impl IdeRegistryRoot {
     /// The default root of a BDS major version (`23` for Delphi 12 Athens —
     /// the same number as `CompilerConfiguration::product_version`).
     pub fn for_bds_version(major: usize) -> Self {
-        // The registry root moved as the product changed hands: Borland up to
-        // BDS 5.0 (Delphi 2007), CodeGear for 6.0/7.0 (2009/2010), Embarcadero
-        // from 8.0 (XE) onwards.
         let vendor = match major {
             0..=5 => "Borland",
             6..=7 => "CodeGear",
@@ -65,8 +60,7 @@ pub struct IdeLibrarySettings {
     /// `Search Path` — the global Library Path (compiled units, mostly).
     pub search_path: Option<String>,
     /// `Browsing Path` — where the IDE looks for the sources behind the
-    /// library path: what DelphiLSP navigates into and a debugger's most
-    /// valuable source roots.
+    /// library path; what DelphiLSP and the debugger navigate into.
     pub browsing_path: Option<String>,
     /// `Debug DCU Path` — prepended to `-I`/`-U` for debug configurations.
     pub debug_dcu_path: Option<String>,
@@ -121,8 +115,7 @@ pub fn read_ide_library_settings(bds_version: &str, platform: &str) -> IdeLibrar
 }
 
 /// The user-defined environment-variable overrides of one BDS version
-/// (`"23.0"`). Thin adapter over [`crate::utils::bds_environment_overrides`],
-/// which owns the registry reading.
+/// (`"23.0"`).
 pub fn read_ide_environment_variables(bds_version: &str) -> Vec<(String, String)> {
     crate::utils::bds_environment_overrides(bds_major(bds_version))
 }

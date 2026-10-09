@@ -2,7 +2,6 @@ import { window, workspace, Uri, ProgressLocation } from 'vscode';
 
 export class GroupProjectPicker {
   async pickGroupProject(): Promise<Uri | undefined> {
-    // Scan for .groupproj files
     const groupProjUris = await window.withProgress(
       {
         location: ProgressLocation.Notification,
@@ -17,7 +16,6 @@ export class GroupProjectPicker {
       window.showInformationMessage('No .groupproj files found in the workspace.');
       return;
     }
-    // Show QuickPick
     const picked = await window.showQuickPick(
       groupProjUris.map((uri) => ({
         label: workspace.asRelativePath(uri),

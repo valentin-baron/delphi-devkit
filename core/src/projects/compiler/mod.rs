@@ -20,22 +20,20 @@ pub struct CompileResult {
     pub success: bool,
     pub cancelled: bool,
     pub code: i32,
-    /// Structured description of what was compiled, lifted from the banner.
     pub header: CompileHeader,
 }
 
-/// Structured header metadata for a compile, mirroring the banner fields.
+/// The banner fields, as structured data.
 #[derive(Debug, Clone, Default)]
 pub struct CompileHeader {
-    /// The compiled project/target path (or a description for multi-project runs).
+    /// The compiled project path, or a description for multi-project runs.
     pub target: String,
-    /// Product name of the compiler, e.g. "Delphi 12.0 Athens".
     pub compiler: String,
-    /// Effective build configuration (single-project compiles only).
+    /// Set for single-project compiles only.
     pub config: Option<String>,
-    /// Effective target platform (single-project compiles only).
+    /// Set for single-project compiles only.
     pub platform: Option<String>,
-    /// Whether this was a rebuild (Clean;Build) rather than a compile (Clean;Make).
+    /// Clean;Build rather than Clean;Make.
     pub rebuild: bool,
 }
 
@@ -43,15 +41,12 @@ pub struct Compiler {
     client: Option<tower_lsp::Client>,
     params: CompileProjectParams,
     projects_data: ProjectsData,
-    /// Additional free-form arguments appended to the MSBuild command line
-    /// (from the CLI `-- <args...>` passthrough). Ignored for bare
-    /// `.dpr`/`.dpk` compiles, which use the command-line compiler (dcc)
-    /// rather than MSBuild.
+    /// From the CLI `-- <args...>` passthrough. Ignored for bare
+    /// `.dpr`/`.dpk` compiles, which go through dcc rather than MSBuild.
     extra_msbuild_args: Vec<String>,
 }
 
 impl Compiler {
-    /// Create a compiler with a live LSP client (used by ddk-server).
     pub async fn new(client: tower_lsp::Client, params: &CompileProjectParams) -> Self {
         Compiler {
             client: Some(client),
@@ -61,9 +56,8 @@ impl Compiler {
         }
     }
 
-    /// Create a compiler without an LSP client (used by ddk-mcp-server).
-    /// Progress is still broadcast via the in-process channel; diagnostics
-    /// will not be published to VS Code.
+    /// Without an LSP client, progress is still broadcast in-process but no
+    /// diagnostics reach VS Code.
     pub async fn new_standalone(params: &CompileProjectParams) -> Self {
         Compiler {
             client: None,
@@ -73,20 +67,15 @@ impl Compiler {
         }
     }
 
-    /// Append additional free-form arguments to the MSBuild invocation. These
-    /// are placed **after** the built-in `/p:Config`/`/p:Platform` args so a
-    /// user-supplied `/p:` override wins (MSBuild takes the last value). Has no
-    /// effect on bare `.dpr`/`.dpk` compiles (which do not use MSBuild).
+    /// Placed after the built-in `/p:Config`/`/p:Platform` so a user's `/p:`
+    /// override wins: MSBuild takes the last value of a duplicated property.
     pub fn with_extra_msbuild_args(mut self, args: Vec<String>) -> Self {
         self.extra_msbuild_args = args;
         self
     }
 
-    /// Create a standalone compiler operating on an explicit, caller-supplied
-    /// [`ProjectsData`] instead of the persisted global state. Used for ad-hoc
-    /// compilation of a file that has not been added to any saved workspace:
-    /// the caller assembles an ephemeral `ProjectsData` (one workspace + the
-    /// target project) and the regular compile path runs against it unchanged.
+    /// Runs the regular compile path against caller-supplied state instead of
+    /// the persisted one — how an ad-hoc file compile works.
     pub async fn new_standalone_with_data(
         params: &CompileProjectParams,
         projects_data: ProjectsData,
@@ -160,7 +149,6 @@ impl Compiler {
         }
         let target = project.get_project_file()?;
         let compiler_name = configuration.product_name.clone();
-        // Resolve config/platform for the banner
         let (eff_config, eff_platform) = if let Some(dproj_path) = &project.dproj {
             if let Ok(dproj_obj) = dproj_cache::get_or_load(project.id, &PathBuf::from(dproj_path)) {
                 project.effective_config_platform(&dproj_obj)
@@ -389,7 +377,6 @@ impl Compiler {
         };
         parameters.debug_info = self.params.debug_info();
         clear_stale_diagnostics(self.client.as_ref()).await;
-        // Actual compilation process
         let start_lines = if parameters.only_one_project {
             parameters.banner.into_header_vec()
         } else {
@@ -401,7 +388,7 @@ impl Compiler {
         ).await;
         let result = self.do_compile(&parameters).await;
         let cancelled = compiler_state::is_cancelled();
-        // Treat cancellation as a non-error outcome so no upstream error is logged
+        // Cancellation is not an error, so nothing upstream logs one.
         let result = if cancelled { Ok(()) } else { result };
         let banner = &parameters.banner;
         let compile_result = CompileResult {
@@ -427,9 +414,8 @@ impl Compiler {
         return Ok(compile_result);
     }
 
-    /// The build's outcome is published however the build ends — a project
-    /// that failed is the build's answer just as much when a later one was
-    /// cancelled or could not be started as when every project ran.
+    /// The outcome is published however the build ends, so a failed project
+    /// stays the answer even when a later one was cancelled or never started.
     async fn do_compile(&self, parameters: &CompilationParameters<'_>) -> Result<()> {
         let mut outcome = BuildOutcome::default();
         let result = self.compile_each_project(parameters, &mut outcome).await;
@@ -443,8 +429,6 @@ impl Compiler {
                 return Err(anyhow::anyhow!("Compilation cancelled by user."));
             }
 
-            // Resolve effective configuration/platform for this project early,
-            // so the banner can display it and MSBuild receives the right args.
             let (eff_config, eff_platform) = if let Some(dproj_path) = &project.dproj {
                 if let Ok(dproj_obj) = dproj_cache::get_or_load(project.id, &PathBuf::from(dproj_path)) {
                     project.effective_config_platform(&dproj_obj)
@@ -453,9 +437,8 @@ impl Compiler {
                      project.active_platform.clone().unwrap_or_else(|| "Win32".to_string()))
                 }
             } else {
-                // Bare `.dpr`/`.dpk`: no dproj defaults exist, so fall back to the
-                // synthetic bare-project defaults (matching what `dproj/metadata`
-                // advertises to the platform picker).
+                // A bare `.dpr`/`.dpk` has no dproj defaults; these are the
+                // ones `dproj/metadata` advertises to the platform picker.
                 (project.active_configuration.clone().unwrap_or_else(|| BARE_DEFAULT_CONFIGURATION.to_string()),
                  project.active_platform.clone().unwrap_or_else(|| BARE_DEFAULT_PLATFORM.to_string()))
             };
@@ -487,10 +470,8 @@ impl Compiler {
                 .map_err(|e| anyhow::anyhow!("Failed to parse rsvars.bat: {}", e))?;
             let project_file = project.get_project_file()?;
 
-            // A project with a real `.dproj` is built through MSBuild as before.
-            // A bare `.dpr`/`.dpk` (no `.dproj`) cannot be loaded by MSBuild
-            // (it is Pascal source, not an MSBuild XML project → MSB4025), so it
-            // is compiled with the Delphi command-line compiler directly.
+            // MSBuild cannot load a bare `.dpr`/`.dpk` — it is Pascal source,
+            // not MSBuild XML (MSB4025) — so dcc compiles those directly.
             let has_dproj = project.dproj.as_deref()
                 .map(|p| !p.is_empty() && PathBuf::from(p).exists())
                 .unwrap_or(false);
@@ -538,9 +519,10 @@ impl Compiler {
             }
             let mut child_process = command.spawn()?;
 
-            // Capture the PID before taking stdio handles so we can kill the
-            // entire process tree on cancellation (taskkill /F /T kills MSBuild
-            // AND every compiler child process it spawned, e.g. dcc32.exe).
+            // Kept for the cancellation path: `taskkill /F /T` ends MSBuild
+            // and every compiler it spawned (dcc32.exe), which a surviving
+            // one would otherwise keep the output file locked against. Read
+            // here because `wait()` borrows the child for the rest of the scope.
             let child_pid = child_process.id();
 
             let stdout = child_process.stdout.take()
@@ -591,16 +573,13 @@ impl Compiler {
                     Ok(())
                 }
                 _ = cancel_signal => {
-                    // Kill the whole process tree so that child processes spawned
-                    // by MSBuild (dcc32.exe, dcc64.exe, …) are also terminated.
-                    // Without this, those processes keep file locks and the next
-                    // compilation attempt on the same project fails immediately.
+                    // `/T` takes the whole tree: a surviving dcc32.exe keeps
+                    // file locks that fail the next compile immediately.
                     if let Some(pid) = child_pid {
                         let _ = std::process::Command::new("taskkill")
                             .args(["/F", "/T", "/PID", &pid.to_string()])
                             .output();
                     }
-                    // Fallback: also ask Tokio to kill the root process handle.
                     let _ = child_process.kill().await;
                     stdout_task.abort();
                     stderr_task.abort();
@@ -646,10 +625,9 @@ impl Compiler {
     }
 }
 
-/// The outcome of a whole build. `compiler_state` holds the status of the
-/// project compiled last, which is what the per-project notifications need;
-/// a build of several projects, though, succeeded only if every one of them
-/// did, and its exit code is that of the first project that failed.
+/// `compiler_state` holds the last project's status, which is what the
+/// per-project notifications need. A multi-project build succeeds only if
+/// every one did, and its exit code is the first failure's.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct BuildOutcome {
     first_failure: Option<i32>,
@@ -662,7 +640,6 @@ impl BuildOutcome {
         }
     }
 
-    /// Makes the build's outcome the state callers read once it is over.
     fn publish(&self) {
         if let Some(code) = self.first_failure {
             compiler_state::set_success(false);
@@ -671,12 +648,8 @@ impl BuildOutcome {
     }
 }
 
-/// The compiler configuration's build arguments as MSBuild receives them.
-/// Each entry is one argument and is passed as it is, spaces included
-/// (`/p:DCC_Define=FOO BAR`, a log file under `C:\build logs`). An entry
-/// holding several switches in one string (`/v:q /nologo`) is still split,
-/// as it always was: it is recognised by every one of its words being a
-/// switch.
+/// An entry is one argument, spaces included (`/p:DCC_Define=FOO BAR`). Only
+/// an entry whose every word is a switch (`/v:q /nologo`) is split.
 fn split_build_arguments(build_arguments: &[String]) -> Vec<String> {
     let is_switch = |word: &str| word.starts_with('/') || word.starts_with('-');
     build_arguments
@@ -732,8 +705,8 @@ enum OutputKind {
 }
 
 lazy_static::lazy_static! {
-    // Matches Delphi 2007 compiler-progress lines: indented Windows absolute path with no
-    // line-number notation, e.g. "  C:\Projects\...\SomeUnit".
+    // Delphi 2007 progress lines: an indented absolute path with no line
+    // number, e.g. "  C:\Projects\...\SomeUnit".
     static ref PATH_ONLY_LINE_REGEX: regex::Regex =
         regex::Regex::new(r"^\s+[A-Za-z]:\\[^()\r\n]*$").unwrap();
 }
@@ -748,8 +721,6 @@ async fn process_output_lines<R: AsyncRead + Unpin + Send>(
     use tokio::io::AsyncBufReadExt;
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
     let mut last_file = String::new();
-    // Tracks the last emitted CompilerLineDiagnostic::dedup_key to drop the consecutive
-    // repetition Delphi 2007 produces (once wrapped in MSBuild format, once plain).
     let mut last_diag_key: Option<(String, u32, String, String)> = None;
     let mut buf = Vec::new();
 
@@ -760,15 +731,12 @@ async fn process_output_lines<R: AsyncRead + Unpin + Send>(
             Ok(_) => {}
             Err(_) => break,
         }
-        // Decode using the configured compiler encoding
         let line = crate::encoding::decode_line(&buf)
             .trim_end_matches(['\r', '\n'])
             .to_string();
-        // Skip blank / whitespace-only lines (Delphi 2007 emits many)
         if line.trim().is_empty() {
             continue;
         }
-        // Skip path-only compiler-progress lines, e.g. "  C:\Projects\...\SomeUnit"
         if PATH_ONLY_LINE_REGEX.is_match(&line) {
             continue;
         }
@@ -776,7 +744,6 @@ async fn process_output_lines<R: AsyncRead + Unpin + Send>(
             break;
         }
         if let Some(mut diagnostic) = CompilerLineDiagnostic::from_line(&line, compiler_name.clone()) {
-            // Resolve relative file paths against the project directory
             let file_path = PathBuf::from(&diagnostic.file);
             if file_path.is_relative() {
                 let resolved = project_dir.join(&file_path);
@@ -784,19 +751,18 @@ async fn process_output_lines<R: AsyncRead + Unpin + Send>(
                     diagnostic.file = resolved.to_string_lossy().to_string();
                 }
             }
-            // Deduplicate: Delphi 2007 emits the same diagnostic twice – once in the
-            // Borland.Delphi.Targets MSBuild wrapper and once as a plain indented line.
-            // Skip the second occurrence when it repeats the diagnostic we just emitted,
-            // message included: dcc reports several diagnostics with the same code for one
-            // source line, and those differ in nothing else.
+            // Delphi 2007 emits each diagnostic twice, once wrapped by the
+            // Borland.Delphi.Targets MSBuild wrapper and once plain. The key
+            // includes the message: dcc reports several diagnostics with the
+            // same code for one source line, differing in nothing else.
             let key = diagnostic.dedup_key();
             if last_diag_key.as_ref() == Some(&key) {
                 continue;
             }
             last_diag_key = Some(key);
-            // Windows paths are case-insensitive, so a differently spelled drive letter
-            // must not flush the batch early – publishing twice for one document would
-            // replace the first batch instead of adding to it.
+            // Compared case-insensitively: a differently spelled drive letter
+            // must not flush the batch early, since publishing twice for one
+            // document replaces the first batch instead of adding to it.
             if !last_file.eq_ignore_ascii_case(&diagnostic.file) && !diagnostics.is_empty() {
                 compiler_state::track_diagnosed_file(last_file.clone());
                 publish_diagnostics(client.as_ref(), &last_file, &diagnostics).await;
@@ -823,10 +789,8 @@ async fn process_output_lines<R: AsyncRead + Unpin + Send>(
     }
 }
 
-/// Resolve the Delphi command-line compiler for a bare `.dpr`/`.dpk` build.
-/// The platform selects the bitness: `Win64` → `dcc64.exe`, everything else
-/// (including `Win32`) → `dcc32.exe`. The binary lives in the compiler's
-/// `bin` directory.
+/// `Win64` → `dcc64.exe`, everything else (`Win32` included) → `dcc32.exe`,
+/// in the compiler's `bin` directory.
 fn find_dcc(installation_path: &str, platform: &str) -> Result<PathBuf> {
     let exe = if platform.eq_ignore_ascii_case("Win64") {
         "dcc64.exe"
@@ -844,13 +808,11 @@ fn find_dcc(installation_path: &str, platform: &str) -> Result<PathBuf> {
     );
 }
 
-/// The MSBuild global properties a debug-info build injects for a `.dproj`.
 /// Global properties override the dproj's own values, so the full debug
-/// artefact set is produced regardless of the selected configuration:
-/// optimizations off (otherwise breakpoints land on wrong lines and locals
-/// read as garbage), TD32 debug info in the binary, the `.rsm` remote-debug
-/// symbols (variable and type inspection) and a detailed `.map`. Property
-/// names match those an IDE-authored dproj writes for its Debug configuration.
+/// artefact set is produced whatever the configuration says: optimizations
+/// off (they make breakpoints land on wrong lines), TD32 debug info, the
+/// `.rsm` remote-debug symbols and a detailed `.map`. The names are those an
+/// IDE-authored dproj writes for its Debug configuration.
 fn debug_info_msbuild_properties() -> Vec<String> {
     [
         "DCC_Optimize=false",
@@ -867,13 +829,9 @@ fn debug_info_msbuild_properties() -> Vec<String> {
     .collect()
 }
 
-/// The MSBuild command line for a `.dproj` build, in this order: the project,
-/// the target (`Clean` first, then `Make` or `Build`), the compiler
-/// configuration's own build arguments, config/platform, the debug-info
-/// overrides when asked for (global properties win over the dproj's values),
-/// and the user's passthrough arguments last — so a `/p:` property of theirs
-/// wins over everything before it, the debug-info set included (MSBuild takes
-/// the last value of a duplicated property).
+/// The user's passthrough arguments come last, so a `/p:` property of theirs
+/// wins over everything before it, the debug-info set included: MSBuild takes
+/// the last value of a duplicated property.
 fn msbuild_arguments(
     project_file: &str,
     build_arguments: &[String],
@@ -898,18 +856,14 @@ fn msbuild_arguments(
     args
 }
 
-/// Build the dcc command-line switches for a bare-source compile. There is no
-/// `.dproj` to carry configuration, so the (Debug|Release) selection is mapped
-/// onto the relevant `-$` compiler directives. `rebuild` adds `-B` to force a
-/// full build of every unit. `debug_info` appends the full debug artefact
-/// switches after the configuration block — later dcc switches win — so they
-/// take effect even on a Release configuration.
+/// A bare source has no `.dproj` to carry configuration, so Debug/Release is
+/// mapped onto `-$` directives. The `debug_info` switches come after that
+/// block and win, later dcc switches overriding earlier ones.
 fn dcc_arguments(config: &str, rebuild: bool, debug_info: bool) -> Vec<String> {
     let mut args = vec!["-Q".to_string()]; // quiet: suppress per-unit progress chatter
-    // Build all units, not just out-of-date ones. A debug-info build always
-    // does: the switches below change what goes into every DCU, and an
-    // up-to-date DCU from a Release build would be reused as is — the MSBuild
-    // path cleans first for the same reason.
+    // A debug-info build must rebuild every unit: the switches below change
+    // what goes into each DCU, and an up-to-date Release DCU would be reused
+    // as is. The MSBuild path cleans first for the same reason.
     if rebuild || debug_info {
         args.push("-B".to_string());
     }
@@ -968,9 +922,9 @@ mod compile_arguments_tests {
         assert_eq!(msbuild(true, false, &[]), common("Build"));
     }
 
-    /// The property set is spelled out here on purpose, not taken from the
-    /// function under test: it is the documented contract of `--debug-info`
-    /// (README, CLI help), and changing it must be a decision, not a typo.
+    /// The properties are spelled out rather than taken from the function
+    /// under test: they are the documented contract of `--debug-info`
+    /// (README, CLI help), so changing one must be a decision, not a typo.
     #[test]
     fn msbuild_debug_info_adds_the_documented_properties_before_the_passthrough() {
         let documented = [
@@ -1057,7 +1011,7 @@ fn find_msbuild() -> Result<String> {
 
 
 async fn clear_stale_diagnostics(client: Option<&tower_lsp::Client>) {
-    // Always drain the tracked files to prevent stale state
+    // Drained even without a client, so no stale state is left behind.
     let files = compiler_state::take_diagnosed_files();
     let Some(client) = client else { return };
     let mut tasks = tokio::task::JoinSet::new();
@@ -1096,8 +1050,7 @@ struct CompilationParameters<'compiler> {
     projects: Vec<&'compiler Project>,
     configuration: CompilerConfiguration,
     rebuild: bool,
-    /// Force the full debug artefact set regardless of the build
-    /// configuration's own settings — see [`debug_info_msbuild_properties`].
+    /// See [`debug_info_msbuild_properties`].
     debug_info: bool,
     only_one_project: bool,
     banner: CompBanner,
@@ -1125,7 +1078,6 @@ struct CompBanner {
     target: String,
     compiler_name: String,
     rebuild: bool,
-    /// Optional per-project config/platform shown in the banner.
     config_platform: Option<(String, String)>,
 }
 

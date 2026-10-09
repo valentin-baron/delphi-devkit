@@ -12,9 +12,9 @@
 //! * the IDE's **global Library Path** and user-defined environment variable
 //!   overrides, both read from `HKCU\SOFTWARE\Embarcadero\BDS\<ver>`.
 //!
-//! The emitted `dccOptions` string mirrors what the IDE writes. It only feeds
-//! code insight — it never drives a real build — so switches that cannot be
-//! derived faithfully fall back to sane defaults.
+//! The emitted `dccOptions` string mirrors what the IDE writes. It feeds code
+//! insight only and never drives a build, so switches that cannot be derived
+//! faithfully fall back to defaults.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -29,18 +29,11 @@ use crate::utils::{dir_to_file_uri, path_to_file_uri, trim_trailing_separator};
 pub mod registry;
 pub use registry::{IdeLibrarySettings, IdeRegistryRoot};
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/// Value of the top-level `generatedBy` key DDK stamps on every file it
-/// writes, as a sibling of `settings`.
+/// Value of the top-level `generatedBy` key, a sibling of `settings`.
 ///
-/// The RAD Studio IDE never writes this key, which makes it a reliable
-/// ownership marker: a `.delphilsp.json` carrying it is DDK's to refresh
-/// whenever the project's search paths, defines, configuration or platform go
-/// stale, while a file without it was hand-made or produced by the IDE and
-/// must never be overwritten automatically.
+/// The RAD Studio IDE never writes this key, so it is the ownership marker: a
+/// file carrying it is DDK's to refresh, one without it was hand-made or
+/// written by the IDE and must never be overwritten automatically.
 pub const GENERATED_BY_MARKER: &str = "delphi-devkit";
 
 /// Unit aliases the RAD Studio IDE emits when a project defines none of its
@@ -59,8 +52,8 @@ pub const DEFAULT_UNIT_ALIASES: &str = concat!(
 // Path list helpers
 // ---------------------------------------------------------------------------
 
-/// Split a `;`-separated path list, expand its macros, and drop entries that
-/// still contain an unresolved `$(NAME)` (collecting a warning for each).
+/// Expands the macros in a `;`-separated path list. Entries still holding
+/// an unresolved `$(NAME)` are dropped with a warning.
 pub fn expand_path_list(raw: &str, macros: &MacroMap, warnings: &mut Vec<String>) -> Vec<String> {
     let mut out = Vec::new();
     for entry in raw.split(';') {
@@ -92,8 +85,6 @@ fn quote_if_needed(value: &str) -> String {
     }
 }
 
-/// Join a path list into a dcc option payload: `;`-separated, entries with
-/// spaces double-quoted individually.
 fn join_paths(paths: &[String]) -> String {
     paths.iter().map(|p| quote_if_needed(p)).collect::<Vec<_>>().join(";")
 }
@@ -102,9 +93,7 @@ fn join_paths(paths: &[String]) -> String {
 // dccOptions assembly
 // ---------------------------------------------------------------------------
 
-/// Fully resolved inputs for [`build_dcc_options`]. Everything here is already
-/// expanded — the builder does no macro resolution of its own, which keeps it
-/// trivially unit-testable.
+/// Fully expanded inputs: [`build_dcc_options`] resolves no macros of its own.
 #[derive(Debug, Clone, Default)]
 pub struct DccOptionsInput {
     /// `true` for a `.dpk` (emits `-TX.bpl`).
@@ -155,16 +144,14 @@ impl DccOptionsInput {
     }
 }
 
-/// Append `<prefix><value>` (quoted when it contains a space), skipping empty
-/// values so the IDE's "absent option" behaviour is preserved.
+/// Empty values are skipped: the IDE omits the option entirely.
 fn push_value(parts: &mut Vec<String>, prefix: &str, value: &str) {
     if !value.is_empty() {
         parts.push(format!("{prefix}{}", quote_if_needed(value)));
     }
 }
 
-/// Assemble the single-line `dccOptions` string, in the order the RAD Studio
-/// IDE emits it.
+/// Switch order follows what the RAD Studio IDE emits.
 pub fn build_dcc_options(input: &DccOptionsInput) -> String {
     let mut parts: Vec<String> = Vec::new();
 
@@ -215,7 +202,6 @@ pub fn build_dcc_options(input: &DccOptionsInput) -> String {
         parts.push(format!("-U{include_and_unit}"));
     }
     if let Some(description) = input.description.as_ref().filter(|d| !d.trim().is_empty()) {
-        // Escape embedded quotes so the quoted payload cannot break the option syntax.
         parts.push(format!("--description:\"{}\"", description.replace('"', "\\\"")));
     }
     if !input.required_packages.is_empty() {
@@ -229,8 +215,7 @@ pub fn build_dcc_options(input: &DccOptionsInput) -> String {
 // The generated file
 // ---------------------------------------------------------------------------
 
-/// The `settings` object of a `.delphilsp.json`, field-for-field as the RAD
-/// Studio IDE writes it.
+/// Field-for-field as the RAD Studio IDE writes it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DelphiLspSettings {
     project: String,
@@ -256,30 +241,24 @@ struct DelphiLspSettings {
     templates: String,
 }
 
-/// A whole `.delphilsp.json`. The RAD Studio IDE writes only `settings`; DDK
-/// adds the [`GENERATED_BY_MARKER`] alongside it so a file it owns can be told
-/// apart from one the IDE produced.
+/// A `.delphilsp.json` as it is on disk. The IDE writes only `settings`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DelphiLspFile {
     settings: DelphiLspSettings,
     /// Absent on IDE-generated files — see [`GENERATED_BY_MARKER`].
     #[serde(rename = "generatedBy", skip_serializing_if = "Option::is_none")]
     generated_by: Option<String>,
-    /// SHA-256 (lowercase hex) of the `.dproj` bytes the settings were derived
-    /// from. The VS Code auto-sync compares it against the current `.dproj` to
-    /// decide staleness — timestamps are unreliable on Windows, and an
-    /// untouched-content `.dproj` with a fresh mtime must not trigger a
-    /// regeneration. Absent on IDE files and for bare `.dpr`/`.dpk` projects.
+    /// SHA-256 (lowercase hex) of the `.dproj` bytes these settings came from;
+    /// the VS Code auto-sync decides staleness by it because Windows
+    /// timestamps are unreliable. Absent for IDE files and bare `.dpr`/`.dpk`.
     #[serde(rename = "dprojHash", skip_serializing_if = "Option::is_none")]
     dproj_hash: Option<String>,
 }
 
-/// Outcome of generating a `.delphilsp.json` file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelphiLspConfigResult {
-    /// Absolute path of the file that was written.
     pub file_path: String,
-    /// Project this configuration describes (`.dproj` when there is one).
+    /// The `.dproj` when there is one, else the main source.
     pub project_file: String,
     /// `file:///…` URI of the `.dpr`/`.dpk` main source.
     pub project_uri: String,
@@ -287,7 +266,6 @@ pub struct DelphiLspConfigResult {
     pub dllname: String,
     pub configuration: String,
     pub platform: String,
-    /// Compiler installation the settings were derived from.
     pub compiler: String,
     pub search_path_count: usize,
     pub browsing_path_count: usize,
@@ -318,7 +296,6 @@ impl fmt::Display for DelphiLspConfigResult {
 // Generation
 // ---------------------------------------------------------------------------
 
-/// Everything the generator needs about the target, resolved by the caller.
 #[derive(Debug, Clone)]
 pub struct GenerationRequest {
     /// The project's `.dproj`. `None` for a bare `.dpr`/`.dpk` without one.
@@ -331,28 +308,23 @@ pub struct GenerationRequest {
     pub platform: Option<String>,
     /// Root of the Delphi installation (the folder containing `bin`).
     pub installation_path: PathBuf,
-    /// BDS version of the compiler configuration, e.g. `"23.0"` for Delphi 12
-    /// (`CompilerConfiguration::product_version` + `.0`) — selects the
-    /// registry hive and the IDE data directories.
+    /// `"23.0"` for Delphi 12: selects the registry hive and the IDE data
+    /// directories.
     pub bds_version: String,
-    /// Human-readable compiler name, echoed back in the result.
     pub compiler_name: String,
     /// Where to write the file; `None` writes `<main source>.delphilsp.json`
     /// next to the project.
     pub out_path: Option<PathBuf>,
 }
 
-/// Generate (and write) the `.delphilsp.json` file for `request`.
 pub fn generate(request: &GenerationRequest) -> Result<DelphiLspConfigResult> {
     let mut warnings: Vec<String> = Vec::new();
 
     let installation = &request.installation_path;
     let bds_version = request.bds_version.clone();
 
-    // ── Build the macro map ────────────────────────────────────────────────
     let mut macros = IdeEnvironment::read(installation, &bds_version)?.macros(installation);
 
-    // ── Resolve configuration / platform ───────────────────────────────────
     let dproj = match &request.dproj_path {
         Some(path) => Some(
             dproj_rs::DprojBuilder::new()
@@ -392,13 +364,10 @@ pub fn generate(request: &GenerationRequest) -> Result<DelphiLspConfigResult> {
         .map(|raw| expand_path_list(raw, &macros, &mut warnings))
         .unwrap_or_default();
 
-    // ── Evaluate the effective property group ──────────────────────────────
-    // `DCC_*` names are deliberately left out of the seed environment: the
-    // project's list properties end in an inheritance token (`;$(DCC_Define)`)
-    // which must chain across property groups. `dproj-rs` re-asserts every
-    // seeded variable after each group, so seeding those names would reset the
-    // chain. Left unseeded they expand to nothing, yielding the project's own
-    // values — the IDE's global counterparts are appended below.
+    // `DCC_*` names must stay out of the seed environment: the project's list
+    // properties end in an inheritance token (`;$(DCC_Define)`) that has to
+    // chain across property groups, and `dproj-rs` re-asserts every seeded
+    // variable after each group, which would reset the chain.
     let property_group = match &request.dproj_path {
         Some(path) => Some(
             dproj_rs::DprojBuilder::new()
@@ -411,7 +380,6 @@ pub fn generate(request: &GenerationRequest) -> Result<DelphiLspConfigResult> {
     };
     let dcc = property_group.as_ref().map(|pg| &pg.dcc_options);
 
-    // ── Assemble the option payloads ───────────────────────────────────────
     let take = |value: Option<&String>| value.filter(|v| !v.trim().is_empty()).cloned();
     let flag_of = |value: Option<&String>| value.map(|v| v.eq_ignore_ascii_case("true"));
 
@@ -444,8 +412,8 @@ pub fn generate(request: &GenerationRequest) -> Result<DelphiLspConfigResult> {
     );
     // Namespaces keep the IDE's trailing `;`.
     let namespaces = dcc.and_then(|d| take(d.namespace.as_ref())).unwrap_or_default();
-    // Project-defined aliases sit in front of the IDE's built-in ones, again
-    // where the `;$(DCC_UnitAlias)` inheritance token was.
+    // Project-defined aliases sit where the `;$(DCC_UnitAlias)` inheritance
+    // token was: in front of the IDE's built-in ones.
     let unit_aliases = match dcc.and_then(|d| take(d.unit_alias.as_ref())) {
         Some(own) => format!("{};{DEFAULT_UNIT_ALIASES}", strip_trailing_separators(&own)),
         _ => DEFAULT_UNIT_ALIASES.to_string(),
@@ -464,7 +432,6 @@ pub fn generate(request: &GenerationRequest) -> Result<DelphiLspConfigResult> {
             .map(|t| t.eq_ignore_ascii_case("Library"))
             .unwrap_or(false);
 
-    // Debug DCUs are only meaningful when the configuration asks for them.
     let wants_debug_dcus = dcc
         .and_then(|d| flag_of(d.debug_dcus.as_ref()))
         .unwrap_or_else(|| configuration.eq_ignore_ascii_case("Debug"));
@@ -513,7 +480,6 @@ pub fn generate(request: &GenerationRequest) -> Result<DelphiLspConfigResult> {
     };
     let dcc_options = build_dcc_options(&options_input);
 
-    // ── dllname ────────────────────────────────────────────────────────────
     let dllname = match find_compiler_dll(installation, &platform) {
         Some(name) => name,
         _ => {
@@ -525,7 +491,6 @@ pub fn generate(request: &GenerationRequest) -> Result<DelphiLspConfigResult> {
         }
     };
 
-    // ── Browsing paths and IDE data directories ────────────────────────────
     let browsing_paths: Vec<String> = ide
         .browsing_path
         .as_deref()
@@ -539,7 +504,6 @@ pub fn generate(request: &GenerationRequest) -> Result<DelphiLspConfigResult> {
         .unwrap_or_default();
     let templates = dir_to_file_uri(&installation.join("ObjRepos"));
 
-    // ── Write ──────────────────────────────────────────────────────────────
     let project_uri = path_to_file_uri(&request.main_source);
     let file = DelphiLspFile {
         settings: DelphiLspSettings {
@@ -591,9 +555,8 @@ pub fn generate(request: &GenerationRequest) -> Result<DelphiLspConfigResult> {
     })
 }
 
-/// SHA-256 of the `.dproj` bytes, lowercase hex — the staleness fingerprint
-/// stored as `dprojHash`. The VS Code auto-sync computes the same digest
-/// (`node:crypto`), so the two must never diverge.
+/// The VS Code auto-sync computes the same digest with `node:crypto`; the two
+/// must never diverge.
 fn dproj_content_hash(dproj_path: &Path) -> Option<String> {
     let bytes = std::fs::read(dproj_path).ok()?;
     Some(format!("{:x}", Sha256::digest(&bytes)))
@@ -610,8 +573,7 @@ pub fn default_out_path(main_source: &Path) -> PathBuf {
     dir.join(format!("{stem}.delphilsp.json"))
 }
 
-/// Trim trailing `;` separators left over after an inheritance token was
-/// replaced by nothing (`DEBUG;QBF_ODAC;` → `DEBUG;QBF_ODAC`).
+/// An inheritance token that expanded to nothing leaves a trailing `;`.
 fn strip_trailing_separators(value: &str) -> String {
     value.trim_end_matches(';').to_string()
 }
@@ -654,8 +616,9 @@ fn compiler_dll_prefix(platform: &str) -> (&'static str, &'static str) {
     }
 }
 
-/// Locate the compiler DLL DelphiLSP must load, e.g. `dcc64290.dll`, by
-/// scanning `<installation>\bin` for `<prefix><version><suffix>.dll`.
+/// Scans `<installation>\bin` for `<prefix><version><suffix>.dll` and takes
+/// the last by file name. That is the highest version only while every
+/// version is the same number of digits, which has held since `dcc32170.dll`.
 pub fn find_compiler_dll(installation: &Path, platform: &str) -> Option<String> {
     let (prefix, suffix) = compiler_dll_prefix(platform);
     let entries = std::fs::read_dir(installation.join("bin")).ok()?;
@@ -683,10 +646,6 @@ fn matches_compiler_dll(name: &str, prefix: &str, suffix: &str) -> bool {
     };
     !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -941,8 +900,6 @@ mod tests {
 
     #[test]
     fn ide_files_without_the_marker_still_parse() {
-        // The IDE writes `settings` only; reading such a file must not fail and
-        // must leave the ownership marker unset.
         let raw = r#"{"settings":{"project":"file:///C%3A/a/App.dpr","dllname":"dcc32290.dll",
             "dccOptions":"--no-config","projectFiles":[],"includeDCUsInUsesCompletion":true,
             "enableKeyWordCompletion":true,"browsingPaths":[],"CommonAppData":"","Templates":""}}"#;

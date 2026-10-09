@@ -47,7 +47,6 @@ class ExtendedTransferInfo {
       if (this.target.isEmpty) return false;
       if (!this.source.entity.project || !this.source.item.project) return false;
       if (!this.source.isDraggedFromGroupProject)
-        // we are dragging from a workspace - all workspace info must exist
         if (!this.source.entity.workspaceLink || !this.source.entity.workspace || !this.source.item.workspace)
           return false;
     }
@@ -152,7 +151,6 @@ export class WorkspaceTreeDragDropController implements TreeDragAndDropControlle
           hasFiles = true;
       }
     }
-    // if we reach this, it means we haven't handled any other type
     if (hasFiles) await window.showInformationMessage('Drag-Drop of files from file system is coming soon.');
   }
 
@@ -185,7 +183,6 @@ export class WorkspaceTreeDragDropController implements TreeDragAndDropControlle
   }
 
   private async dropProject(transfer: ExtendedTransferInfo): Promise<boolean> {
-    // validate all required combinations
     if (!transfer.validate()) return false;
     const source = transfer.source;
     const target = transfer.target;

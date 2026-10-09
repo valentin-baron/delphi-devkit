@@ -1,10 +1,6 @@
 use std::path::PathBuf;
 use ddk_core::utils::normalize_path;
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Stripping the \\?\ prefix
-// ═══════════════════════════════════════════════════════════════════════════════
-
 #[test]
 fn strips_extended_length_prefix() {
     let input = r"\\?\C:\Users\foo\project";
@@ -29,12 +25,7 @@ fn leaves_unc_path_without_prefix_unchanged() {
     assert_eq!(normalize_path(input), PathBuf::from(r"\\server\share\file.txt"));
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Delphi-style bare UNC paths  (UNC\server\share\...)
-// ═══════════════════════════════════════════════════════════════════════════════
-
 /// Delphi project files sometimes store UNC paths without the leading `\\`.
-/// e.g. `UNC\Mac\repos\be\BE\D12\be.dpr` should become `\\Mac\repos\be\BE\D12\be.dpr`.
 #[test]
 fn converts_bare_unc_prefix_to_unc_path() {
     let input = r"UNC\Mac\repos\be\BE\D12\be.dpr";
@@ -47,24 +38,19 @@ fn converts_bare_unc_prefix_case_insensitive() {
     assert_eq!(normalize_path(input), PathBuf::from(r"\\server\share\path\file.exe"));
 }
 
-/// `\\?\UNC\server\share\...` is the extended-length UNC form; strip `\\?\` and
-/// then convert the remaining `UNC\` prefix.
+/// `\\?\UNC\server\share\...` is the extended-length UNC form: both prefixes
+/// have to go.
 #[test]
 fn strips_extended_length_unc_prefix() {
     let input = r"\\?\UNC\Mac\repos\be\BE\D12\be.dproj";
     assert_eq!(normalize_path(input), PathBuf::from(r"\\Mac\repos\be\BE\D12\be.dproj"));
 }
 
-/// Dotdot resolution must work after UNC conversion.
 #[test]
 fn resolves_parent_dir_after_unc_conversion() {
     let input = r"UNC\Mac\repos\be\BE\D12\..\other\file.exe";
     assert_eq!(normalize_path(input), PathBuf::from(r"\\Mac\repos\be\BE\other\file.exe"));
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Resolving `..` segments
-// ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn resolves_parent_dir_in_absolute_path() {
@@ -92,7 +78,6 @@ fn resolves_parent_dir_in_relative_path() {
 
 #[test]
 fn parent_dir_past_root_stays_at_root() {
-    // `C:\..` should stay at `C:\`
     let input = r"C:\..";
     let result = normalize_path(input);
     assert_eq!(result, PathBuf::from(r"C:\"));
@@ -110,10 +95,6 @@ fn consecutive_parent_dirs_in_relative_path() {
     assert_eq!(normalize_path(input), PathBuf::from(r"..\..\foo"));
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Resolving `.` (current dir) segments
-// ═══════════════════════════════════════════════════════════════════════════════
-
 #[test]
 fn removes_current_dir_segments() {
     let input = r"C:\Users\.\foo\.\bar";
@@ -125,10 +106,6 @@ fn removes_current_dir_at_start_of_relative_path() {
     let input = r".\src\main.rs";
     assert_eq!(normalize_path(input), PathBuf::from(r"src\main.rs"));
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Combined: prefix stripping + path resolution
-// ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn strips_prefix_and_resolves_parent_dir() {
@@ -145,16 +122,9 @@ fn strips_prefix_and_resolves_current_dir() {
 #[test]
 fn strips_prefix_and_resolves_complex_path() {
     let input = r"\\?\C:\a\b\.\c\..\d\..\..\e";
-    // After stripping prefix: C:\a\b\.\c\..\d\..\..\e
-    //  components: Prefix(C:), RootDir, a, b, ., c, .., d, .., .., e
-    //  skip `.`: a, b, c, .., d, .., .., e
-    //  resolve `..`: a, b, [c popped], d, [d popped], [b popped], e → a, e
+    // a, b, c, .., d, .., .., e → a, b, [c popped], d, [d popped], [b popped], e
     assert_eq!(normalize_path(input), PathBuf::from(r"C:\a\e"));
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Edge cases
-// ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn empty_path_returns_dot() {
@@ -163,7 +133,6 @@ fn empty_path_returns_dot() {
 
 #[test]
 fn single_dot_returns_relative_empty() {
-    // `.` alone → all components are CurDir, stack is empty → "."
     assert_eq!(normalize_path("."), PathBuf::from("."));
 }
 

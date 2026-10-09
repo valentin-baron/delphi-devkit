@@ -11,11 +11,7 @@ import { McpServerFeature } from './mcp/server';
 import { DelphiLspFeature } from './delphilsp/feature';
 import { DebugFeature } from './debug/feature';
 
-/**
- * Runtime class to manage workspace state and global variables.
- *
- * Properties must be synchronously accessible.
- */
+/** Global workspace state. Properties must be synchronously accessible. */
 export abstract class Runtime {
   private static _events: string[] = [];
   private static _failedEvents: string[] = [];
@@ -37,8 +33,8 @@ export abstract class Runtime {
     this.extension = context;
     this.compilerOutputChannel = window.createOutputChannel('DDK Compiler', 'ddk.compiler');
     this.runOutputChannel = window.createOutputChannel('DDK Run');
-    // Initialized before the client so its availability flag and hook are
-    // ready by the time the client's own initial `refresh()` runs.
+    // Before the client: its availability flag and hook must be ready by the
+    // time the client's own initial `refresh()` runs.
     this.delphilsp = new DelphiLspFeature();
     await this.delphilsp.initialize();
     this.client = new DDK_Client();
@@ -47,12 +43,10 @@ export abstract class Runtime {
     await this.projects.initialize();
     this.dfm = new DfmFeature();
     await this.dfm.initialize();
-    // Debugging through whichever extension contributes the `delphi` debug
-    // type; inert (no commands, no menu items) until one is installed.
+    // Inert (no commands, no menu items) until an extension contributing the
+    // `delphi` debug type is installed.
     this.debug = new DebugFeature();
     await this.debug.initialize();
-    // Register the MCP server (spawns ddk-mcp-server as a STDIO child process
-    // when VS Code or another MCP client requests it).
     this.mcp = new McpServerFeature();
     await this.mcp.initialize();
     context.subscriptions.push(
@@ -67,14 +61,13 @@ export abstract class Runtime {
     return this.projectsData?.projects?.find((p) => p.id === this.projectsData.active_project_id);
   }
 
-  /** Update VS Code context keys that govern keybinding `when` clauses.
-   *  Must be called whenever `projectsData` changes so that shortcuts
-   *  work even when the tree view is not visible. */
+  /** The context keys governing keybinding `when` clauses. Must be called
+   *  whenever `projectsData` changes, so shortcuts work with the tree hidden. */
   public static updateProjectContexts(): void {
     const hasSelected = !!this.projectsData?.active_project_id;
     const active = this.activeProject;
-    // A configured Host Application makes a project runnable even without an
-    // own executable (e.g. a .dpk package run through its hosting exe).
+    // A configured Host Application makes a project runnable without an own
+    // executable, which is what makes a .dpk package runnable at all.
     const hasRunTarget = !!(active && Entities.resolveRunTarget(active));
     this.setContext(PROJECTS.CONTEXT.IS_PROJECT_SELECTED, hasSelected);
     this.setContext(PROJECTS.CONTEXT.DOES_SELECTED_PROJECT_HAVE_EXE, hasRunTarget);

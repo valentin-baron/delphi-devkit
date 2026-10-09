@@ -13,11 +13,9 @@ import { PROJECTS } from './constants';
 import { CompileOutcome, compileOutcomeOf, DebugTarget, isDebugTarget } from './debug/contract';
 
 /**
- * The fields `UpdateProject` accepts server-side — the mirror of Rust's
- * `ProjectUpdateData` in `core/src/projects/changes.rs`, field-for-field.
- * Deliberately narrower than `Entities.Project`: read-only/derived fields
- * (`id`, `dproj_run_params`, `dproj_host_application`, ...) are not updatable
- * and would be silently dropped by the server.
+ * Mirrors Rust's `ProjectUpdateData` in `core/src/projects/changes.rs`.
+ * Narrower than `Entities.Project` on purpose: read-only/derived fields are
+ * silently dropped by the server.
  */
 export interface ProjectUpdateData {
     name?: string;
@@ -150,13 +148,12 @@ export class DDK_Client {
                 encoding: workspace.getConfiguration(PROJECTS.SETTINGS.SECTION).get<string>(PROJECTS.SETTINGS.COMPILER_ENCODING, 'oem')
             },
             middleware: {
-                // Route the server's compile diagnostics into a collection DDK
-                // owns, so single entries can be dropped when DelphiLSP reports
-                // the same error live (see MergedDiagnostics).
+                // Into a DDK-owned collection, so single entries can be dropped
+                // when DelphiLSP reports the same error live (see MergedDiagnostics).
                 handleDiagnostics: (uri, diagnostics) => MergedDiagnostics.publish(uri, diagnostics)
             }
         };
-        // we can't set the documentSelector until we implement the actual LSP
+        // No documentSelector: the server does not serve documents yet.
         clientOptions.outputChannelName = 'DDK Server';
         this.client = new LanguageClient(
             'ddk_server',
@@ -257,8 +254,7 @@ export class DDK_Client {
     }
 
     /** `debugInfo` forces the full debug artefact set (optimizations off, TD32,
-     *  `.rsm`, detailed `.map`) whatever the build configuration says — see
-     *  `CompileProjectParams::debug_info` in `core/src/lsp_types.rs`. */
+     *  `.rsm`, detailed `.map`) whatever the build configuration says. */
     public async compileProject(rebuild: boolean, projectId: number, projectLinkId?: number, debugInfo: boolean = false): Promise<boolean> {
         return await this.compile({
             type: 'Project',
@@ -295,12 +291,8 @@ export class DDK_Client {
         });
     }
 
-    /**
-     * Compiles one project and resolves to the build's outcome — success,
-     * failure or cancellation — for a caller that acts on the difference.
-     * `undefined` when the server reported none (a `ddk-server` older than
-     * this extension).
-     */
+    /** `undefined` when the server reported no outcome (a `ddk-server` older
+     *  than this extension). */
     public async compileProjectForOutcome(
         rebuild: boolean, projectId: number, projectLinkId?: number, debugInfo: boolean = false
     ): Promise<CompileOutcome | undefined> {
@@ -313,17 +305,15 @@ export class DDK_Client {
         });
     }
 
-    /** Whether the build succeeded; an outcome the server did not report counts as a failure. */
+    /** A missing outcome counts as a failure. */
     private async compile(params: Record<string, unknown>): Promise<boolean> {
         return (await this.compileForOutcome(params))?.success === true;
     }
 
     /**
-     * Runs one `projects/compile` request. The server answers only once the
-     * compiler is done, and its reply carries the outcome; the event only
-     * keeps the request's lifetime visible to `Runtime` (it cannot fail a
-     * compile: the server finishes it whatever the compiler said). The reply
-     * is checked, not trusted: see `compileOutcomeOf`.
+     * The server answers only once the compiler is done, and its reply carries
+     * the outcome; the event merely keeps the request's lifetime visible to
+     * `Runtime` and can never fail a compile.
      */
     private async compileForOutcome(params: Record<string, unknown>): Promise<CompileOutcome | undefined> {
         const event = Runtime.addEvent(0);
@@ -340,19 +330,16 @@ export class DDK_Client {
         return await this.client.sendRequest('dproj/metadata', { project_id: projectId });
     }
 
-    /** Thin wrapper over the `delphilsp/generate` custom method. `project` is a project id
-     *  (as a string), name, or path — omit to target the currently active project. Throws
-     *  (with a formatted candidate list as the message) when the reference is ambiguous. */
+    /** `delphilsp/generate`. `project` is a project id (as a string), name or path;
+     *  omit for the active project. Throws with the candidate list when ambiguous. */
     public async generateDelphiLspConfig(project?: string, compiler?: string, out?: string): Promise<DelphiLspConfigResult> {
         return await this.client.sendRequest('delphilsp/generate', { project, compiler, out });
     }
 
-    /** Thin wrapper over the `debug/target` custom method. `project` is a project id
-     *  (as a string), name, or path — omit to target the currently active project.
-     *  `config`/`platform` describe those instead of the project's active ones —
-     *  the same overrides `ddk debug-target` and `ddk compile` take; nothing is
-     *  persisted. Throws (with the candidate list as the message) when the
-     *  reference is ambiguous, and when the reply is not a debug target. */
+    /** `debug/target`. `project` is a project id (as a string), name or path; omit
+     *  for the active project. `config`/`platform` override the project's active
+     *  ones for this query only, nothing is persisted. Throws when the reference is
+     *  ambiguous and when the reply is not a debug target. */
     public async debugTarget(project?: string, compiler?: string, config?: string, platform?: string): Promise<DebugTarget> {
         const reply: unknown = await this.client.sendRequest('debug/target', { project, compiler, config, platform });
         if (!isDebugTarget(reply))
@@ -366,9 +353,8 @@ export class DDK_Client {
             case 'Start':
                 this.compilerLinkProvider.compilerIsActive = true;
                 Runtime.setContext(PROJECTS.CONTEXT.IS_COMPILING, true);
-                // generally, we need smart scroll to be enabled so that the output channel
-                // scrolls to the end when new lines are added. We do not re-enable it because
-                // we are likely the only extension that actually really cares about the setting.
+                // Smart scroll off so the output channel follows new lines to the
+                // end. Never restored: no other extension is likely to care.
                 workspace.getConfiguration('output.smartScroll').update('enabled', false);
                 Runtime.compilerOutputChannel.clear();
                 Runtime.compilerOutputChannel.show(true);
@@ -453,8 +439,8 @@ class DelphiFormattingProvider implements DocumentFormattingEditProvider, Docume
         return this.format(document, undefined);
     }
 
-    // Always send the whole document, even for a range request: the formatter
-    // needs full context. The server maps the selection back onto the result.
+    // The whole document goes over even for a range request — the formatter needs
+    // the full context — and the server maps the selection back onto the result.
     private async format(document: TextDocument, range: Range | undefined): Promise<TextEdit[]> {
         const edit: DocumentFormatEdit = await this.client.sendRequest('custom/document/format', {
             content: document.getText(),

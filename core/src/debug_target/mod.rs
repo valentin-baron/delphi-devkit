@@ -1,32 +1,18 @@
-//! The **debug target** of a Delphi project: a debugger-agnostic description
-//! of what debugging that project means — which executable to launch or
-//! attach to, the symbol files next to it, the project's own module when it
-//! is not that executable, where the sources are, the arguments, and what is
-//! missing or stale. It is the same information the IDE gathers for *Run
-//! with debugger*, computed from DevKit's project state, the dproj, the
-//! compiler's `rsvars.bat` and the IDE's per-user registry settings.
-//!
-//! Nothing here belongs to a particular debugger. A debug adapter's VS Code
-//! extension (or its MCP server) asks DevKit for the target and maps it onto
-//! its own launch attributes; hand-written configurations shrink to a
-//! project reference. The callers — CLI `ddk debug-target`, the MCP
-//! `delphi_get_debug_target` tool, the LSP `debug/target` method — are thin
-//! wrappers around [`crate::commands::cmd_debug_target`].
+//! The debugger-agnostic **debug target** of a Delphi project: what to launch
+//! or attach to, the symbol files, the project's own module, the sources, the
+//! arguments, and what is missing or stale — the same information the IDE
+//! gathers for *Run with debugger*, from DevKit's project state, the dproj,
+//! the compiler's `rsvars.bat` and the IDE's per-user registry settings.
 //!
 //! Two rules hold throughout:
 //!
-//! * **A path in the target is a file that was found.** Symbol files, module
-//!   binaries and `.dcp`s are `None` when they are not on disk; what is
-//!   missing is said in `warnings`, never implied by a path that leads
-//!   nowhere.
-//! * **`warnings` are problems, `notes` are information.** A warning means
-//!   the session will be degraded or will not work; a note explains a choice
-//!   DevKit made. An empty `warnings` list therefore means ready to debug.
+//! * **A path in the target is a file that was found.** Anything not on disk
+//!   is `None` and named in `warnings`, never a path that leads nowhere.
+//! * **`warnings` are problems, `notes` are information.** An empty
+//!   `warnings` list means ready to debug.
 //!
-//! Everything read from outside the project state — `rsvars.bat`, the IDE's
-//! registry settings — comes in through [`IdeSettings`], so the builder is a
-//! pure function of its inputs and its tests need neither a Delphi
-//! installation nor `HKCU`.
+//! Everything outside the project state comes in through [`IdeSettings`], so
+//! the builder's tests need neither a Delphi installation nor `HKCU`.
 
 mod lib_suffix;
 
@@ -41,9 +27,8 @@ use crate::projects::{CompilerConfiguration, IdeEnvironment, MacroMap, Project};
 use crate::utils::normalize_path;
 use lib_suffix::{BuildSymbols, DeclaredSuffix};
 
-/// What kind of binary the project produces, which decides how it is
-/// debugged: a program is launched itself, a package or a DLL is loaded by
-/// its Host Application.
+/// A program is launched itself; a package or a DLL is loaded by its Host
+/// Application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DebugTargetKind {
@@ -52,7 +37,6 @@ pub enum DebugTargetKind {
     Library,
 }
 
-/// The symbol files found next to a binary; `None` for one that is not there.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SymbolFiles {
     /// The linker map (`DCC_MapFile=3`): source lines and public names.
@@ -62,13 +46,12 @@ pub struct SymbolFiles {
 }
 
 /// A module the target process loads at run time whose debug information the
-/// debugger should bind up front: the project's own package or DLL, or the
-/// project's own program when a Host Application launches it. Every path is
-/// a file that exists.
+/// debugger should bind up front: the project's own package or DLL, or its
+/// program when a Host Application launches it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DebugModule {
-    /// The module's file name (`libAbout290.bpl`), how a loaded module is
-    /// matched; known even when the module was never built.
+    /// File name (`libAbout290.bpl`), how a loaded module is matched; known
+    /// even when the module was never built.
     pub name: String,
     pub binary: Option<String>,
     pub map: Option<String>,
@@ -84,45 +67,33 @@ pub struct DebugTarget {
     pub project: String,
     /// The `.dproj` when there is one, else the `.dpr`/`.dpk`.
     pub project_file: String,
-    /// The `.dpr`/`.dpk` main source, when known.
     pub main_source: Option<String>,
     pub kind: DebugTargetKind,
-    /// The process to launch or attach to: the program's own exe, or the
-    /// Host Application that loads a package, a DLL — or the program itself,
-    /// when one is configured for it. The one path that may not exist yet
-    /// (a program never built); `warnings` says so.
+    /// The process to launch or attach to. The one path that may not exist
+    /// yet (a program never built); `warnings` says so.
     pub executable: String,
     /// The Host Application when the executable is one.
     pub host_application: Option<String>,
-    /// Product name of the compiler the project builds with.
     pub compiler: String,
     pub config: String,
     pub platform: String,
     /// `32` or `64` for a Windows platform; `None` (with a warning) otherwise.
     pub bitness: Option<u8>,
-    /// The symbol files found next to `executable`.
+    /// The symbol files next to `executable`.
     pub symbols: SymbolFiles,
     /// The project directory.
     pub source_root: String,
     /// Existing directories to resolve unit sources from, most specific
-    /// first: the project directory, the dproj's unit search and include
-    /// paths, the IDE's Library Path and Browsing Path for the platform, and
-    /// the compiler's `source` tree.
+    /// first.
     pub source_search_paths: Vec<String>,
-    /// The project's own binary whenever `executable` is not it: the
-    /// package or DLL a host loads, or the program a Host Application starts.
+    /// The project's own binary whenever `executable` is not it.
     pub modules: Vec<DebugModule>,
-    /// Command-line arguments: the dproj's `Debugger_RunParams` fused with the
-    /// saved Start Parameters, exactly as `Run` passes them.
+    /// The dproj's `Debugger_RunParams` fused with the saved Start
+    /// Parameters, exactly as `Run` passes them.
     pub args: Vec<String>,
-    /// What will degrade or break a session: a missing executable or module,
-    /// missing, empty or stale symbols, a platform the project does not
-    /// build or Windows cannot debug, a value depending on an undefined
-    /// `$(NAME)`, an input that could not be read. Empty means ready.
+    /// What will degrade or break a session. Empty means ready.
     pub warnings: Vec<String>,
-    /// What DevKit decided or left out without harm to the session: the
-    /// compiler an unlinked project is described with, an IDE path that is
-    /// not configured, search path entries that do not exist.
+    /// What DevKit decided or left out without harm to the session.
     pub notes: Vec<String>,
 }
 
@@ -162,7 +133,6 @@ impl std::fmt::Display for DebugTarget {
     }
 }
 
-/// What is wrong with the target, and what is merely worth knowing.
 #[derive(Debug, Default)]
 struct Report {
     warnings: Vec<String>,
@@ -188,10 +158,8 @@ impl Report {
         ));
     }
 
-    /// What was found wrong on the way, for an error that ends the
-    /// description: the cause is almost always among these, and refusing
-    /// with "compile it first" while holding "the dproj defines no property
-    /// group for Relase/Win32" sends the reader looking in the wrong place.
+    /// Appended to an error that ends the description: the cause is almost
+    /// always among the warnings found on the way.
     fn diagnosis(&self) -> String {
         if self.warnings.is_empty() {
             return String::new();
@@ -206,9 +174,7 @@ impl Report {
         ));
     }
 
-    /// Whether this dproj value cannot serve as a path, saying why: a
-    /// variable nothing defines, or one that collapsed out of it and left a
-    /// driveless rooted path behind.
+    /// Whether the value cannot serve as a path, saying why.
     fn unusable_path(&mut self, what: &str, value: &str) -> bool {
         if has_unresolved_macro(value) {
             self.warn_unresolved(what, value);
@@ -230,14 +196,11 @@ fn push_once(lines: &mut Vec<String>, line: String) {
 
 // ─── The project to describe ─────────────────────────────────────────────────
 
-/// The project as it has to be described: `project` itself, or — when
-/// `config`/`platform` ask for another build than the active one — a copy
-/// whose executable, Host Application and run parameters were discovered
-/// anew **for that build**. The persisted ones belong to the active
-/// configuration and platform; describing a Release/Win64 build with the
-/// Debug/Win32 executable would hand a debugger the wrong binary. When the
-/// discovery fails, those values are dropped rather than kept, and the
-/// reason comes back as a warning.
+/// `project` itself, or — when `config`/`platform` ask for another build than
+/// the active one — a copy whose paths were discovered anew for that build.
+/// The persisted ones belong to the active configuration and platform, so
+/// reusing them would hand the debugger the wrong binary; a failed discovery
+/// drops them rather than keeping them, and warns.
 pub fn project_to_describe(
     project: &Project,
     config: Option<String>,
@@ -255,9 +218,6 @@ pub fn project_to_describe(
         described.active_platform = platform;
     }
     let mut warnings = Vec::new();
-    // A bare source has no dproj to name an output directory per build: it
-    // compiles to one path whatever the configuration and platform, so the
-    // binary described is simply whichever build wrote it last.
     if described.dproj.is_none() {
         warnings.push(format!(
             "Project \"{}\" has no .dproj, so it builds to one path for every configuration and platform: \
@@ -281,20 +241,18 @@ pub fn project_to_describe(
 
 // ─── IDE inputs ──────────────────────────────────────────────────────────────
 
-/// The inputs that come from the Delphi installation rather than from the
-/// project: its macro environment and the IDE's per-platform library
-/// settings. [`InstalledIde`] reads the real ones; a test supplies values.
+/// The inputs that come from the Delphi installation rather than the project.
+/// [`InstalledIde`] reads the real ones; a test supplies values.
 pub trait IdeSettings {
-    /// The installation's macro environment (`rsvars.bat`, the IDE's
-    /// environment-variable overrides, derived data directories).
+    /// `rsvars.bat`, the IDE's environment-variable overrides, derived data
+    /// directories.
     fn environment(&self) -> Result<IdeEnvironment>;
-    /// The IDE's Library Path, Browsing Path and package output defaults
-    /// for `platform`.
+    /// Library Path, Browsing Path and package output defaults.
     fn library_settings(&self, platform: &str) -> IdeLibrarySettings;
 }
 
-/// The installation a compiler configuration describes: `rsvars.bat` on
-/// disk, the IDE settings under the version's registry root.
+/// Reads `rsvars.bat` on disk and the IDE settings under the version's
+/// registry root.
 pub struct InstalledIde<'a> {
     pub compiler: &'a CompilerConfiguration,
 }
@@ -316,16 +274,14 @@ fn bds_version(compiler: &CompilerConfiguration) -> String {
 
 // ─── Building ────────────────────────────────────────────────────────────────
 
-/// Describes the debug target of a project that builds with `compiler`,
-/// reading the installation's `rsvars.bat` and the IDE's registry settings.
-/// The project's active configuration and platform are the ones described;
-/// see [`project_to_describe`] for another build.
+/// Describes the project's active configuration and platform; see
+/// [`project_to_describe`] for another build.
 pub fn build_debug_target(project: &Project, compiler: &CompilerConfiguration) -> Result<DebugTarget> {
     build_debug_target_with(project, compiler, &InstalledIde { compiler })
 }
 
-/// [`build_debug_target`] with the IDE inputs supplied by `ide`. Pure with
-/// respect to global state: everything needed is passed in.
+/// [`build_debug_target`] with the IDE inputs supplied by `ide`: nothing is
+/// read from global state.
 pub fn build_debug_target_with(
     project: &Project,
     compiler: &CompilerConfiguration,
@@ -356,8 +312,8 @@ pub fn build_debug_target_with(
             report.diagnosis()
         ),
     };
-    // The launched executable's own symbols are required only when it is
-    // the project's program; a host's are a bonus, the module's count.
+    // Symbols of the launched exe are required only when it is the project's
+    // own program; a host's are a bonus, the module's are what count.
     let launches_own_program = kind == DebugTargetKind::Program && host_application.is_none();
     let symbols = if Path::new(&executable).exists() {
         symbols_next_to(&executable, "the executable", launches_own_program, &mut report)
@@ -417,11 +373,8 @@ pub fn build_debug_target_with(
     })
 }
 
-/// Everything the builder needs, resolved once: the effective configuration
-/// and platform, the dproj evaluated for them, the macro map that expands
-/// `$(NAME)` the way the IDE would, and the IDE's library settings. Every
-/// input that fails to load is reported and replaced by the best available
-/// fallback, never silently.
+/// Everything the builder needs, resolved once. An input that fails to load
+/// is reported and replaced by a fallback, never dropped silently.
 struct TargetContext<'a> {
     project: &'a Project,
     compiler: &'a CompilerConfiguration,
@@ -433,13 +386,12 @@ struct TargetContext<'a> {
     library: IdeLibrarySettings,
 }
 
-/// A directory value once its macros are expanded.
+/// A directory value once its macros are expanded. The unusable variants
+/// carry the expanded text for the report.
 enum Directory {
-    /// Nothing was configured.
     Blank,
     Found(PathBuf),
-    /// A `$(NAME)` in it has no definition; the expanded text is kept for
-    /// the report.
+    /// A `$(NAME)` in it has no definition.
     Unresolved(String),
     /// A variable expanded to nothing and left a driveless rooted path —
     /// see [`crate::files::dproj::looks_collapsed`].
@@ -516,8 +468,7 @@ impl<'a> TargetContext<'a> {
 
     /// A package by its main source or its `AppType`; a library by `AppType`
     /// or `GenDll`. Both properties sit in the dproj's unconditional group,
-    /// so the kind does not depend on the platform being one the project
-    /// defines settings for.
+    /// so the kind holds even for a platform the project defines nothing for.
     fn kind(&self) -> DebugTargetKind {
         let properties = self.group.as_ref().map(|group| &group.project_properties);
         let app_type = properties.and_then(|properties| properties.app_type.as_deref()).unwrap_or("");
@@ -533,11 +484,10 @@ impl<'a> TargetContext<'a> {
         DebugTargetKind::Program
     }
 
-    /// The Host Application, by the rule `Run` follows — DevKit's override,
-    /// then the dproj's value DevKit recorded — and, where the record has
-    /// none (it may predate host discovery), the dproj read now. A relative
-    /// path is resolved against the project directory. A host depending on
-    /// an undefined `$(NAME)` is no host, and is reported.
+    /// By the rule `Run` follows: DevKit's override, then the recorded dproj
+    /// value, then the dproj read now (a record may predate host discovery).
+    /// A relative path resolves against the project directory; a host
+    /// depending on an undefined `$(NAME)` is no host, and is reported.
     fn host_application(&self, report: &mut Report) -> Option<String> {
         let recorded = [
             ("DevKit's Host Application override", &self.project.host_application),
@@ -562,9 +512,8 @@ impl<'a> TargetContext<'a> {
         Some(absolutize(live, &self.project.directory).to_string_lossy().to_string())
     }
 
-    /// The file name stem of what the project builds: that of its main
-    /// source, as the compiler names the output — not the project's display
-    /// name, which can be anything.
+    /// The compiler names the output after the main source, not after the
+    /// project's display name.
     fn output_stem(&self) -> String {
         self.project
             .dpk
@@ -580,9 +529,8 @@ impl<'a> TargetContext<'a> {
         format!("{}{}", self.output_stem(), self.lib_suffix(report))
     }
 
-    /// The `LIBSUFFIX` of the package/DLL: the dproj's `DllSuffix` (macros
-    /// expanded, `$(Auto)` included), else what the main source declares
-    /// with `{$LIBSUFFIX}` for this compiler and platform.
+    /// The dproj's `DllSuffix` (macros expanded, `$(Auto)` included), else
+    /// the `{$LIBSUFFIX}` the main source declares for this build.
     fn lib_suffix(&self, report: &mut Report) -> String {
         let from_dproj = self
             .group
@@ -625,9 +573,7 @@ impl<'a> TargetContext<'a> {
         }
     }
 
-    /// The conditional symbols in effect for this build: the compiler's
-    /// version symbol, what its RTL defines, the platform's, and the
-    /// project's own defines.
+    /// The conditional symbols in effect for this build.
     fn build_symbols(&self) -> BuildSymbols {
         let mut defined = vec![self.compiler.condition.clone(), "CONDITIONALEXPRESSIONS".to_string()];
         // Delphi 2009 (CompilerVersion 20) was the first with Unicode strings.
@@ -645,14 +591,12 @@ impl<'a> TargetContext<'a> {
         defined.extend(platform_symbols.iter().map(|symbol| symbol.to_string()));
         let project_defines = self.group.as_ref().and_then(|group| group.dcc_options.define.clone()).unwrap_or_default();
         defined.extend(project_defines.split(';').map(str::trim).filter(|symbol| !symbol.is_empty()).map(str::to_string));
-        // A compiler configuration records one `VERxxx`. That is the whole
-        // truth for every release but Delphi 2007 (CompilerVersion 18.5),
-        // which declares `VER180` next to `VER185` for being a non-breaking
-        // release; for it the family decides nothing.
+        // A configuration records one `VERxxx`, which is the whole truth for
+        // every release but Delphi 2007 (CompilerVersion 18.5): it declares
+        // `VER180` beside `VER185`, being a non-breaking release.
         let version_symbols_known = self.compiler.compiler_version >= 20;
-        // Every release but Delphi 2007 has a whole-numbered
-        // `CompilerVersion`, which is all a configuration can record; 18.5
-        // is therefore not available and nothing may be concluded from it.
+        // A configuration can only record a whole-numbered `CompilerVersion`,
+        // so Delphi 2007's 18.5 is unavailable and decides nothing.
         let compiler_version = match self.compiler.compiler_version {
             19 => None,
             version => Some(version as f64),
@@ -663,7 +607,7 @@ impl<'a> TargetContext<'a> {
     // ─── Modules ─────────────────────────────────────────────────────────
 
     /// A program started by a Host Application is still the module whose
-    /// symbols matter; the host launches it, DevKit knows where it is.
+    /// symbols matter.
     fn hosted_program_module(&self, report: &mut Report) -> DebugModule {
         let Some(exe) = self.project.exe.as_deref() else {
             report.warn(format!(
@@ -679,11 +623,11 @@ impl<'a> TargetContext<'a> {
         built_module(exe, None, report)
     }
 
-    /// The package's own `.bpl`, searched where a build puts one — the
-    /// dproj's `DCC_BplOutput`, the IDE's default package output,
-    /// `.\<Platform>\<Config>` — and, last, in the hosting executable's
-    /// directory; with its `.dcp`. Without a built `.bpl` the debugger
-    /// treats the package as a black box, so that is a warning, not an error.
+    /// The package's own `.bpl` and `.dcp`, searched where a build puts one:
+    /// the dproj's `DCC_BplOutput`, the IDE's default package output,
+    /// `.\<Platform>\<Config>`, and last the hosting executable's directory.
+    /// A missing `.bpl` is a warning, not an error: the session still runs,
+    /// with the debugger treating the package as a black box.
     fn package_module(&self, host: &str, report: &mut Report) -> DebugModule {
         let bpl_name = format!("{}.bpl", self.binary_stem(report));
         let host_directory = Path::new(host).parent().map(Path::to_path_buf);
@@ -744,7 +688,6 @@ impl<'a> TargetContext<'a> {
         built_module(&binary, None, report)
     }
 
-    /// Adds an output directory the dproj's merged property group names.
     fn push_dproj_output(
         &self,
         directories: &mut Vec<PathBuf>,
@@ -756,7 +699,6 @@ impl<'a> TargetContext<'a> {
         self.push_output(directories, &format!("The dproj's {property}"), raw.as_deref(), report);
     }
 
-    /// Adds an output directory the IDE's library settings name.
     fn push_ide_output(&self, directories: &mut Vec<PathBuf>, setting: &str, raw: Option<&str>, report: &mut Report) {
         self.push_output(directories, &format!("The IDE's {setting}"), raw, report);
     }
@@ -770,9 +712,8 @@ impl<'a> TargetContext<'a> {
         }
     }
 
-    /// Expands and absolutizes a directory value. A relative one is taken
-    /// from the project directory: that is the compiler's working directory,
-    /// for the dproj's paths and for the IDE's alike.
+    /// A relative value is taken from the project directory: that is the
+    /// compiler's working directory, for dproj and IDE paths alike.
     fn directory(&self, raw: Option<&str>) -> Directory {
         let raw = raw.map(str::trim).unwrap_or("");
         if raw.is_empty() {
@@ -782,18 +723,17 @@ impl<'a> TargetContext<'a> {
         if has_unresolved_macro(&expanded) {
             return Directory::Unresolved(expanded);
         }
-        // A variable that collapsed is as unusable as one still standing:
-        // `\bpl` is a directory of whatever drive the server runs from.
+        // As unusable as a macro still standing: `\bpl` is a directory of
+        // whatever drive the server runs from.
         if looks_collapsed(&expanded) {
             return Directory::Collapsed(expanded);
         }
         Directory::Found(absolutize(&expanded, &self.project.directory))
     }
 
-    /// The IDE's default package output: `$(BDSCOMMONDIR)\<kind>\<platform>`,
-    /// and the root `$(BDSCOMMONDIR)\<kind>` for Win32 only — that is where
-    /// Win32 builds land, so for any other platform a file there is another
-    /// platform's build.
+    /// `$(BDSCOMMONDIR)\<kind>\<platform>`, plus the root
+    /// `$(BDSCOMMONDIR)\<kind>` for Win32 only: that is where Win32 builds
+    /// land, so for any other platform a file there is a foreign build.
     fn common_output_dirs(&self, kind: &str) -> Vec<PathBuf> {
         let Directory::Found(root) = self.directory(Some(&format!("$(BDSCOMMONDIR)\\{kind}"))) else {
             return Vec::new();
@@ -807,14 +747,9 @@ impl<'a> TargetContext<'a> {
 
     // ─── Sources ─────────────────────────────────────────────────────────
 
-    /// The directories a debugger should scan for unit sources, most
-    /// specific first and without duplicates: the project directory, the
-    /// dproj's unit search path and include path (a `{$I}` line is
-    /// attributed to the `.inc` file, so the debugger must find it too), the
-    /// IDE's Library Path and Browsing Path for the platform — the browsing
-    /// path is where the sources behind third-party components live — and
-    /// the compiler's own `source` tree. Only existing directories are
-    /// kept; what was left out is reported.
+    /// Most specific first, without duplicates, existing only; what was left
+    /// out is reported. The include path belongs here because a `{$I}` line
+    /// is attributed to the `.inc` file, which the debugger must find too.
     fn source_search_paths(&self, report: &mut Report) -> Vec<String> {
         let dcc_options = self.group.as_ref().map(|group| &group.dcc_options);
         let lists = [
@@ -894,8 +829,7 @@ fn project_file_stem(project: &Project) -> String {
 }
 
 /// A platform the dproj does not enable is one the project does not build:
-/// its settings come from no property group of its own, and whatever sits
-/// in its output directory was not made by this project's options.
+/// whatever sits in its output directory came from other options.
 fn warn_about_an_unsupported_platform(dproj: &dproj_rs::Dproj, platform: &str, report: &mut Report) {
     let platforms = dproj.platforms();
     let enabled: Vec<&str> = platforms.iter().filter(|(_, enabled)| *enabled).map(|(name, _)| *name).collect();
@@ -911,7 +845,6 @@ fn warn_about_an_unsupported_platform(dproj: &dproj_rs::Dproj, platform: &str, r
 
 // ─── Artefact checks ─────────────────────────────────────────────────────────
 
-/// The module at `binary`, with the symbol files found next to it.
 fn built_module(binary: &str, dcp: Option<String>, report: &mut Report) -> DebugModule {
     let symbols = symbols_next_to(binary, &file_name(binary), true, report);
     DebugModule {
@@ -927,19 +860,16 @@ fn unbuilt_module(name: String) -> DebugModule {
     DebugModule { name, binary: None, map: None, rsm: None, dcp: None }
 }
 
-/// How far apart a binary and its symbol file may be written before they
-/// cannot belong to the same build. Within one build the linker writes the
-/// `.map` and `.rsm` *before* it finishes the executable (measured: 0.3–0.6 s
-/// earlier on an MSBuild build of a mid-sized program), and a large link
-/// takes longer than that, so only a wider gap is reported.
+/// How far apart a binary and its symbol file may be written and still belong
+/// to the same build. The linker writes the `.map` and `.rsm` before it
+/// finishes the executable (measured: 0.3–0.6 s earlier on a mid-sized
+/// program), and a large link takes longer still.
 const SAME_BUILD_TOLERANCE: Duration = Duration::from_secs(5 * 60);
 
-/// The `.map` and `.rsm` found next to `binary` (called `what` in the
-/// messages). A file that exists but cannot belong to the binary — empty,
-/// or written by another build — is reported and not returned: symbols left
-/// over from an earlier build are worse than none, breakpoints land on wrong
-/// lines and locals read as garbage. A missing file is a warning only when
-/// the symbols are `required`.
+/// The `.map` and `.rsm` next to `binary` (called `what` in the messages). A
+/// file that cannot belong to it — empty, or written by another build — is
+/// reported and not returned: stale symbols are worse than none. A missing
+/// file is a warning only when the symbols are `required`.
 fn symbols_next_to(binary: &str, what: &str, required: bool, report: &mut Report) -> SymbolFiles {
     let binary_time = std::fs::metadata(binary).and_then(|metadata| metadata.modified()).ok();
     let mut find = |extension: &str, effect: &str| -> Option<String> {
@@ -980,8 +910,8 @@ fn symbols_next_to(binary: &str, what: &str, required: bool, report: &mut Report
     }
 }
 
-/// Says how a symbol file's time rules out the binary's build, if it does.
-/// Times that cannot be read or compared rule nothing out.
+/// Why a symbol file does not belong to its binary, if it does not. Times
+/// that cannot be read or compared rule nothing out.
 fn written_by_another_build(binary: Option<SystemTime>, symbols: Option<SystemTime>) -> Option<&'static str> {
     let (binary, symbols) = (binary?, symbols?);
     match binary.duration_since(symbols) {
@@ -994,9 +924,8 @@ fn written_by_another_build(binary: Option<SystemTime>, symbols: Option<SystemTi
     }
 }
 
-/// The host loads the copy in its own directory before any other: when that
-/// copy is not the file described, the symbols described are not the ones
-/// of the code that will run.
+/// The host loads the copy in its own directory before any other, so a
+/// different copy there means the described symbols are not the running code.
 fn warn_about_a_different_copy(described: &str, in_host_directory: &Path, report: &mut Report) {
     let same_file = normalize_path(in_host_directory)
         .to_string_lossy()
@@ -1017,9 +946,9 @@ fn warn_about_a_different_copy(described: &str, in_host_directory: &Path, report
 
 // ─── File helpers ────────────────────────────────────────────────────────────
 
-/// The first directory holding exactly `file_name`. An exact name only: the
-/// stem already carries the `LIBSUFFIX`, and a looser match in a shared
-/// output directory would pick up another package's binary.
+/// The first directory holding exactly `file_name`. The stem already carries
+/// the `LIBSUFFIX`, and a looser match in a shared output directory would
+/// pick up another package's binary.
 fn find_built_file(directories: &[PathBuf], file_name: &str) -> Option<String> {
     directories
         .iter()

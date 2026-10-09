@@ -1,14 +1,7 @@
-//! Standalone MCP (Model Context Protocol) server for DDK.
+//! Standalone MCP (Model Context Protocol) server for DDK, over STDIO.
 //!
-//! This binary exposes Delphi project management tools via STDIO transport,
-//! making it compatible with any MCP client:
-//!   - VS Code (registered via McpStdioServerDefinition)
-//!   - Claude Desktop
-//!   - Any other MCP-capable tool
-//!
-//! State is shared with ddk-server through RON files on disk. Changes to the
-//! selected project or compiler are picked up by ddk-server's file watcher,
-//! which pushes the updated state to VS Code automatically.
+//! State is shared with ddk-server through RON files on disk; ddk-server's file
+//! watcher picks up a changed project or compiler and pushes it to VS Code.
 
 mod arguments;
 mod handler;
@@ -30,7 +23,6 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> SdkResult<()> {
-    // Ensure state files exist (creates defaults if first run).
     ProjectsData::initialize().expect("Failed to initialize projects data");
     CompilerConfigurations::initialize().expect("Failed to initialize compiler configurations");
 

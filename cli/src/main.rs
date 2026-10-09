@@ -1,8 +1,7 @@
 //! DDK CLI – command-line interface for Delphi project management.
 //!
-//! Thin wrapper around `ddk_core::commands`. Shares the same RON-based
-//! state as ddk-server (LSP) and ddk-mcp-server, so changes made via the
-//! CLI are automatically picked up by the other tools.
+//! Shares the RON state files with ddk-server (LSP) and ddk-mcp-server, so a
+//! change made here is picked up by the other tools.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -13,16 +12,13 @@ use ddk_core::commands::CompileFilterOptions;
 use ddk_core::projects::{CompilerConfigurations, ProjectsData};
 use ddk_core::state::Stateful;
 
-/// Whether a compile TARGET should be treated as a project file (ad-hoc
-/// compile) rather than a project id/name reference. Decided purely by
-/// extension so a bare name like "be" or "123" is never mistaken for a file.
+/// Decided purely by extension, so a bare name like "be" or "123" is never
+/// mistaken for a file.
 fn is_project_file(target: &str) -> bool {
     let lower = target.to_lowercase();
     lower.ends_with(".dproj") || lower.ends_with(".dpr") || lower.ends_with(".dpk")
 }
 
-/// Whether a `run` TARGET should be treated as a file path (project file or
-/// executable) rather than a project id/name reference.
 fn is_run_target_file(target: &str) -> bool {
     is_project_file(target) || target.to_lowercase().ends_with(".exe")
 }
@@ -285,7 +281,6 @@ enum CompilerCmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Ensure state files exist (creates defaults if first run).
     ProjectsData::initialize()?;
     CompilerConfigurations::initialize()?;
 
@@ -379,9 +374,8 @@ async fn main() -> Result<()> {
             fail_on_error,
             msbuild_args,
         } => {
-            // Resolve compiler-output encoding: --encoding wins, then the
-            // DDK_COMPILER_ENCODING env var, else the "oem" default (which
-            // auto-detects the console output codepage at decode time).
+            // Left unset, decoding falls back to "oem", which resolves the
+            // console output codepage at decode time.
             if let Some(enc) = encoding
                 .or_else(|| std::env::var("DDK_COMPILER_ENCODING").ok())
                 .filter(|e| !e.trim().is_empty())
@@ -394,16 +388,12 @@ async fn main() -> Result<()> {
                 show_hints,
                 summarize_diagnostics,
             };
-            // A TARGET ending in a project-file extension is an ad-hoc file
-            // compile; otherwise it is a project reference (id or name), exactly
-            // like --project. `--project` (when no TARGET) keeps working too.
             let (file_path, project_ref) = match target {
                 Some(t) if is_project_file(&t) => (Some(t), None),
                 Some(t) => (None, Some(t)),
                 None => (None, project),
             };
             use commands::CompileOrAmbiguity;
-            // Captured for --fail-on-error: (success, code).
             let mut outcome: Option<(bool, i32)> = None;
             if cli.json {
                 let result = match file_path {
@@ -451,21 +441,17 @@ async fn main() -> Result<()> {
                 };
                 match result {
                     CompileOrAmbiguity::Output(o) => {
-                        // Output already streamed live via on_progress; just
-                        // capture the outcome for --fail-on-error.
+                        // Nothing to print: on_progress already streamed it.
                         outcome = Some((o.success, o.code));
                     }
                     CompileOrAmbiguity::Ambiguity(a) => print!("{a}"),
                 }
             }
-            // Opt-in: propagate a failed compile to the process exit code.
-            // Default (off) keeps the historical exit 0.
             if fail_on_error {
                 if let Some((success, code)) = outcome {
                     if !success {
                         let _ = io::stdout().flush();
-                        // Mirror the compiler exit code (fall back to 1 if it
-                        // was 0/-1 despite the failure).
+                        // A failed compile can still report 0/-1; never exit 0 then.
                         std::process::exit(if code > 0 { code } else { 1 });
                     }
                 }
@@ -473,10 +459,6 @@ async fn main() -> Result<()> {
         }
 
         Commands::Run { target, project, args } => {
-            // A TARGET that looks like a project file or executable is a
-            // file-path run; otherwise it is a project reference (id or
-            // name), exactly like --project. `--project` (when no TARGET)
-            // keeps working too.
             let (file_path, project_ref) = match target {
                 Some(t) if is_run_target_file(&t) => (Some(t), None),
                 Some(t) => (None, Some(t)),

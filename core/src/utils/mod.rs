@@ -7,12 +7,11 @@ pub use document::*;
 /// The custom environment-variable overrides configured in the Delphi IDE
 /// (Tools > Options > IDE > Environment Variables), stored per BDS version at
 /// `HKCU\SOFTWARE\<vendor>\BDS\<ver>\Environment Variables`. The IDE injects
-/// these into its own process (and thus into IDE-run MSBuild), so dproj
-/// values routinely reference them (e.g. a site-specific `$(VEGADIR)`) even
-/// though they exist in no real environment. Reads the set of the given BDS
-/// major version (`23` for Delphi 12 Athens — the same number as
-/// `CompilerConfiguration::product_version`); returns an empty list when the
-/// key does not exist (or off Windows).
+/// these into its own process and thus into IDE-run MSBuild, so dproj values
+/// reference them (a site-specific `$(VEGADIR)`) though they exist in no real
+/// environment. `bds_major_version` is `23` for Delphi 12 Athens — the same
+/// number as `CompilerConfiguration::product_version`. Empty when the key does
+/// not exist, or off Windows.
 #[cfg(windows)]
 pub fn bds_environment_overrides(bds_major_version: usize) -> Vec<(String, String)> {
     use winreg::RegKey;
@@ -27,9 +26,9 @@ pub fn bds_environment_overrides(bds_major_version: usize) -> Vec<(String, Strin
     read_environment_values(&env_key)
 }
 
-/// Decode the name/value pairs of an IDE `Environment Variables` registry key.
-/// Only string values (`REG_SZ`/`REG_EXPAND_SZ`) define a usable `$(NAME)`
-/// variable; names and values are trimmed and empty ones dropped.
+/// The IDE's environment-variable overrides under `env_key`. Only string
+/// values (`REG_SZ`/`REG_EXPAND_SZ`) define a usable `$(NAME)`; names and
+/// values are trimmed and empty ones dropped.
 #[cfg(windows)]
 fn read_environment_values(env_key: &winreg::RegKey) -> Vec<(String, String)> {
     use winreg::enums::{REG_EXPAND_SZ, REG_SZ};
@@ -52,9 +51,9 @@ pub fn bds_environment_overrides(_bds_major_version: usize) -> Vec<(String, Stri
     Vec::new()
 }
 
-/// Fallback variant of [`bds_environment_overrides`] for projects with no
-/// owning workspace or group project to pick a compiler configuration from:
-/// reads the highest installed BDS version's non-empty set.
+/// Fallback for projects with no owning workspace or group project to pick a
+/// compiler configuration from: the highest installed BDS version's non-empty
+/// set.
 #[cfg(windows)]
 pub fn ide_environment_overrides() -> Vec<(String, String)> {
     use winreg::RegKey;
@@ -100,9 +99,9 @@ pub fn trim_trailing_separator(path: &str) -> &str {
 }
 
 /// Percent-encode a Windows path into the `file:///C%3A/dir/file.dpk` form the
-/// RAD Studio IDE writes: backslashes become forward slashes and everything
-/// outside the unreserved URI set is percent-encoded — including `:`, spaces,
-/// `(`, `)` and `+`, all observed encoded in IDE-generated files.
+/// RAD Studio IDE writes: everything outside the unreserved URI set is encoded,
+/// `:`, spaces, `(`, `)` and `+` included — all observed encoded in
+/// IDE-generated files.
 pub fn path_to_file_uri(path: &Path) -> String {
     const SAFE: &str = "-._~/";
     let normalized = path.to_string_lossy().replace('\\', "/");
@@ -131,25 +130,19 @@ pub fn dir_to_file_uri(path: &Path) -> String {
 }
 
 /// Normalise a path by:
-///   1. Resolving `.` and `..` segments purely (without touching the filesystem).
-///   2. Stripping the Windows extended-length prefix (`\\?\`) if present.
-///   3. Converting Delphi-style bare UNC paths (`UNC\server\share\...`) to the
-///      proper `\\server\share\...` form.  Delphi project files sometimes write
-///      UNC paths without the leading `\\`, which would otherwise be treated as
-///      a relative path by the standard library.
-///   4. On Windows, remapping `\\server\share\...` UNC paths to a local drive
-///      letter (e.g. `Y:\...`) by querying which drive is mapped to that share.
+///   1. Resolving `.` and `..` segments purely, without touching the filesystem.
+///   2. Stripping the Windows extended-length prefix (`\\?\`).
+///   3. Converting Delphi-style bare UNC paths (`UNC\server\share\...`, as
+///      Delphi project files sometimes write them) to `\\server\share\...`;
+///      the standard library would otherwise read them as relative.
+///   4. On Windows, remapping `\\server\share\...` to the local drive letter
+///      mapped to that share.
 ///
-/// `std::fs::canonicalize()` requires the path to exist and on Windows returns
-/// paths like `\\?\C:\Users\...`, which are valid but ugly in config files.
-/// This function works on any path string regardless of whether the target exists.
+/// Unlike `std::fs::canonicalize()`, works on any path string whether or not
+/// the target exists, and returns no `\\?\` prefix.
 pub fn normalize_path(path: impl AsRef<Path>) -> PathBuf {
     let path = path.as_ref();
 
-    // Handle path prefixes in order of precedence:
-    //   \\?\C:\...               -> C:\...
-    //   \\?\UNC\server\share\... -> \\server\share\...
-    //   UNC\server\share\...     -> \\server\share\...  (Delphi project files)
     let path = {
         let s = path.to_string_lossy();
         if s.starts_with(r"\\?\") {
@@ -166,14 +159,11 @@ pub fn normalize_path(path: impl AsRef<Path>) -> PathBuf {
         }
     };
 
-    // Resolve `.` and `..` using a stack-based approach.
     let mut components: Vec<Component> = Vec::new();
     for component in path.components() {
         match component {
             Component::CurDir => { /* skip `.` */ }
             Component::ParentDir => {
-                // Pop the last normal component if possible;
-                // if we're already at a root, just ignore the `..`.
                 match components.last() {
                     Some(Component::Normal(_)) => { components.pop(); }
                     Some(Component::RootDir) | Some(Component::Prefix(_)) => { /* can't go above root */ }
@@ -190,8 +180,6 @@ pub fn normalize_path(path: impl AsRef<Path>) -> PathBuf {
         components.iter().collect()
     };
 
-    // On Windows, try to remap \\server\share\... UNC paths to a local drive
-    // letter by querying which drive is mapped to that share.
     #[cfg(windows)]
     {
         use windows_sys::Win32::NetworkManagement::WNet::WNetGetConnectionW;

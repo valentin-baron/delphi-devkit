@@ -1,9 +1,5 @@
 use ddk_core::projects::*;
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Helper: build a minimal ProjectsData for testing
-// ═══════════════════════════════════════════════════════════════════════════════
-
 fn make_project(id: usize, name: &str) -> Project {
     Project {
         id,
@@ -66,10 +62,6 @@ fn sample_data_with_group() -> ProjectsData {
     data
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  next_id
-// ═══════════════════════════════════════════════════════════════════════════════
-
 #[test]
 fn next_id_increments() {
     let mut data = ProjectsData::default();
@@ -77,10 +69,6 @@ fn next_id_increments() {
     assert_eq!(data.next_id(), 2);
     assert_eq!(data.next_id(), 3);
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  get_project / get_workspace
-// ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn get_project_found() {
@@ -110,20 +98,16 @@ fn get_workspace_not_found() {
     assert!(data.get_workspace(999).is_none());
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  can_find_any_links
-// ═══════════════════════════════════════════════════════════════════════════════
-
 #[test]
 fn can_find_links_in_workspace() {
     let data = sample_data();
-    assert!(data.can_find_any_links(1)); // project 1 is linked in WS-A
+    assert!(data.can_find_any_links(1));
 }
 
 #[test]
 fn can_find_links_in_group_project() {
     let data = sample_data_with_group();
-    assert!(data.can_find_any_links(1)); // also in group project
+    assert!(data.can_find_any_links(1));
 }
 
 #[test]
@@ -131,10 +115,6 @@ fn cannot_find_links_for_missing_project() {
     let data = sample_data();
     assert!(!data.can_find_any_links(999));
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  select_project
-// ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn select_existing_project() {
@@ -149,10 +129,6 @@ fn select_nonexistent_project_fails() {
     assert!(data.select_project(999).is_err());
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  remove_project
-// ═══════════════════════════════════════════════════════════════════════════════
-
 #[test]
 fn remove_project_clears_active() {
     let mut data = sample_data();
@@ -165,7 +141,6 @@ fn remove_project_clears_active() {
 fn remove_project_with_links_removes_links() {
     let mut data = sample_data();
     data.remove_project(1, true);
-    // No links to project 1 should remain
     for ws in &data.workspaces {
         for link in &ws.project_links {
             assert_ne!(link.project_id, 1);
@@ -177,16 +152,11 @@ fn remove_project_with_links_removes_links() {
 fn remove_project_without_links_keeps_links() {
     let mut data = sample_data();
     data.remove_project(1, false);
-    // Links still reference project 1 (orphaned)
     let has_link = data.workspaces.iter()
         .flat_map(|ws| &ws.project_links)
         .any(|link| link.project_id == 1);
     assert!(has_link);
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  remove_project_link
-// ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn remove_last_link_removes_project() {
@@ -204,10 +174,6 @@ fn remove_non_last_link_keeps_project() {
     assert!(data.get_project(1).is_some());
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  remove_workspace
-// ═══════════════════════════════════════════════════════════════════════════════
-
 #[test]
 fn remove_workspace_orphans_unique_projects() {
     let mut data = sample_data();
@@ -220,18 +186,11 @@ fn remove_workspace_orphans_unique_projects() {
 #[test]
 fn remove_workspace_keeps_shared_projects() {
     let mut data = sample_data();
-    // Project 1 is in WS-A (link 5). Remove WS-A.
-    // Project 1 has no other links, so it gets removed too.
-    // But project 2 is also only in WS-A, so it also gets removed.
+    // WS-A's two projects (1 and 2) are linked nowhere else.
     let initial_count = data.projects.len();
     data.remove_workspace(4);
-    // WS-A had 2 unique projects (1 and 2)
     assert_eq!(data.projects.len(), initial_count - 2);
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  remove_group_project
-// ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn remove_group_project_clears_it() {
@@ -244,14 +203,10 @@ fn remove_group_project_clears_it() {
 fn remove_group_project_keeps_workspace_linked_projects() {
     let mut data = sample_data_with_group();
     data.remove_group_project();
-    // Projects 1 and 2 are still in WS-A, so they should be kept
+    // Projects 1 and 2 are still linked in WS-A.
     assert!(data.get_project(1).is_some());
     assert!(data.get_project(2).is_some());
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  find_project_by_dproj
-// ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn find_project_by_dproj_found() {
@@ -267,10 +222,6 @@ fn find_project_by_dproj_not_found() {
     assert!(data.find_project_by_dproj(&"nonexistent.dproj".to_string()).is_none());
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  active_project
-// ═══════════════════════════════════════════════════════════════════════════════
-
 #[test]
 fn active_project_returns_correct_project() {
     let data = sample_data();
@@ -285,10 +236,6 @@ fn active_project_none_when_no_selection() {
     assert!(data.active_project().is_none());
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  get_workspace_id_containing_project_link
-// ═══════════════════════════════════════════════════════════════════════════════
-
 #[test]
 fn finds_workspace_containing_link() {
     let data = sample_data();
@@ -301,10 +248,6 @@ fn returns_none_for_unknown_link() {
     let data = sample_data();
     assert_eq!(data.get_workspace_id_containing_project_link(999), None);
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  is_project_link_in_group_project
-// ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn link_in_group_project() {
@@ -319,10 +262,6 @@ fn link_not_in_group_project() {
     assert!(!data.is_project_link_in_group_project(5)); // in workspace
     assert!(!data.is_project_link_in_group_project(999));
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  projects_of_workspace / projects_of_group_project
-// ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn projects_of_workspace_returns_linked_projects() {

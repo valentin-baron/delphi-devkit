@@ -6,15 +6,9 @@ import { join } from 'path';
 import { existsSync } from 'fs';
 
 /**
- * Registers ddk-mcp-server (Rust STDIO binary) with VS Code's MCP infrastructure.
- *
- * VS Code spawns the binary as a child process and uses its stdin/stdout for
- * the MCP protocol. External tools such as Claude Desktop can also speak to
- * this server via STDIO – no HTTP proxy or port discovery required.
- *
- * State is shared with ddk-server through RON files on disk, so project and
- * compiler changes from the MCP server are reflected in the extension tree
- * automatically via the file watcher.
+ * Registers ddk-mcp-server (a Rust STDIO binary) with VS Code's MCP
+ * infrastructure, which spawns it as a child process and speaks MCP over its
+ * stdin/stdout. State is shared with ddk-server through RON files on disk.
  */
 export class McpServerFeature implements Feature, McpServerDefinitionProvider<McpStdioServerDefinition> {
   async initialize(): Promise<void> {

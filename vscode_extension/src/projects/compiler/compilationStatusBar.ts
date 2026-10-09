@@ -4,23 +4,15 @@ import { PROJECTS } from '../../constants';
 import { Runtime } from '../../runtime';
 
 /**
- * Status bar item that shows the current compilation state.
- *
- * - While compiling: spinning icon + project name (if known)
- * - On success:      green check, visible for a short duration then hidden
- * - On failure:      error icon, visible for a short duration then hidden
- * - Idle:            hidden
- *
- * The result visibility duration is controlled by the
- * `ddk.compiler.resultTimeout` setting (milliseconds).
- * Set to `0` to never show the result in the status bar.
+ * Status bar item for the current compilation state, hidden while idle.
+ * `ddk.compiler.resultTimeout` (ms) is how long a finished build's result stays
+ * visible; `0` never shows it.
  */
 export class CompilationStatusBar {
   private readonly item: StatusBarItem;
   private hideTimer: ReturnType<typeof setTimeout> | undefined;
   private readonly listener: (p: CompilerProgressParams) => void;
 
-  /** Default result visibility in ms when the setting is not configured. */
   private static readonly DEFAULT_RESULT_VISIBLE_MS = 5_000;
 
   private get resultTimeoutMs(): number {
@@ -47,8 +39,6 @@ export class CompilationStatusBar {
     Runtime.client.removeCompilerProgressListener(this.listener);
     this.item.dispose();
   }
-
-  // -------------------------------------------------------------------------
 
   private onProgress(params: CompilerProgressParams): void {
     switch (params.kind) {

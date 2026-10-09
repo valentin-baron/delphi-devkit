@@ -1,21 +1,17 @@
 //! Reading a tool call's arguments without ever dropping one silently.
 //!
-//! A client that sends `"project_id": "7"` or `"rebuild": "true"` means
-//! what it says; reading those with `as_u64()`/`as_bool()` and falling back
-//! to a default turns the call into a different one — the active project
-//! instead of project 7, an incremental build instead of a rebuild — with no
-//! hint that an argument was ignored. Every accessor here therefore either
-//! understands the value (accepting the obvious spellings of a number or a
-//! boolean) or fails with a message naming the argument.
+//! A client that sends `"project_id": "7"` means it; `as_u64()` with a default
+//! fallback would silently act on the active project instead. Every accessor
+//! here either understands the value — including the obvious string spellings
+//! of a number or a boolean — or fails with a message naming the argument.
 
 use serde_json::Value;
 
-/// The arguments of one tool call.
 pub struct Arguments<'a> {
     values: &'a Value,
 }
 
-/// A message for the caller: which argument was wrong, and how.
+/// The error is the message sent back to the caller.
 pub type ArgumentResult<T> = Result<T, String>;
 
 impl<'a> Arguments<'a> {
@@ -28,8 +24,8 @@ impl<'a> Arguments<'a> {
         self.values.get(name).filter(|value| !value.is_null())
     }
 
-    /// A text argument. A number is accepted as its text, since an id given
-    /// where a name or an id is expected is still an id.
+    /// A number is accepted as its text: an id given where a name or an id is
+    /// expected is still an id.
     pub fn text(&self, name: &str) -> ArgumentResult<Option<String>> {
         match self.value(name) {
             None => Ok(None),
@@ -39,7 +35,6 @@ impl<'a> Arguments<'a> {
         }
     }
 
-    /// A text argument that must be present.
     pub fn required_text(&self, name: &str) -> ArgumentResult<String> {
         self.text(name)?.ok_or_else(|| format!("Missing required parameter: {name}"))
     }
@@ -55,7 +50,6 @@ impl<'a> Arguments<'a> {
         }
     }
 
-    /// A number that must be present.
     pub fn required_number(&self, name: &str) -> ArgumentResult<u64> {
         self.number(name)?.ok_or_else(|| format!("Missing required parameter: {name}"))
     }

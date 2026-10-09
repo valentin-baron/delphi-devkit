@@ -1,9 +1,5 @@
 use ddk_core::encoding::{decode_bytes, encode_string};
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  decode_bytes – UTF-8
-// ═══════════════════════════════════════════════════════════════════════════════
-
 #[test]
 fn decode_utf8_ascii() {
     assert_eq!(decode_bytes(b"Hello, world!", "utf-8"), "Hello, world!");
@@ -24,13 +20,8 @@ fn decode_utf8_with_multibyte() {
 fn decode_utf8_lossy_on_invalid() {
     let input = &[0xFF, 0xFE, 0x41];
     let result = decode_bytes(input, "utf-8");
-    // Invalid bytes should be replaced, but 'A' (0x41) should survive.
     assert!(result.contains('A'));
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  decode_bytes – Windows-1252
-// ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn decode_windows_1252() {
@@ -46,10 +37,6 @@ fn decode_case_insensitive_label() {
     assert_eq!(decode_bytes(input, "Windows-1252"), "A");
     assert_eq!(decode_bytes(input, "WINDOWS-1252"), "A");
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  decode_bytes – UTF-32
-// ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn decode_utf32le_ascii() {
@@ -88,19 +75,11 @@ fn decode_utf32_remainder_bytes_ignored() {
     assert_eq!(result, "A");
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  decode_bytes – unknown label
-// ═══════════════════════════════════════════════════════════════════════════════
-
 #[test]
 fn decode_unknown_label_falls_back_to_utf8_lossy() {
     let input = b"plain ascii";
     assert_eq!(decode_bytes(input, "totally-fake-encoding"), "plain ascii");
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  encode_string – UTF-8
-// ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn encode_utf8() {
@@ -113,10 +92,6 @@ fn encode_utf8_label_variant() {
     let result = encode_string("abc", "utf8");
     assert_eq!(result, b"abc");
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  encode_string – UTF-32
-// ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn encode_utf32le() {
@@ -137,19 +112,11 @@ fn encode_utf32le_emoji() {
     assert_eq!(result, vec![0x00, 0xF6, 0x01, 0x00]);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  encode_string – Windows-1252
-// ═══════════════════════════════════════════════════════════════════════════════
-
 #[test]
 fn encode_windows_1252() {
     let result = encode_string("é", "windows-1252");
     assert_eq!(result, vec![0xE9]);
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Round-trip: decode(encode(s)) == s
-// ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn roundtrip_utf8() {
@@ -183,30 +150,21 @@ fn roundtrip_windows_1252() {
     assert_eq!(decoded, original);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  encode_string – unknown label falls back to UTF-8
-// ═══════════════════════════════════════════════════════════════════════════════
-
 #[test]
 fn encode_unknown_label_returns_utf8() {
     let result = encode_string("abc", "nonsense-encoding");
     assert_eq!(result, b"abc");
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  OEM encoding (always available as label "oem")
-// ═══════════════════════════════════════════════════════════════════════════════
-
 #[test]
 fn decode_oem_ascii() {
-    // ASCII bytes should always decode identically regardless of OEM codepage.
+    // ASCII is identical in every OEM codepage, so this holds on any machine.
     let result = decode_bytes(b"Hello", "oem");
     assert_eq!(result, "Hello");
 }
 
 #[test]
 fn encode_oem_ascii() {
-    // ASCII characters should encode identically via OEM.
     let result = encode_string("Hello", "oem");
     assert_eq!(result, b"Hello");
 }

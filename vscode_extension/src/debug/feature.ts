@@ -20,30 +20,21 @@ export interface DebugTargetRequest {
 }
 
 /**
- * Debugging a DDK project with whichever debugger registers the `delphi`
- * debug type.
+ * Debugging a DDK project with whichever debugger registers the `delphi` debug
+ * type. DDK owns the gesture and the knowledge: the Debug/Attach commands, the
+ * dynamic dropdown entries, the build preceding a launch, and the
+ * `ddk.debug.getDebugTarget` command another extension calls for the target.
+ * The debugger extension owns the session and fills in its own launch
+ * attributes; DDK never writes a launch.json and knows no debugger's format.
  *
- * DDK owns the gesture and the knowledge: **Debug** / **Attach Debugger** on
- * a project (context menu, command palette, keybinding), one dynamic entry
- * per project in the debug dropdown, the build that precedes a launch, and
- * the `ddk.debug.getDebugTarget` command through which another extension
- * obtains the project's debug target (`debug/target`: executable or host,
- * symbols, modules, sources, arguments, warnings). The debugger extension
- * owns the session: it resolves `{ type: 'delphi', request, ddkProject }` by
- * calling that command and fills in its own launch attributes. DDK never
- * writes a launch.json and knows no debugger's configuration format.
- *
- * The commands and menu items are enabled only while an extension
- * contributing the `delphi` debug type is installed
- * (`ddk:debuggerAvailable`, kept current when extensions change); the target
- * query is always registered.
+ * Commands and menu items are enabled only while such an extension is
+ * installed (`ddk:debuggerAvailable`); the target query is always registered.
  */
 export class DebugFeature implements Feature {
   private available = false;
   private registrations: Disposable[] = [];
   private readonly buildBeforeDebug = new DdkBuildBeforeDebug();
 
-  /** An extension contributing the `delphi` debug type is installed. */
   public get isDebuggerAvailable(): boolean {
     return this.available;
   }
@@ -102,10 +93,8 @@ export class DebugFeature implements Feature {
   }
 
   /**
-   * One gesture, like the Delphi IDE's Run-with-debugger. The session is
-   * only asked for here: the build that precedes a launch happens where
-   * every session passes, whoever started it — see [`DdkBuildBeforeDebug`] —
-   * which is told on which link this one was asked for.
+   * Only asks for the session; the build happens in `DdkBuildBeforeDebug`,
+   * where every session passes, which is told the link this one was asked on.
    */
   private async startSession(project: Entities.Project, request: 'launch' | 'attach', link?: Entities.ProjectLink): Promise<void> {
     this.buildBeforeDebug.pick(project, link);

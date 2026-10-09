@@ -1,11 +1,7 @@
 use ddk_core::projects::compiler_state;
 
-// NOTE: These tests use module-level statics, so they MUST run serially.
-// Use `cargo test --test compiler_state -- --test-threads=1` to be safe.
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  activate / reset
-// ═══════════════════════════════════════════════════════════════════════════════
+// These tests share module-level statics and must run serially:
+// `cargo test --test compiler_state -- --test-threads=1`.
 
 #[test]
 fn activate_returns_true_first_time() {
@@ -36,10 +32,6 @@ fn is_active_after_activate() {
     assert!(compiler_state::is_active());
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  cancel
-// ═══════════════════════════════════════════════════════════════════════════════
-
 #[test]
 fn not_cancelled_by_default() {
     compiler_state::reset();
@@ -60,10 +52,6 @@ fn reset_clears_cancelled() {
     compiler_state::reset();
     assert!(!compiler_state::is_cancelled());
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  success / code
-// ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn success_default_false() {
@@ -91,13 +79,8 @@ fn set_code() {
     assert_eq!(compiler_state::get_code(), 42);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  diagnosed files tracking
-// ═══════════════════════════════════════════════════════════════════════════════
-
 #[test]
 fn track_and_take_diagnosed_files() {
-    // Clean slate
     let _ = compiler_state::take_diagnosed_files();
 
     compiler_state::track_diagnosed_file("file1.pas".to_string());
@@ -105,7 +88,7 @@ fn track_and_take_diagnosed_files() {
     compiler_state::track_diagnosed_file("file1.pas".to_string()); // duplicate
 
     let files = compiler_state::take_diagnosed_files();
-    assert_eq!(files.len(), 2); // set, no duplicates
+    assert_eq!(files.len(), 2);
     assert!(files.contains("file1.pas"));
     assert!(files.contains("file2.pas"));
 }

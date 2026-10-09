@@ -1,8 +1,7 @@
 //! Shared command implementations for DDK.
 //!
-//! Both the MCP server and the CLI binary delegate to these functions.
-//! Each function returns a typed Rust struct; the caller decides how to
-//! present it (JSON for MCP, human-readable table for CLI, etc.).
+//! Both the MCP server and the CLI binary delegate to these functions. Each
+//! returns a typed struct; the caller decides how to present it.
 
 use anyhow::{Context, Result, bail};
 use regex::Regex;
@@ -20,7 +19,6 @@ use crate::utils::normalize_path;
 // Result types
 // ---------------------------------------------------------------------------
 
-/// Summary of a single project entry within a workspace or group project.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectSummary {
     pub id: usize,
@@ -28,15 +26,13 @@ pub struct ProjectSummary {
     pub directory: String,
     pub dproj: Option<String>,
     pub exe: Option<String>,
-    /// Effective Host Application (DevKit override or the dproj's own
-    /// `Debugger_HostApplication`): the executable RunProgram launches to
-    /// host a project with no standalone exe (e.g. a package or DLL).
+    /// DevKit override or the dproj's `Debugger_HostApplication`: the exe that
+    /// hosts a project without a standalone one (a package or DLL).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
     pub active: bool,
 }
 
-/// Summary of a user-defined workspace and its projects.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceSummary {
     pub id: usize,
@@ -45,7 +41,6 @@ pub struct WorkspaceSummary {
     pub projects: Vec<ProjectSummary>,
 }
 
-/// Summary of the loaded group project and its projects.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupProjectSummary {
     pub name: String,
@@ -54,7 +49,6 @@ pub struct GroupProjectSummary {
     pub projects: Vec<ProjectSummary>,
 }
 
-/// Hierarchical project listing preserving workspace / group-project structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectListResult {
     pub workspaces: Vec<WorkspaceSummary>,
@@ -108,7 +102,6 @@ impl fmt::Display for ProjectListResult {
     }
 }
 
-/// Environment info for the currently active project.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnvironmentInfo {
     pub project: Option<EnvironmentProject>,
@@ -124,10 +117,9 @@ pub struct EnvironmentProject {
     pub compilers: Vec<EnvironmentCompilerEntry>,
 }
 
-/// A compiler associated with a specific context (workspace name or
-/// "group_project").
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnvironmentCompilerEntry {
+    /// Workspace name, or `"group_project"`.
     pub context: String,
     pub key: String,
     pub product_name: String,
@@ -174,7 +166,6 @@ impl fmt::Display for EnvironmentInfo {
     }
 }
 
-/// Summary of a compiler configuration (returned by `list_compilers`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompilerSummary {
     pub key: String,
@@ -197,7 +188,6 @@ impl fmt::Display for CompilerSummary {
     }
 }
 
-/// Confirmation after selecting a project.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelectProjectResult {
     pub project_id: usize,
@@ -214,7 +204,6 @@ impl fmt::Display for SelectProjectResult {
     }
 }
 
-/// Confirmation after setting the group project compiler.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetCompilerResult {
     pub key: String,
@@ -231,29 +220,19 @@ impl fmt::Display for SetCompilerResult {
     }
 }
 
-/// A single structured compiler diagnostic.
-///
-/// Parsed from the normalized diagnostic lines ddk already produces, so all
-/// three source compiler formats (dcc32, Delphi 2007 MSBuild wrapper, plain)
-/// collapse into the same shape. Severity is conveyed by which
-/// [`CompileDiagnostics`] group the entry lives in, so it is not repeated here.
+/// Severity is not a field: it is the [`CompileDiagnostics`] group the entry
+/// lives in.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompileDiagnostic {
-    /// Compiler code, e.g. `"W1035"`.
     pub code: String,
-    /// Absolute source file path.
     pub file: String,
     /// 1-based line number.
     pub line: u32,
     pub message: String,
 }
 
-/// Compiler diagnostics grouped by severity.
-///
-/// Subject to the same `show_warnings` / `show_hints` filters as `lines`:
-/// errors always appear, warnings only with `show_warnings`, hints only with
-/// `show_hints`. The filters slim the output for machine consumers, so they
-/// gate the structured data and the human-readable lines uniformly.
+/// Errors always appear; warnings and hints only under `show_warnings` /
+/// `show_hints`, which gate the structured data and the streamed lines alike.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CompileDiagnostics {
     pub errors: Vec<CompileDiagnostic>,
@@ -261,51 +240,33 @@ pub struct CompileDiagnostics {
     pub hints: Vec<CompileDiagnostic>,
 }
 
-/// Full, machine-coded compilation output. Every field is structured — there
-/// is no raw log text; the header banner is split into fields and all
-/// recognised compiler messages live in `diagnostics`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompileOutput {
-    /// Project name.
     pub project: String,
-    /// Absolute path of the compiled project/target.
     pub project_path: String,
-    /// Compiler product name, e.g. "Delphi 12.0 Athens".
     pub compiler: String,
-    /// Effective build configuration (e.g. "Release"), if known.
     pub config: Option<String>,
-    /// Effective target platform (e.g. "Win32"), if known.
     pub platform: Option<String>,
     /// `"compile"` (Clean;Make) or `"rebuild"` (Clean;Build).
     pub action: String,
     pub success: bool,
     pub code: i32,
-    /// Structured diagnostics grouped by severity, subject to the
-    /// `show_warnings` / `show_hints` filters (errors are always included).
     #[serde(default)]
     pub diagnostics: CompileDiagnostics,
 }
 
 pub type CompileProgressCallback = std::sync::Arc<dyn Fn(String) + Send + Sync>;
 
-/// Output filter options for `cmd_compile` / `cmd_compile_with_progress`.
-///
-/// The VS Code extension consumes compiler events directly via the LSP server
-/// (which never goes through these commands), so its output remains untouched.
-/// CLI and MCP callers should set these to reduce token noise.
+/// Only CLI and MCP filter here; the VS Code extension reads compiler events
+/// from the LSP server and bypasses these commands entirely.
 #[derive(Debug, Clone, Default)]
 pub struct CompileFilterOptions {
-    /// Strip box-drawing border lines from start/completed banners and trim
-    /// the centered padding on the remaining info lines.
+    /// Drop the banners' box-drawing borders and the centering padding.
     pub trim_banners: bool,
-    /// Emit warning lines verbatim. When false, warnings are hidden (and
-    /// optionally counted toward `summarize_diagnostics`).
     pub show_warnings: bool,
-    /// Emit hint lines verbatim. When false, hints are hidden (and optionally
-    /// counted toward `summarize_diagnostics`).
     pub show_hints: bool,
-    /// Emit a per-file summary `<file>: X warn, Y hint` after each project's
-    /// completion event for any diagnostics that were not shown verbatim.
+    /// Emit `<file>: X warn, Y hint` per project for the diagnostics that were
+    /// suppressed above.
     pub summarize_diagnostics: bool,
 }
 
@@ -338,9 +299,6 @@ impl fmt::Display for CompileOutput {
 // Output-filter helpers (used by cmd_compile_with_progress)
 // ---------------------------------------------------------------------------
 
-/// Returns `true` if `line` is a banner border (only box-drawing chars and
-/// whitespace). These are the decorative top/bottom rows of the compile
-/// banner that have no value for an LLM consumer.
 fn is_banner_border_line(line: &str) -> bool {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -358,8 +316,6 @@ fn is_banner_border_line(line: &str) -> bool {
     ))
 }
 
-/// Trim a banner line vector for compact CLI/MCP output: drop border rows and
-/// strip the centering padding from the remaining info rows.
 fn trim_banner_lines(lines: Vec<String>) -> Vec<String> {
     lines
         .into_iter()
@@ -370,16 +326,13 @@ fn trim_banner_lines(lines: Vec<String>) -> Vec<String> {
 }
 
 lazy_static::lazy_static! {
-    /// Matches the formatted-diagnostic line emitted by
-    /// `CompilerLineDiagnostic::Display`, capturing every field:
-    ///   `HH:MM:SS.mmm: [KIND][CODE] file:line[:col] - message`
+    /// Must track `CompilerLineDiagnostic::Display`, which emits
+    /// `HH:MM:SS.mmm: [KIND][CODE] file:line[:col] - message`.
     static ref FORMATTED_DIAG_FULL_REGEX: regex::Regex = regex::Regex::new(
         r"^\d{2}:\d{2}:\d{2}\.\d+:\s+\[(?P<kind>WARN|HINT|ERROR)\]\[(?P<code>[A-Z]\d+)\]\s+(?P<file>.+?):(?P<line>\d+)(?::\d+)?\s+-\s(?P<message>.*)$"
     ).unwrap();
 }
 
-/// Parse a formatted diagnostic line into its severity group and a structured
-/// [`CompileDiagnostic`]. Returns `None` for non-diagnostic lines.
 fn parse_formatted_diagnostic(line: &str) -> Option<(DiagKind, CompileDiagnostic)> {
     let caps = FORMATTED_DIAG_FULL_REGEX.captures(line)?;
     let kind = match caps.name("kind")?.as_str() {
@@ -443,8 +396,7 @@ enum DiagKind {
     Error,
 }
 
-/// Extract `<filename without extension>` from a path string.
-/// Handles both `/` and `\` separators since Delphi runs on Windows.
+/// Filename without extension; accepts both `/` and `\` separators.
 fn diag_file_basename(path: &str) -> String {
     let last = path.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(path);
     match last.rsplit_once('.') {
@@ -453,9 +405,8 @@ fn diag_file_basename(path: &str) -> String {
     }
 }
 
-/// Per-project tracker for warnings/hints suppressed from streamed output.
-/// Counts are aggregated by file basename in insertion order so the summary
-/// reflects the order diagnostics arrived.
+/// Warnings/hints suppressed from the streamed output, counted per file
+/// basename in arrival order.
 #[derive(Debug, Default)]
 struct DiagCounts {
     order: Vec<String>,
@@ -494,14 +445,13 @@ impl DiagCounts {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Case-insensitive path equality on normalized forms — used to hide a
-/// Host Application that is just the project's own executable.
+/// Case-insensitive path equality on normalized forms.
 fn paths_equal_ci(a: &str, b: &str) -> bool {
     normalize_path(a).to_string_lossy().to_lowercase() == normalize_path(b).to_string_lossy().to_lowercase()
 }
 
-/// Find the first `ProjectLink.id` for a given project, searching workspaces
-/// first, then the group project.
+/// First matching `ProjectLink.id`: workspaces are searched before the group
+/// project.
 pub fn find_project_link_id(data: &ProjectsData, project_id: usize) -> Option<usize> {
     for ws in &data.workspaces {
         if let Some(link) = ws.project_links.iter().find(|l| l.project_id == project_id) {
@@ -516,29 +466,23 @@ pub fn find_project_link_id(data: &ProjectsData, project_id: usize) -> Option<us
     None
 }
 
-/// A project candidate surfaced when a name reference is ambiguous.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectRef {
     pub id: usize,
     pub name: String,
-    /// Workspace or group-project name the project belongs to (or "(unlinked)").
+    /// Workspace or group-project name, or `"(unlinked)"`.
     pub location: String,
-    /// The project's primary file (.dproj/.dpr/.dpk) or its directory.
+    /// The project's `.dproj`/`.dpr`/`.dpk`, falling back to its directory.
     pub path: String,
 }
 
-/// Outcome of resolving a project reference (name or numeric id).
 #[derive(Debug, Clone)]
 pub enum ProjectResolution {
-    /// Exactly one project matched; carries its id.
     Single(usize),
-    /// Several projects matched; the caller should present these candidates.
     Ambiguous(Vec<ProjectRef>),
-    /// Nothing matched.
     NotFound,
 }
 
-/// The workspace/group-project name that contains `project_id`.
 fn project_location(data: &ProjectsData, project_id: usize) -> String {
     for ws in &data.workspaces {
         if ws.project_links.iter().any(|l| l.project_id == project_id) {
@@ -568,13 +512,9 @@ fn project_ref(data: &ProjectsData, p: &Project) -> ProjectRef {
     }
 }
 
-/// Resolve a project reference to a concrete project.
-///
-/// A reference that parses as a number and matches an existing project id wins
-/// outright. Otherwise the reference is matched against project names: an
-/// exact (case-insensitive) match is preferred, falling back to a
-/// case-insensitive substring match. A single match resolves to that project;
-/// multiple matches are returned as candidates so the caller can disambiguate.
+/// An existing numeric id wins outright; otherwise an exact name beats a
+/// substring match, both case-insensitive. Several matches are returned as
+/// candidates rather than picked.
 pub fn resolve_project_reference(data: &ProjectsData, reference: &str) -> ProjectResolution {
     if let Ok(id) = reference.parse::<usize>() {
         if data.get_project(id).is_some() {
@@ -602,11 +542,8 @@ pub fn resolve_project_reference(data: &ProjectsData, reference: &str) -> Projec
     }
 }
 
-/// Resolve a project **file path** to the managed project(s) that own it
-/// (i.e. whose `.dproj`/`.dpr`/`.dpk` is that file). Paths are normalised and
-/// compared case-insensitively (Windows). Used so that `compile <path>` for a
-/// file already belonging to a project behaves like referencing that project
-/// by name, rather than compiling it ad-hoc.
+/// Resolve a file path to the managed project(s) whose `.dproj`/`.dpr`/`.dpk`
+/// it is. Paths are normalised and compared case-insensitively.
 pub fn resolve_project_by_path(data: &ProjectsData, path: &str) -> ProjectResolution {
     let target = normalize_path(path).to_string_lossy().to_lowercase();
     let owns = |field: &Option<String>| -> bool {
@@ -627,13 +564,9 @@ pub fn resolve_project_by_path(data: &ProjectsData, path: &str) -> ProjectResolu
     }
 }
 
-/// Resolve a user-supplied compiler reference to a concrete configuration key.
-///
-/// Matching order: exact key (`"12.0"`) → exact product name (case-insensitive,
-/// e.g. `"Delphi 12.0 Athens"`) → unique product-name substring (e.g.
-/// `"Delphi 12"` or `"Athens"`). When `requested` is `None`, the newest
-/// installed compiler (highest `compiler_version`, preferring `"12.0"` on a
-/// tie) is chosen. Errors list the available compilers.
+/// Matching order: exact key (`"12.0"`) → exact product name → unique
+/// product-name substring, the latter two case-insensitive. `None` takes
+/// `"12.0"` when installed, else the highest `compiler_version`.
 async fn resolve_compiler_key(requested: Option<String>) -> Result<String> {
     let configs = COMPILER_CONFIGURATIONS.read().await;
     if configs.iter().next().is_none() {
@@ -649,7 +582,6 @@ async fn resolve_compiler_key(requested: Option<String>) -> Result<String> {
     };
 
     let Some(req) = requested else {
-        // No preference: prefer the canonical default, else the newest compiler.
         if configs.contains_key("12.0") {
             return Ok("12.0".to_string());
         }
@@ -688,9 +620,7 @@ async fn resolve_compiler_key(requested: Option<String>) -> Result<String> {
     }
 }
 
-/// Resolve a workspace reference (name, or numeric id) to a workspace id.
-/// Names are matched exactly first, then case-insensitively. Errors list the
-/// available workspace names.
+/// Matching order: exact name → case-insensitive name → numeric id.
 pub fn resolve_workspace_id(data: &ProjectsData, reference: &str) -> Result<usize> {
     if let Some(ws) = data.workspaces.iter().find(|w| w.name == reference) {
         return Ok(ws.id);
@@ -720,7 +650,6 @@ pub fn resolve_workspace_id(data: &ProjectsData, reference: &str) -> Result<usiz
 // Commands
 // ---------------------------------------------------------------------------
 
-/// Returns environment information for the currently active project.
 pub async fn cmd_get_environment_info() -> Result<EnvironmentInfo> {
     let projects_data = PROJECTS_DATA.read().await;
     let compilers = COMPILER_CONFIGURATIONS.read().await;
@@ -794,7 +723,6 @@ pub async fn cmd_get_environment_info() -> Result<EnvironmentInfo> {
     })
 }
 
-/// Lists all known projects, preserving workspace / group-project hierarchy.
 pub async fn cmd_list_projects() -> Result<ProjectListResult> {
     let projects_data = PROJECTS_DATA.read().await;
     let active_id = projects_data.active_project_id;
@@ -805,8 +733,7 @@ pub async fn cmd_list_projects() -> Result<ProjectListResult> {
         directory: p.directory.clone(),
         dproj: p.dproj.clone(),
         exe: p.exe.clone(),
-        // A Host Application that is just the project's own exe adds no
-        // information — only surface a host that actually differs.
+        // Only surface a host that differs from the project's own exe.
         host: p.effective_host_application().filter(|host| {
             !p.exe.as_deref().is_some_and(|exe| paths_equal_ci(host, exe))
         }),
@@ -860,7 +787,6 @@ pub async fn cmd_list_projects() -> Result<ProjectListResult> {
     })
 }
 
-/// Selects a project by ID.
 pub async fn cmd_select_project(project_id: usize) -> Result<SelectProjectResult> {
     {
         let data = PROJECTS_DATA.read().await;
@@ -884,7 +810,6 @@ pub async fn cmd_select_project(project_id: usize) -> Result<SelectProjectResult
     })
 }
 
-/// Lists all available compiler configurations.
 pub async fn cmd_list_compilers() -> Result<Vec<CompilerSummary>> {
     let configs = COMPILER_CONFIGURATIONS.read().await;
     Ok(configs
@@ -899,7 +824,6 @@ pub async fn cmd_list_compilers() -> Result<Vec<CompilerSummary>> {
         .collect())
 }
 
-/// Sets the group project compiler by key.
 pub async fn cmd_set_group_compiler(compiler_key: String) -> Result<SetCompilerResult> {
     {
         let configs = COMPILER_CONFIGURATIONS.read().await;
@@ -929,7 +853,6 @@ pub async fn cmd_set_group_compiler(compiler_key: String) -> Result<SetCompilerR
     })
 }
 
-/// Confirmation after adding a project to a workspace.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddProjectResult {
     pub project_id: usize,
@@ -952,7 +875,6 @@ impl fmt::Display for AddProjectResult {
     }
 }
 
-/// Confirmation after creating a workspace.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddWorkspaceResult {
     pub workspace_id: usize,
@@ -971,9 +893,8 @@ impl fmt::Display for AddWorkspaceResult {
     }
 }
 
-/// Adds a project to an existing workspace, identified by workspace name (or
-/// numeric id). The file may be a `.dproj`, `.dpr`, or `.dpk`; bare sources
-/// without a `.dproj` are supported. Returns the newly created project.
+/// `file_path` may be a `.dproj`, `.dpr` or `.dpk`; a bare source without a
+/// `.dproj` works too.
 pub async fn cmd_add_project(file_path: String, workspace: String) -> Result<AddProjectResult> {
     if !std::path::Path::new(&file_path).exists() {
         bail!("File not found: {file_path}");
@@ -1013,9 +934,8 @@ pub async fn cmd_add_project(file_path: String, workspace: String) -> Result<Add
     })
 }
 
-/// Creates a new workspace bound to a compiler configuration. `compiler` is
-/// resolved like the compile commands: exact key, exact product name, or a
-/// unique product-name substring (e.g. `"Delphi 12"`).
+/// `compiler` resolves like everywhere else: exact key, exact product name, or
+/// a unique product-name substring.
 pub async fn cmd_add_workspace(name: String, compiler: String) -> Result<AddWorkspaceResult> {
     if name.trim().is_empty() {
         bail!("Workspace name cannot be empty.");
@@ -1054,7 +974,6 @@ pub async fn cmd_add_workspace(name: String, compiler: String) -> Result<AddWork
     })
 }
 
-/// Result of formatting a file in-place.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FormatFileResult {
     pub file_path: String,
@@ -1066,8 +985,6 @@ impl fmt::Display for FormatFileResult {
     }
 }
 
-/// Several projects matched a name reference; presented to the user instead of
-/// compiling so they can re-run with a specific project id.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AmbiguousProjects {
     pub reference: String,
@@ -1084,21 +1001,18 @@ impl fmt::Display for AmbiguousProjects {
     }
 }
 
-/// Result of a reference-based compile: either the compilation output, or a
-/// list of candidate projects when the reference was ambiguous.
 #[derive(Debug, Clone)]
 pub enum CompileOrAmbiguity {
     Output(CompileOutput),
     Ambiguity(AmbiguousProjects),
 }
 
-/// Compiles a project. If `project_id` is `Some`, that project is compiled
-/// directly **without** changing the active project in state; otherwise the
-/// currently active project is compiled.
+/// `project_id` compiles that project without making it the active one;
+/// `None` compiles the active project.
+///
 /// `debug_info` forces the full debug artefact set (optimizations off, TD32
-/// debug info, `.rsm`, detailed `.map`) regardless of what the selected build
-/// configuration says, without touching the dproj — what a debugger needs.
-/// Collects compiler broadcast output and returns it as a `CompileOutput`.
+/// debug info, `.rsm`, detailed `.map`) over the build configuration's own
+/// settings, without touching the dproj.
 pub async fn cmd_compile(
     rebuild: bool,
     debug_info: bool,
@@ -1108,12 +1022,9 @@ pub async fn cmd_compile(
     cmd_compile_with_progress(rebuild, debug_info, project_id, filter, Vec::new(), None).await
 }
 
-/// Compiles a project selected by a reference (project name or numeric id).
-///
-/// `None` compiles the active project. A reference that uniquely identifies a
-/// project compiles it; a reference matching several projects returns
-/// [`CompileOrAmbiguity::Ambiguity`] (the candidate list) **without** compiling;
-/// a reference matching nothing is an error.
+/// `project` is a name or numeric id; `None` compiles the active project. An
+/// ambiguous reference returns the candidates without compiling, an unmatched
+/// one is an error.
 pub async fn cmd_compile_ref(
     rebuild: bool,
     debug_info: bool,
@@ -1158,8 +1069,6 @@ pub async fn cmd_compile_ref_with_progress(
     Ok(CompileOrAmbiguity::Output(output))
 }
 
-/// Compiles a project and optionally invokes `on_progress` for each emitted
-/// compiler output line as it arrives.
 pub async fn cmd_compile_with_progress(
     rebuild: bool,
     debug_info: bool,
@@ -1170,9 +1079,8 @@ pub async fn cmd_compile_with_progress(
 ) -> Result<CompileOutput> {
     let (project_name, resolved_id, link_id) = {
         let data = PROJECTS_DATA.read().await;
-        // Use the explicitly requested project_id, falling back to the active project.
-        // We intentionally do NOT call cmd_select_project here so that the active
-        // project in state is never changed as a side-effect of a compile call.
+        // Deliberately not cmd_select_project: compiling must not change the
+        // active project.
         let target_id = match project_id.or(data.active_project_id) {
             Some(id) => id,
             _ => bail!("No active project selected."),
@@ -1203,22 +1111,13 @@ pub async fn cmd_compile_with_progress(
     run_compile_collecting(compiler, project_name, filter, on_progress).await
 }
 
-/// Compiles a Delphi project from a file path.
+/// A file owned by a managed project compiles as that project, exactly as a
+/// reference by name would; only a file owned by none is compiled ad-hoc
+/// against ephemeral state, leaving the persisted state untouched.
 ///
-/// If the file already belongs to a managed project (its `.dproj`/`.dpr`/`.dpk`
-/// matches one), it is compiled as that managed project — identical to
-/// referencing it by name — and a path shared by several projects yields the
-/// candidate list ([`CompileOrAmbiguity::Ambiguity`]) instead of compiling.
-/// Only a file owned by no project is compiled **ad-hoc**: an ephemeral
-/// [`ProjectsData`] is assembled in memory (a throw-away workspace bound to the
-/// chosen compiler) and the regular compile path runs against it, leaving the
-/// persisted state untouched.
-///
-/// `compiler` selects the ad-hoc compiler configuration: matched first as an
-/// exact key (e.g. `"12.0"`), then by product name (e.g. `"Delphi 12"`); `None`
-/// uses the newest installed compiler. `config` / `platform` are optional
-/// ad-hoc build overrides. (These three are ignored for a managed match, which
-/// uses the project's own workspace compiler and overrides.)
+/// `compiler`, `config` and `platform` configure that ad-hoc build and are
+/// ignored for a managed match, which uses the project's own workspace
+/// compiler and overrides.
 pub async fn cmd_compile_file(
     file_path: String,
     compiler: Option<String>,
@@ -1243,8 +1142,6 @@ pub async fn cmd_compile_file(
     .await
 }
 
-/// Like [`cmd_compile_file`] but invokes `on_progress` for each emitted
-/// compiler output line as it arrives.
 pub async fn cmd_compile_file_with_progress(
     file_path: String,
     compiler: Option<String>,
@@ -1256,8 +1153,6 @@ pub async fn cmd_compile_file_with_progress(
     extra_msbuild_args: Vec<String>,
     on_progress: Option<CompileProgressCallback>,
 ) -> Result<CompileOrAmbiguity> {
-    // Prefer a managed project that owns this file: compile it like a named
-    // reference (with ambiguity reporting) rather than ad-hoc.
     let managed_id = {
         let data = PROJECTS_DATA.read().await;
         match resolve_project_by_path(&data, &file_path) {
@@ -1278,7 +1173,6 @@ pub async fn cmd_compile_file_with_progress(
         return Ok(CompileOrAmbiguity::Output(output));
     }
 
-    // Ad-hoc: the file is not part of any managed project.
     let data = adhoc_project_data(&file_path, compiler, config, platform).await?;
     let project = data.projects.last().expect("adhoc_project_data holds the project");
     let project_id = project.id;
@@ -1301,19 +1195,14 @@ pub async fn cmd_compile_file_with_progress(
     Ok(CompileOrAmbiguity::Output(output))
 }
 
-/// Drives a prepared [`Compiler`] to completion while collecting (and
-/// optionally streaming) its broadcast output, applying the diagnostic
-/// filters, and returns the assembled [`CompileOutput`].
+/// Drives a prepared [`Compiler`] to completion, collecting and optionally
+/// streaming its broadcast output under the diagnostic filters.
 async fn run_compile_collecting(
     compiler: Compiler,
     project_name: String,
     filter: CompileFilterOptions,
     on_progress: Option<CompileProgressCallback>,
 ) -> Result<CompileOutput> {
-    // Parse structured diagnostics from the broadcast output concurrently with
-    // compilation, and stream every line to the progress callback for live
-    // (human) output. No raw log text is retained — the JSON is fully
-    // machine-coded (structured header + diagnostics).
     let diagnostics: std::sync::Arc<std::sync::Mutex<CompileDiagnostics>> =
         std::sync::Arc::new(std::sync::Mutex::new(CompileDiagnostics::default()));
     let diagnostics_clone = diagnostics.clone();
@@ -1344,8 +1233,7 @@ async fn run_compile_collecting(
                     }
                     CompilerProgressParams::Completed { lines: ls, .. }
                     | CompilerProgressParams::SingleProjectCompleted { lines: ls, .. } => {
-                        // Drain pending per-project diagnostic summary first
-                        // so it appears immediately before the footer.
+                        // Drain first, so the summary precedes the footer.
                         if filter_opts.summarize_diagnostics {
                             let summary = counts.drain_summary_lines();
                             if !summary.is_empty() {
@@ -1364,10 +1252,8 @@ async fn run_compile_collecting(
                     CompilerProgressParams::Stdout { line }
                     | CompilerProgressParams::Stderr { line } => {
                         if let Some((kind, diag)) = parse_formatted_diagnostic(&line) {
-                            // The show_warnings/show_hints filters slim the
-                            // output for machine consumers, so they gate the
-                            // structured diagnostics and the streamed lines
-                            // uniformly: a suppressed severity appears in neither.
+                            // A suppressed severity appears neither in the
+                            // structured diagnostics nor in the streamed lines.
                             let suppress = match kind {
                                 DiagKind::Warn => !filter_opts.show_warnings,
                                 DiagKind::Hint => !filter_opts.show_hints,
@@ -1390,12 +1276,11 @@ async fn run_compile_collecting(
                     }
                 },
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                // Known gap: the broadcast has no backpressure, so a producer that
-                // outruns this loop by more than the channel capacity overwrites the
-                // oldest events, and the diagnostics they carried are missing from the
-                // JSON without a trace. Closing it means giving the compiler output a
-                // channel that blocks instead of dropping – a change to the shared
-                // CompilerProgress broadcast and therefore its own slice.
+                // Known gap: the broadcast has no backpressure, so a producer
+                // outrunning this loop overwrites events and their diagnostics
+                // are lost from the JSON without a trace. Closing it means
+                // giving the compiler output a channel that blocks instead of
+                // dropping — a change to the shared CompilerProgress broadcast.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
             }
         }
@@ -1403,13 +1288,11 @@ async fn run_compile_collecting(
 
     let compile_result = compiler.compile().await;
 
-    // Brief settling window for in-flight broadcasts, then stop collector.
-    // Known gap: compile() has already joined the output readers, so everything is
-    // sent by now – but the collector may still be working through the backlog, and
-    // the abort cuts whatever it has not processed after 100 ms. A deterministic end
-    // needs the loop to drain until the channel is empty rather than race a timer;
-    // the broadcast's sender is a process-wide OnceLock and never closes, so that
-    // needs a termination signal of its own and is left to its own slice.
+    // Known gap: everything is sent by now, but the collector may still be
+    // working through its backlog, and the abort cuts whatever it has not
+    // processed after 100 ms. Draining until the channel is empty is not the
+    // fix on its own: the broadcast's sender is a process-wide OnceLock and
+    // never closes, so a termination signal has to come first.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     collect_handle.abort();
     let _ = collect_handle.await;
@@ -1439,11 +1322,9 @@ async fn run_compile_collecting(
 // Run
 // ---------------------------------------------------------------------------
 
-/// Result of running a project's built executable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunOutput {
-    /// Name of the managed project that owns the executable, or `None` when
-    /// an `.exe` path was run directly without going through a project.
+    /// `None` when a bare `.exe` path was run without a project.
     pub project_name: Option<String>,
     pub exe: String,
     pub args: Vec<String>,
@@ -1462,17 +1343,14 @@ impl fmt::Display for RunOutput {
     }
 }
 
-/// Result of a reference-based run: either the run output, or a list of
-/// candidate projects when the reference/path was ambiguous.
 #[derive(Debug, Clone)]
 pub enum RunOrAmbiguity {
     Output(RunOutput),
     Ambiguity(AmbiguousProjects),
 }
 
-/// Fuses the dproj's `Debugger_RunParams` with the DDK "Start Parameters"
-/// override: both contribute, base first, joined by a space — neither
-/// silently discards the other. Blank/absent values contribute nothing.
+/// The dproj's `Debugger_RunParams` and the DDK "Start Parameters" override
+/// both contribute, base first: neither discards the other.
 pub(crate) fn fuse_run_params(base: Option<String>, extra: Option<String>) -> Option<String> {
     let base = base.filter(|s| !s.trim().is_empty());
     let extra = extra.filter(|s| !s.trim().is_empty());
@@ -1484,8 +1362,7 @@ pub(crate) fn fuse_run_params(base: Option<String>, extra: Option<String>) -> Op
     }
 }
 
-/// Splits a start-parameters string into argv entries, honoring
-/// double-quoted segments (e.g. `-flag "value with spaces"`).
+/// Splits into argv entries, honoring double-quoted segments.
 pub(crate) fn split_run_args(args: &str) -> Vec<String> {
     let re = Regex::new(r#""([^"]*)"|(\S+)"#).unwrap();
     re.captures_iter(args)
@@ -1493,8 +1370,7 @@ pub(crate) fn split_run_args(args: &str) -> Vec<String> {
         .collect()
 }
 
-/// Launches an executable detached (not awaited); the child process outlives
-/// this call and keeps running independently of DDK.
+/// Detached: the child is not awaited and outlives this call.
 fn launch_executable(exe_path: &str, args: &[String]) -> Result<()> {
     let exe = std::path::Path::new(exe_path);
     if !exe.exists() {
@@ -1511,10 +1387,8 @@ fn launch_executable(exe_path: &str, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Runs a project selected by internal id (or the active project when
-/// `None`). `args`, when given, overrides the project's run parameters
-/// (dproj `Debugger_RunParams` fused with the saved Start Parameters) for
-/// this invocation only.
+/// `args` replaces the project's fused run parameters for this invocation
+/// only.
 pub async fn cmd_run(project_id: Option<usize>, args: Option<String>) -> Result<RunOutput> {
     let (project_name, exe, start_parameters) = {
         let data = PROJECTS_DATA.read().await;
@@ -1526,10 +1400,8 @@ pub async fn cmd_run(project_id: Option<usize>, args: Option<String>) -> Result<
             Some(p) => p,
             _ => bail!("Project with ID {target_id} not found."),
         };
-        // A configured Host Application (Project > Options > Debugger in the
-        // Delphi IDE, or the DevKit "Set Host Application" override) wins over
-        // the project's own executable, matching the IDE's Run behaviour —
-        // it is what makes a `.dpk` package or DLL project runnable at all.
+        // A configured Host Application wins over the project's own exe, as in
+        // the IDE: it is what makes a `.dpk` package or DLL project runnable.
         let exe = match project.effective_host_application().or_else(|| project.exe.clone()) {
             Some(target) => target,
             _ => bail!(
@@ -1537,11 +1409,6 @@ pub async fn cmd_run(project_id: Option<usize>, args: Option<String>) -> Result<
                 project.name
             ),
         };
-        // The dproj's own Debugger_RunParams (Project > Options > Run in the
-        // Delphi IDE) and the DDK "Start Parameters" override are fused
-        // together (dproj first) rather than one replacing the other, so
-        // `run` behaves like pressing Run there plus whatever extra
-        // parameters were saved on top.
         let start_parameters = fuse_run_params(project.dproj_run_params.clone(), project.start_parameters.clone());
         (project.name.clone(), exe, start_parameters)
     };
@@ -1551,12 +1418,9 @@ pub async fn cmd_run(project_id: Option<usize>, args: Option<String>) -> Result<
     Ok(RunOutput { project_name: Some(project_name), exe, args: parsed_args })
 }
 
-/// Runs a project selected by a reference (project name or numeric id).
-///
-/// `None` runs the active project. A reference that uniquely identifies a
-/// project runs it; a reference matching several projects returns
-/// [`RunOrAmbiguity::Ambiguity`] (the candidate list) **without** running; a
-/// reference matching nothing is an error.
+/// `project` is a name or numeric id; `None` runs the active project. An
+/// ambiguous reference returns the candidates without running, an unmatched
+/// one is an error.
 pub async fn cmd_run_ref(project: Option<String>, args: Option<String>) -> Result<RunOrAmbiguity> {
     let project_id: Option<usize> = match project {
         None => None,
@@ -1576,16 +1440,8 @@ pub async fn cmd_run_ref(project: Option<String>, args: Option<String>) -> Resul
     Ok(RunOrAmbiguity::Output(cmd_run(project_id, args).await?))
 }
 
-/// Runs a Delphi project's executable identified by its project file.
-///
-/// If the file belongs to a managed project (its `.dproj`/`.dpr`/`.dpk`
-/// matches one), that project's stored executable is run — identical to
-/// referencing it by name — and a path shared by several projects yields the
-/// candidate list ([`RunOrAmbiguity::Ambiguity`]) instead of running. Unlike
-/// `compile`, a file owned by no project is an **error**: `run` never builds
-/// or assembles ad-hoc state, since there is nothing to execute until the
-/// project is compiled. Run a bare `.exe` path directly via [`cmd_run_exe`]
-/// instead.
+/// Unlike `compile`, a file owned by no managed project is an error: there is
+/// nothing to execute until the project has been compiled.
 pub async fn cmd_run_file(file_path: String, args: Option<String>) -> Result<RunOrAmbiguity> {
     let managed_id = {
         let data = PROJECTS_DATA.read().await;
@@ -1605,19 +1461,15 @@ pub async fn cmd_run_file(file_path: String, args: Option<String>) -> Result<Run
     }
 }
 
-/// Runs an arbitrary executable directly, bypassing project resolution
-/// entirely. `args` are the command-line arguments to pass, split honoring
-/// double quotes; omit for none.
+/// Runs an executable directly, bypassing project resolution.
 pub async fn cmd_run_exe(exe_path: String, args: Option<String>) -> Result<RunOutput> {
     let parsed_args = args.map(|a| split_run_args(&a)).unwrap_or_default();
     launch_executable(&exe_path, &parsed_args)?;
     Ok(RunOutput { project_name: None, exe: exe_path, args: parsed_args })
 }
 
-/// Runs a target identified by file path, dispatching on its extension: a
-/// `.dproj`/`.dpr`/`.dpk` resolves to its managed project (see
-/// [`cmd_run_file`]); a `.exe` runs directly (see [`cmd_run_exe`]). Used by
-/// the CLI/MCP so both share one extension-dispatch rule.
+/// The one extension-dispatch rule CLI and MCP share: `.exe` runs directly,
+/// `.dproj`/`.dpr`/`.dpk` resolves to its managed project.
 pub async fn cmd_run_path(path: String, args: Option<String>) -> Result<RunOrAmbiguity> {
     if has_extension(&path, &["exe"]) {
         return Ok(RunOrAmbiguity::Output(cmd_run_exe(path, args).await?));
@@ -1628,28 +1480,20 @@ pub async fn cmd_run_path(path: String, args: Option<String>) -> Result<RunOrAmb
     bail!("\"{path}\" is not a recognized project or executable file (expected .dproj/.dpr/.dpk/.exe).");
 }
 
-/// Whether `value` names a Delphi project source (`.dproj`/`.dpr`/`.dpk`),
-/// case-insensitively and without allocating.
-// ─── Debug target ────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Debug target
+// ---------------------------------------------------------------------------
 
-/// Result of a debug-target request: the target, or the candidate list when
-/// the reference was ambiguous (mirroring the compile/run commands).
 #[derive(Debug, Clone)]
 pub enum DebugTargetOrAmbiguity {
     Target(crate::debug_target::DebugTarget),
     Ambiguity(AmbiguousProjects),
 }
 
-/// Describes the debug target of a project — see [`crate::debug_target`] —
-/// selected by reference: a numeric id, a project name, or a path to a
-/// `.dproj`/`.dpr`/`.dpk`; `None` targets the active project. A path owned by
-/// no managed project is described ad-hoc (nothing is persisted), building
-/// with `compiler` (an exact key or product name; default: the newest
-/// installed). `config`/`platform` describe that configuration and platform
-/// instead of the project's active ones — the same overrides `compile`
-/// takes, so the artefacts described are the ones such a build produces;
-/// nothing is persisted either way. A reference matching several projects
-/// returns the candidate list instead.
+/// Describes a project's debug target — see [`crate::debug_target`] — by
+/// numeric id, name, or path; `None` targets the active project. `config` and
+/// `platform` are the same overrides `compile` takes, so the artefacts
+/// described are the ones such a build would produce. Nothing is persisted.
 pub async fn cmd_debug_target(
     reference: Option<String>,
     compiler: Option<String>,
@@ -1693,11 +1537,9 @@ pub async fn cmd_debug_target(
         Some(p) => p,
         _ => bail!("Project with ID {project_id} not found."),
     };
-    // An orphan project (linked to no workspace or group project) has no
-    // compiler of its own; describing it is read-only, so fall back to the
-    // requested or newest compiler and say so rather than refusing. A
-    // linked project builds with its workspace's compiler, whatever was
-    // requested — which is said too, since the argument had no effect.
+    // An orphan project has no compiler of its own; describing it is read-only,
+    // so fall back to the requested or newest one and note it rather than
+    // refusing. A linked project ignores `compiler`, which is noted as well.
     let (compiler, compiler_note) = match data.compiler_for_project(project_id).await {
         Some(own) => {
             let note = compiler.map(|requested| {
@@ -1723,12 +1565,9 @@ pub async fn cmd_debug_target(
             (fallback, Some(note))
         }
     };
-    // Everything from here on is synchronous filesystem work — a dproj
-    // parse, an `is_dir` per search path entry, a `metadata` per artefact —
-    // and one entry on a disconnected share blocks it for the SMB timeout.
-    // The project is copied and the lock released first, so a slow describe
-    // costs its own caller and not every other reader and writer; the work
-    // itself goes to a blocking thread rather than parking a worker.
+    // What follows is synchronous filesystem work, and one search path on a
+    // disconnected share blocks it for the SMB timeout. Copy the project and
+    // release the lock first, so a slow describe costs only its own caller.
     let project = project.clone();
     drop(data);
     let target = tokio::task::spawn_blocking(move || {
@@ -1746,9 +1585,7 @@ pub async fn cmd_debug_target(
     Ok(DebugTargetOrAmbiguity::Target(target))
 }
 
-/// The ad-hoc counterpart of [`cmd_debug_target`] for a project file that
-/// belongs to no workspace: the same ephemeral project [`cmd_compile_file`]
-/// builds, described with its compiler.
+/// Describes the same ephemeral project [`cmd_compile_file`] would build.
 async fn adhoc_debug_target(
     file_path: &str,
     compiler: Option<String>,
@@ -1766,12 +1603,9 @@ async fn adhoc_debug_target(
     Ok(target)
 }
 
-/// The ephemeral, never-persisted project state behind every ad-hoc
-/// command on a project file that belongs to no workspace: one "ad-hoc"
-/// workspace on `compiler` (an exact key or product name; default: the
-/// newest installed) holding the file as its only project — the last entry
-/// of `projects` — with `config`/`platform` overriding the dproj's active
-/// ones where given, and the project's paths discovered for them.
+/// The ephemeral, never-persisted state behind every ad-hoc command: one
+/// workspace on `compiler` holding the file as its only project, which
+/// callers take from the end of `projects`.
 async fn adhoc_project_data(
     file_path: &str,
     compiler: Option<String>,
@@ -1800,8 +1634,8 @@ async fn adhoc_project_data(
     if platform.is_some() {
         project.active_platform = platform;
     }
-    // `new_project` discovered the paths of the dproj's default build; the
-    // executable and the host of the requested one are what is wanted.
+    // `new_project` discovered the paths of the dproj's default build, not of
+    // the configuration and platform just requested.
     project.discover_paths(&ide_env)?;
     Ok(data)
 }
@@ -1821,15 +1655,12 @@ fn has_extension(value: &str, extensions: &[&str]) -> bool {
 // DelphiLSP settings file
 // ---------------------------------------------------------------------------
 
-/// Result of generating a `.delphilsp.json`: either the written file's summary,
-/// or the candidate list when the project reference was ambiguous.
 #[derive(Debug, Clone)]
 pub enum DelphiLspOrAmbiguity {
     Output(crate::delphilsp::DelphiLspConfigResult),
     Ambiguity(AmbiguousProjects),
 }
 
-/// Build the generation request for a project already managed by DDK.
 async fn delphilsp_request_for_project(
     project_id: usize,
     out: Option<String>,
@@ -1872,9 +1703,8 @@ async fn delphilsp_request_for_project(
     })
 }
 
-/// Build the generation request for a project file that belongs to no
-/// workspace — the ad-hoc counterpart of [`cmd_compile_file`]'s ad-hoc mode.
-/// Nothing is added to (or read from) the persisted project state.
+/// Ad-hoc counterpart of [`delphilsp_request_for_project`]: the persisted
+/// project state is neither read nor added to.
 async fn delphilsp_request_for_path(
     file_path: &str,
     compiler: Option<String>,
@@ -1913,19 +1743,13 @@ async fn delphilsp_request_for_path(
     })
 }
 
-/// Generates the `.delphilsp.json` settings file Embarcadero's DelphiLSP VS
-/// Code extension needs for code insight, so search paths, defines and unit
-/// scope names are correct without ever opening the RAD Studio IDE.
+/// Generates the `.delphilsp.json` that Embarcadero's DelphiLSP VS Code
+/// extension reads for search paths, defines and unit scope names, so code
+/// insight works without ever opening the RAD Studio IDE.
 ///
-/// `target` resolves exactly like the compile commands: `None` uses the active
-/// project; a project id or name resolves against the managed projects (an
-/// ambiguous name returns the candidate list instead of writing anything); a
-/// path to a `.dproj`/`.dpr`/`.dpk` that belongs to a managed project is
-/// treated as that project, and one owned by no project is handled **ad-hoc**
-/// against the compiler chosen by `compiler` (default: the newest installed).
-///
-/// The file is written next to the project's main source as
-/// `<stem>.delphilsp.json` unless `out` overrides the destination.
+/// `target` resolves like the compile commands. The file is written next to
+/// the project's main source as `<stem>.delphilsp.json` unless `out` says
+/// otherwise.
 pub async fn cmd_delphilsp_config(
     target: Option<String>,
     compiler: Option<String>,
@@ -1984,12 +1808,9 @@ pub async fn cmd_delphilsp_config(
     Ok(DelphiLspOrAmbiguity::Output(crate::delphilsp::generate(&request)?))
 }
 
-/// Formats a Delphi source file in-place.
-///
-/// Reads the file at `file_path`, decodes it with `encoding` (e.g. `"utf-8"`,
-/// `"windows-1252"`, `"oem"`), runs it through the DDK formatter, then
-/// encodes the result back to the same encoding before writing.
-/// Defaults to `"utf-8"` when `encoding` is `None`.
+/// Formats a Delphi source file in-place. The file is written back in the
+/// `encoding` it was decoded with (e.g. `"windows-1252"`, `"oem"`); `None`
+/// means `"utf-8"`.
 pub async fn cmd_format_file(file_path: String, encoding: Option<String>) -> Result<FormatFileResult> {
     use crate::format::Formatter;
     use crate::encoding::{decode_bytes, encode_string};

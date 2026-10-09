@@ -22,9 +22,8 @@ function isSamePath(a?: string | null, b?: string | null): boolean {
 }
 
 /**
- * A Host Application that is just the project's own exe adds no information
- * (e.g. an exe project whose dproj points Debugger_HostApplication at
- * itself) — only a host that actually differs is worth surfacing.
+ * A dproj can point `Debugger_HostApplication` at the project's own exe; such a
+ * host adds no information, so only one that actually differs is surfaced.
  */
 function informativeHostApplication(entity: Entities.Project): string | undefined {
   const hostApplication = Entities.effectiveHostApplication(entity);
@@ -32,12 +31,6 @@ function informativeHostApplication(entity: Entities.Project): string | undefine
   return hostApplication;
 }
 
-/**
- * Hover tooltip summarizing how the project runs: its exe, the effective
- * Host Application (with origin — DevKit override vs the dproj's own value)
- * and the effective run parameters (with origin — saved Start Parameters,
- * the dproj's Debugger_RunParams, or both fused).
- */
 function buildProjectTooltip(entity: Entities.Project): MarkdownString {
   const useDprojRunParams = workspace.getConfiguration(PROJECTS.CONFIG.KEY).get<boolean>(PROJECTS.CONFIG.USE_DEBUGGER_RUN_PARAMS, true);
   const markdown = new MarkdownString();
@@ -100,9 +93,8 @@ export class ProjectItem extends BaseFileItem implements MainProjectItem {
     this.project = this;
     this.contextValue = PROJECTS.CONTEXT.PROJECT;
     this.tooltip = buildProjectTooltip(projectEntity);
-    // Inline cue that this project runs through a hosting executable (a .dpk
-    // package or DLL): the full path and origin live in the tooltip. A host
-    // that is just the project's own exe is not worth flagging.
+    // Inline cue that this project runs through a hosting executable; the full
+    // path and its origin are in the tooltip.
     const hostApplication = informativeHostApplication(projectEntity);
     if (hostApplication)
       this.description = `⇢ ${basename(hostApplication)}`;
@@ -123,7 +115,6 @@ export class ProjectItem extends BaseFileItem implements MainProjectItem {
     else this.iconPath = new ThemeIcon('symbol-class');
   }
 
-  // Update collapsible state based on children
   updateCollapsibleState(): void {
     const hasChildren = !!(this.projectDproj || this.projectDpr || this.projectDpk || this.projectExe || this.projectIni);
     this.collapsibleState = hasChildren ? TreeItemCollapsibleState.Collapsed : TreeItemCollapsibleState.None;

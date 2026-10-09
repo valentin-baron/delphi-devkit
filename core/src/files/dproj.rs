@@ -6,24 +6,16 @@ use std::sync::Mutex;
 
 use crate::utils::normalize_path;
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Dproj Cache
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Cached entry holding the parsed [`Dproj`] and the path it was loaded from.
 struct CacheEntry {
     dproj: Dproj,
     path: PathBuf,
 }
 
 lazy_static::lazy_static! {
-    /// Global runtime-only cache of parsed `.dproj` files, keyed by project id.
     static ref DPROJ_CACHE: Mutex<HashMap<usize, CacheEntry>> = Mutex::new(HashMap::new());
 }
 
-/// Return a clone of the cached [`Dproj`] for `project_id`, parsing from
-/// `dproj_path` on a cache miss.  The cache is invalidated automatically
-/// when the path changes between calls.
+/// Parses on a cache miss, and whenever the path changed since the last call.
 pub fn get_or_load(project_id: usize, dproj_path: &PathBuf) -> Result<Dproj> {
     let mut cache = DPROJ_CACHE.lock().unwrap();
     if let Some(entry) = cache.get(&project_id) {
@@ -40,21 +32,15 @@ pub fn get_or_load(project_id: usize, dproj_path: &PathBuf) -> Result<Dproj> {
     Ok(dproj)
 }
 
-/// Remove the cached entry for a single project.
 pub fn invalidate(project_id: usize) {
     let mut cache = DPROJ_CACHE.lock().unwrap();
     cache.remove(&project_id);
 }
 
-/// Clear the entire cache (e.g. on bulk reload).
 pub fn invalidate_all() {
     let mut cache = DPROJ_CACHE.lock().unwrap();
     cache.clear();
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Public helpers
-// ═══════════════════════════════════════════════════════════════════════════════
 
 pub fn get_main_source(dproj_path: &PathBuf) -> Result<PathBuf> {
     let dproj = Dproj::from_file(dproj_path)
@@ -95,14 +81,12 @@ pub fn has_unresolved_macro(value: &str) -> bool {
     value.contains("$(")
 }
 
-/// Whether `value` is a path a variable collapsed out of. The names a
-/// `Condition` tests cannot be seeded with their own reference — see
-/// [`seed_environment`] — so for those, dproj-rs still expands `$(VEGADIR)`
-/// to nothing and `$(VEGADIR)\bpl` arrives as `\bpl`: rooted, with no drive
-/// and no host, which is a directory that exists on whatever drive the
-/// server happens to run from. The collapse is visible in the shape of the
-/// result whichever variable caused it, and a dproj has no reason to name a
-/// driveless rooted path otherwise. A UNC path (`\\host\share`) is not one.
+/// Whether `value` is a path a variable collapsed out of: the names a
+/// `Condition` tests cannot be seeded with their own reference (see
+/// [`seed_environment`]), so for those dproj-rs still expands `$(VEGADIR)\bpl`
+/// to `\bpl` — rooted, with no drive and no host, which resolves to a directory
+/// on whatever drive the process runs from. A dproj has no other reason to name
+/// a driveless rooted path. A UNC path (`\\host\share`) is not one.
 pub fn looks_collapsed(value: &str) -> bool {
     let path = value.trim();
     let mut characters = path.chars();
@@ -125,32 +109,26 @@ pub fn unresolved_macros(value: &str) -> Vec<String> {
     names
 }
 
-/// Completes `environment`, the variables a dproj is evaluated with, for
-/// the dproj whose text is `dproj_source`, in the two ways dproj-rs cannot:
+/// Completes `environment`, the variables the dproj at `dproj_source` is
+/// evaluated with, in the two ways dproj-rs cannot:
 ///
 /// * **Casing.** dproj-rs looks names up case-sensitively, MSBuild does not:
 ///   a dproj writing `$(VegaDir)` for a variable defined as `VEGADIR` gets
 ///   the value under the spelling it uses.
-/// * **Undefined names.** dproj-rs expands an unknown `$(Name)` to nothing,
-///   so `$(VEGADIR)\bpl` silently becomes `\bpl` — a different, existing
-///   directory at worst. A name that neither the environment nor the dproj
-///   itself defines is therefore seeded with its own reference, which
-///   leaves `$(Name)` in the evaluated value for the reader to recognise
-///   ([`has_unresolved_macro`]) instead of a path that merely looks valid.
+/// * **Undefined names.** dproj-rs expands an unknown `$(Name)` to nothing, so
+///   `$(VEGADIR)\bpl` silently becomes `\bpl` — a different, existing directory
+///   at worst. A name neither the environment nor the dproj defines is seeded
+///   with its own reference, leaving `$(Name)` in the value for the reader to
+///   recognise ([`has_unresolved_macro`]).
 ///
-/// Names the dproj defines as properties (`$(DCC_UnitSearchPath)` inside its
-/// own definition, `$(Base)`, `$(Cfg_1)`) keep MSBuild's semantics — empty
-/// until defined — since the dproj fills them itself as it is evaluated.
-/// That covers the machinery the build configurations are selected with,
-/// whose truth must not change.
-///
-/// So do the names a `Condition` tests, and that carve-out is not optional:
-/// the IDE guards its own property groups with flags it tests before it
-/// declares them (`'$(Cfg_2_Win64)'!=''`), and a seeded `$(Cfg_2_Win64)` is
-/// a non-empty string, which makes every such group merge and the wrong
-/// build configuration win. The cost is that a value under a variable that
-/// a condition also tests still collapses — `$(VEGADIR)\bpl` to `\bpl` —
-/// where dproj-rs offers one environment for conditions and values alike.
+/// Names the dproj declares as properties keep MSBuild's semantics (empty until
+/// defined), since it fills them itself as it is evaluated. So do the names a
+/// `Condition` tests: the IDE guards its property groups with flags it tests
+/// before declaring them (`'$(Cfg_2_Win64)'!=''`), and a seeded one is a
+/// non-empty string, which merges every such group and wins the wrong build
+/// configuration. The cost is that a value under a condition-tested variable
+/// still collapses, since dproj-rs has one environment for conditions and
+/// values alike.
 pub fn seed_environment(mut environment: HashMap<String, String>, dproj_source: &str) -> HashMap<String, String> {
     let declared = declared_properties(dproj_source);
     let tested_by_a_condition: Vec<String> = CONDITION
@@ -179,10 +157,9 @@ pub fn seed_environment(mut environment: HashMap<String, String>, dproj_source: 
     environment
 }
 
-/// The property names the dproj declares as elements of its own. Matched
-/// whatever their casing, as MSBuild resolves them: a dproj that writes
-/// `$(DCC_UNITSEARCHPATH)` for the `<DCC_UnitSearchPath>` it declares two
-/// lines above means the same property.
+/// The property names the dproj declares as elements of its own, matched
+/// whatever their casing: `$(DCC_UNITSEARCHPATH)` and `<DCC_UnitSearchPath>`
+/// are the same property to MSBuild.
 fn declared_properties(dproj_source: &str) -> Vec<String> {
     PROPERTY_ELEMENT.captures_iter(dproj_source).map(|element| element[1].to_string()).collect()
 }
@@ -237,8 +214,6 @@ mod environment_tests {
         }
     }
 
-    /// A property is the dproj's own whatever casing the reference uses;
-    /// otherwise the dproj's own value for it is dropped as unresolved.
     #[test]
     fn a_property_is_recognised_whatever_casing_the_reference_uses() {
         const SHOUTED: &str = r#"<Project>
@@ -251,9 +226,6 @@ mod environment_tests {
         assert!(!seeded.contains_key("DCC_UNITSEARCHPATH"), "the dproj declares it, whatever the casing");
     }
 
-    /// The IDE guards its property groups with flags it tests before it
-    /// declares them; a seeded one is a non-empty string and would make
-    /// every such group merge.
     #[test]
     fn a_name_a_condition_tests_keeps_msbuild_semantics() {
         let seeded = seed_environment(environment(&[]), DPROJ);
@@ -289,22 +261,19 @@ pub fn find_dproj_file(main_file_path: &PathBuf) -> Result<PathBuf> {
     }
 }
 
-/// Return the available configurations from a `.dproj` file.
 pub fn get_configurations(dproj: &Dproj) -> Vec<String> {
     dproj.configurations().iter().map(|s| s.to_string()).collect()
 }
 
-/// Return the available platforms from a `.dproj` file (name + active flag).
+/// Each platform with its active flag.
 pub fn get_platforms(dproj: &Dproj) -> Vec<(String, bool)> {
     dproj.platforms().iter().map(|(s, active)| (s.to_string(), *active)).collect()
 }
 
-/// Return the dproj's default active configuration.
 pub fn get_active_configuration(dproj: &Dproj) -> Option<String> {
     dproj.active_configuration().ok()
 }
 
-/// Return the dproj's default active platform.
 pub fn get_active_platform(dproj: &Dproj) -> Option<String> {
     dproj.active_platform().ok()
 }

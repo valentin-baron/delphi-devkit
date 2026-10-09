@@ -1,9 +1,5 @@
 use ddk_core::projects::CompilerLineDiagnostic;
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  CompilerLineDiagnostic::from_line – valid inputs
-// ═══════════════════════════════════════════════════════════════════════════════
-
 #[test]
 fn parses_full_format_with_column() {
     let line = r"C:\Projects\Unit1.pas(42,5): error E2003: Undeclared identifier: 'Foo' [C:\Projects\MyProject.dproj]";
@@ -47,14 +43,6 @@ fn parses_fatal_error() {
     assert!(format!("{}", diag.kind) == "ERROR");
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  CompilerLineDiagnostic::from_line – non-matching inputs
-// ═══════════════════════════════════════════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  CompilerLineDiagnostic::from_line – Delphi 2007 formats
-// ═══════════════════════════════════════════════════════════════════════════════
-
 #[test]
 fn parses_delphi2007_msbuild_wrapper_format() {
     let line = r"C:\WINDOWS\Microsoft.NET\Framework\v2.0.50727\Borland.Delphi.Targets : warning : C:\Projects\Sample\SampleMessage.pas(107) Warnung: W1036 Variable 'aHelpContext' ist moeglicherweise nicht initialisiert worden [c:\Projects\Sample\Sample.dproj]";
@@ -80,11 +68,8 @@ fn parses_delphi2007_simple_indented_format() {
     assert_eq!(format!("{}", diag.kind), "WARN");
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  CompilerLineDiagnostic::from_line – native dcc output (Delphi 12)
-//  The severity label is localized and glued to the closing parenthesis, and the
-//  message code carries no trailing colon.
-// ═══════════════════════════════════════════════════════════════════════════════
+// Native dcc output (Delphi 12): the severity label is localized and glued to
+// the closing parenthesis, and the message code carries no trailing colon.
 
 #[test]
 fn parses_delphi12_german_warning_with_glued_label() {
@@ -142,10 +127,10 @@ fn parses_native_format_with_column_and_multiword_label() {
     assert_eq!(format!("{}", diag.kind), "ERROR");
 }
 
-// The three path spellings below are verbatim dcc32 output, captured by running
-// dcc32 18.5 (Delphi 2007), 35.0, 36.0 (Delphi 12) and 37.0 against a scratch
-// project: the compiler prints the unit exactly as it resolved it – absolute
-// only when the search path was absolute – and does not indent its own output.
+// The three path spellings below are verbatim output of dcc32 18.5 (Delphi
+// 2007), 35.0, 36.0 (Delphi 12) and 37.0: the compiler prints the unit exactly
+// as it resolved it – absolute only when the search path was – and does not
+// indent its own output.
 
 #[test]
 fn parses_native_format_with_relative_path_and_no_indent() {
@@ -208,9 +193,7 @@ fn strips_the_msbuild_node_prefix_from_the_file() {
     assert_eq!(diag.column, Some(3));
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Messages ending in brackets – only MSBuild appends "[<project>]"
-// ═══════════════════════════════════════════════════════════════════════════════
+// Messages ending in brackets: only MSBuild appends "[<project>]".
 
 #[test]
 fn native_message_keeps_its_own_trailing_bracket_group() {
@@ -237,10 +220,6 @@ fn msbuild_message_keeps_brackets_but_loses_the_project_suffix() {
     assert_eq!(diag.message, "Variable ist vom Typ array [0..9]");
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Deduplication key (CompilerLineDiagnostic::dedup_key)
-// ═══════════════════════════════════════════════════════════════════════════════
-
 #[test]
 fn delphi2007_duplicate_output_shares_the_dedup_key() {
     // Delphi 2007 prints each diagnostic twice with identical text – once through
@@ -255,7 +234,7 @@ fn delphi2007_duplicate_output_shares_the_dedup_key() {
 #[test]
 fn same_code_on_one_line_with_different_messages_keeps_both() {
     // Verbatim dcc32 output for a call whose two arguments are both converted
-    // implicitly: same file, same line, same code, different message.
+    // implicitly: same file, line and code, different message.
     let first = "Unit3.pas(25) Warnung: W1057 Implizite String-Umwandlung von 'AnsiString' zu 'WideString'";
     let second = "Unit3.pas(25) Warnung: W1057 Implizite String-Umwandlung von 'ShortString' zu 'WideString'";
     let a = CompilerLineDiagnostic::from_line(first, "dcc32".into()).unwrap();
@@ -274,13 +253,9 @@ fn dedup_key_ignores_the_case_of_the_drive_letter() {
     assert_eq!(a.dedup_key(), b.dedup_key());
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  False-alarm guards: MSBuild's own messages are not Delphi diagnostics
-// ═══════════════════════════════════════════════════════════════════════════════
-
-// The four guards below cover the patterns the relaxed native format newly lets
-// through the door: anything may precede the "(<line>)" group, so the file
-// capture must stop at characters a Windows path cannot contain.
+// False-alarm guards: MSBuild's own messages are not Delphi diagnostics.
+// Anything may precede the "(<line>)" group, so the file capture must stop at
+// characters a Windows path cannot contain.
 
 #[test]
 fn rejects_quoted_command_echo_with_parenthesised_number() {
@@ -290,12 +265,11 @@ fn rejects_quoted_command_echo_with_parenthesised_number() {
 
 #[test]
 fn wrapper_head_never_ends_up_in_the_file_capture() {
-    // MSBuild renders the severity word the task hands it, and
-    // Borland.Delphi.Targets hands it in English – a German "Warnung" in that
-    // position is not a form the wrapper regex is meant to read. The native
-    // regex must then reject the line instead of capturing the wrapper head as
-    // part of the path: a lost diagnostic is recoverable, a diagnostic
-    // published against a file that does not exist is not.
+    // Borland.Delphi.Targets hands MSBuild the severity word in English, so a
+    // German "Warnung" there is no form the wrapper regex reads. The native
+    // regex must then reject the line rather than capture the wrapper head as
+    // part of the path: a lost diagnostic is recoverable, one published against
+    // a file that does not exist is not.
     let line = r"C:\WINDOWS\x\Borland.Delphi.Targets : Warnung : C:\Projects\X.pas(107) Warnung: W1036 Variable nicht initialisiert [c:\Projects\Sample.dproj]";
     assert!(CompilerLineDiagnostic::from_line(line, "dcc32".into()).is_none());
 }
@@ -363,10 +337,6 @@ fn rejects_random_text() {
     assert!(CompilerLineDiagnostic::from_line("Something completely different", "dcc32".into()).is_none());
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Severity classification by code prefix
-// ═══════════════════════════════════════════════════════════════════════════════
-
 #[test]
 fn severity_error_from_e_prefix() {
     let line = r"file.pas(1): error E1234: some error";
@@ -388,10 +358,6 @@ fn severity_hint_from_h_prefix() {
     assert_eq!(format!("{}", diag.kind), "HINT");
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Display impl
-// ═══════════════════════════════════════════════════════════════════════════════
-
 #[test]
 fn display_with_column() {
     let line = r"file.pas(10,5): error E2003: something";
@@ -412,10 +378,6 @@ fn display_without_column() {
     assert!(display.contains("file.pas:10"));
     assert!(!display.contains("file.pas:10:"));
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Into<Diagnostic> – LSP conversion
-// ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn lsp_diagnostic_line_is_zero_based() {

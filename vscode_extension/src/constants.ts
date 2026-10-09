@@ -176,9 +176,8 @@ export namespace DELPHILSP {
 }
 
 export namespace DEBUG {
-  /** The debug type DDK starts sessions for. Whichever installed extension
-   *  contributes a `delphi` debugger owns the session; DDK only supplies
-   *  the project reference and, on request, the project's debug target. */
+  /** Whichever installed extension contributes a `delphi` debugger owns the
+   *  session; DDK supplies only the project reference and its debug target. */
   export const TYPE = 'delphi';
   export namespace CONFIG {
     export const KEY = 'ddk.debug';

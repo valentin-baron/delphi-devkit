@@ -17,15 +17,7 @@ use ddk_core::commands::CompileFilterOptions;
 
 use crate::arguments::{ArgumentResult, Arguments};
 
-// ---------------------------------------------------------------------------
-// README content embedded at compile time
-// ---------------------------------------------------------------------------
-
 static README_CONTENT: &str = include_str!("../../README.md");
-
-// ---------------------------------------------------------------------------
-// Tool input types (mcp_tool! generates ::tool() returning a Tool definition)
-// ---------------------------------------------------------------------------
 
 #[macros::mcp_tool(
     name = "get_ddk_extension_info",
@@ -340,10 +332,6 @@ rust_mcp_sdk::tool_box!(DdkTools, [
     GetDebugTargetArgs,
 ]);
 
-// ---------------------------------------------------------------------------
-// MCP server handler
-// ---------------------------------------------------------------------------
-
 #[derive(Default)]
 pub struct DdkMcpHandler;
 
@@ -393,12 +381,10 @@ impl ServerHandler for DdkMcpHandler {
     }
 }
 
-/// Fails when the call carries an argument the tool does not advertise.
-/// A misspelled `rebiuld` would otherwise read as a silent `false` and
-/// `projetc_id` would act on the active project — the quiet substitution
-/// [`crate::arguments`] exists to stop, one letter further out. The
-/// accepted names are the ones the tool publishes in its own schema, so
-/// this cannot disagree with what a client was told.
+/// Fails when the call carries an argument the tool does not advertise: a
+/// misspelled `rebiuld` would otherwise read as a silent `false`. The accepted
+/// names come from the tool's own published schema, so this cannot disagree
+/// with what the client was told.
 fn reject_unknown_arguments(tool: &str, args: &Value) -> Result<(), String> {
     let Some(given) = args.as_object().filter(|given| !given.is_empty()) else {
         return Ok(());
@@ -441,8 +427,6 @@ async fn list_projects() -> String {
     }
 }
 
-/// Runs a tool whose arguments may be malformed: the message naming the
-/// wrong argument is the tool's answer, exactly like any other failure.
 /// The output filter both compile tools take.
 fn compile_filter(arguments: &Arguments) -> ArgumentResult<CompileFilterOptions> {
     Ok(CompileFilterOptions {
@@ -652,8 +636,8 @@ mod argument_tests {
         assert_eq!(reject_unknown_arguments("delphi_list_projects", &json!({})), Ok(()));
     }
 
-    /// A tool this dispatcher does not know is answered by the dispatcher
-    /// itself; checking its arguments here would hide that.
+    /// An unknown tool is answered by the dispatcher; checking its arguments
+    /// here would hide that.
     #[test]
     fn an_unknown_tool_is_left_to_the_dispatcher() {
         assert_eq!(reject_unknown_arguments("delphi_no_such_tool", &json!({ "whatever": 1 })), Ok(()));
