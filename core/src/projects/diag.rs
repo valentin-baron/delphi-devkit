@@ -5,10 +5,13 @@ use std::fmt::Display;
 // Standard MSBuild / dcc32 format:
 // <file>(<line>[,<col>]): (error|warning|hint|fatal) <CODE>: <message> [<project>]
 //
-// The trailing project suffix is matched as "[<no closing bracket>]": dcc
-// messages may end in brackets themselves ("W1054 ... array [0..9]"), which a
-// greedy "[.*]" would swallow along with the suffix.
-const MSBUILD_OUTPUT_REGEX: &str = r"^(?P<file>.*?)[(](?P<line>\d+)(?:,(?P<column>\d+))?[)]:\s+(?P<kind>.*?)\s+(?P<code>[A-Z]\d+):\s+(?P<message>.*?)(?:\s+\[[^\]]*\])?\s*$";
+// The trailing project suffix has to look like a project file. dcc messages
+// end in brackets of their own ("W1054 ... array [0..9]"), and against a
+// non-greedy message an "anything in brackets" suffix is preferred over
+// keeping them — truncating every such message whenever no real suffix
+// follows it. MSBuild appends nothing but the project file, so demanding the
+// extension is exact.
+const MSBUILD_OUTPUT_REGEX: &str = r"^(?P<file>.*?)[(](?P<line>\d+)(?:,(?P<column>\d+))?[)]:\s+(?P<kind>.*?)\s+(?P<code>[A-Z]\d+):\s+(?P<message>.*?)(?:\s+\[[^\]\r\n]*\.(?i:dproj|dpr|dpk|groupproj|bdsproj)\])?\s*$";
 
 // A source file as the compilers print it: dcc prints the unit exactly as it
 // resolved it, so "C:\Proj\Unit1.pas", "src\Unit1.pas" and "Unit1.pas" all
@@ -38,8 +41,9 @@ const DIAG_POSITION: &str = r"[(](?P<line>\d+)(?:,(?P<column>\d+))?[)]";
 const DCC_LOCALIZED_TAIL: &str = r"\s*(?:\p{L}[\p{L} ]*)?:\s*(?P<code>[A-Z]\d+)\s+(?P<message>\S.*?)";
 
 // Only MSBuild appends the project file; native dcc output never carries it, so
-// stripping it there would truncate the messages that end in brackets.
-const MSBUILD_PROJECT_SUFFIX: &str = r"(?:\s+\[[^\]]*\])?";
+// stripping it there would truncate the messages that end in brackets. Pinned
+// to the project extensions for the same reason as the standard format above.
+const MSBUILD_PROJECT_SUFFIX: &str = r"(?:\s+\[[^\]\r\n]*\.(?i:dproj|dpr|dpk|groupproj|bdsproj)\])?";
 
 // Delphi 2007 / Borland MSBuild wrapper format:
 // <target_file> : (warning|error|hint|fatal) : <source_file>(<line>)<tail> [<project>]

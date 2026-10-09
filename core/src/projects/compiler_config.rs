@@ -103,10 +103,28 @@ impl<'de> Deserialize<'de> for CompilerConfigurations {
         // that were baked into user-saved configs from older versions.
         for config in compilers.values_mut() {
             sanitize_build_arguments(&mut config.build_arguments);
+            correct_the_delphi_2007_version_symbol(config);
         }
         Ok(CompilerConfigurations {
             _compilers: compilers,
         })
+    }
+}
+
+/// Corrects a saved Delphi 2007 configuration that still carries `VER190`.
+/// That is the symbol of the 2007 compiler **for .NET**; the Win32 compiler
+/// declares `VER185`, and nothing a Win32 build produces ever defines
+/// `VER190`. The debug target reads this symbol to evaluate a package's
+/// `{$LIBSUFFIX}` conditions, so leaving a stored one wrong keeps answering
+/// `{$IFDEF VER185}` with the wrong branch. Shipping a corrected preset
+/// does not reach anyone: a saved `compilers.ron` is loaded whole and never
+/// merged with the defaults.
+///
+/// Keyed on the pair, so a configuration a user deliberately pointed
+/// elsewhere is left alone: BDS 5.0 is Delphi 2007 and nothing else.
+fn correct_the_delphi_2007_version_symbol(config: &mut CompilerConfiguration) {
+    if config.product_version == 5 && config.condition.eq_ignore_ascii_case("VER190") {
+        config.condition = "VER185".to_string();
     }
 }
 
@@ -247,5 +265,48 @@ mod preset_tests {
         let delphi_2007 = presets.get("2007").expect("a 2007 preset");
 
         assert_eq!(delphi_2007.condition, "VER185");
+    }
+
+    /// A saved `compilers.ron` is loaded whole, never merged with the
+    /// presets, so the corrected preset reaches nobody who has already run
+    /// DevKit unless the stored value is migrated on the way in.
+    #[test]
+    fn a_stored_delphi_2007_keeps_no_dotnet_version_symbol() {
+        let stored = r#"{
+            "2007": (
+                condition: "VER190",
+                product_name: "Delphi 2007",
+                product_version: 5,
+                package_version: 110,
+                compiler_version: 19,
+                installation_path: r"C:\CodeGear\RAD Studio\5.0",
+                build_arguments: [],
+            ),
+        }"#;
+
+        let loaded: CompilerConfigurations = ron::from_str(stored).expect("stored config parses");
+
+        assert_eq!(loaded._compilers["2007"].condition, "VER185");
+    }
+
+    /// Only that pair is corrected: a configuration pointed somewhere of
+    /// the user's own choosing is not second-guessed.
+    #[test]
+    fn a_version_symbol_of_another_product_is_left_alone() {
+        let stored = r#"{
+            "12.0": (
+                condition: "VER190",
+                product_name: "Delphi 12",
+                product_version: 23,
+                package_version: 290,
+                compiler_version: 36,
+                installation_path: r"C:\Embarcadero\Studio\23.0",
+                build_arguments: [],
+            ),
+        }"#;
+
+        let loaded: CompilerConfigurations = ron::from_str(stored).expect("stored config parses");
+
+        assert_eq!(loaded._compilers["12.0"].condition, "VER190");
     }
 }

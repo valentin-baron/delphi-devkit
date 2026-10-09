@@ -1602,12 +1602,23 @@ async fn adhoc_debug_target(
     platform: Option<String>,
 ) -> Result<crate::debug_target::DebugTarget> {
     let data = adhoc_project_data(file_path, compiler, config, platform).await?;
-    let project = data.projects.last().expect("adhoc_project_data holds the project");
+    let project = data.projects.last().expect("adhoc_project_data holds the project").clone();
     let compiler = data
         .compiler_for_project(project.id)
         .await
         .ok_or_else(|| anyhow::anyhow!("Ad-hoc project link was not created."))?;
-    let mut target = crate::debug_target::build_debug_target(project, &compiler)?;
+    // Same two reasons as the managed path: a bare source is described with
+    // the warning that says so, and the filesystem walk belongs off the
+    // async worker — an unreachable share in a search path blocks it for the
+    // SMB timeout. `adhoc_project_data` already discovered for the requested
+    // build, so only the warning is wanted here, not another discovery.
+    let (_, bare_source_warnings) = crate::debug_target::project_to_describe(&project, None, None, &[]);
+    let described = tokio::task::spawn_blocking(move || crate::debug_target::build_debug_target(&project, &compiler)).await;
+    let mut target = match described {
+        Ok(target) => target?,
+        Err(error) => bail!("Describing the debug target did not finish: {error}"),
+    };
+    target.warnings.splice(0..0, bare_source_warnings);
     target.project_id = None;
     Ok(target)
 }

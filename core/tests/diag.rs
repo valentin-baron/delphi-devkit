@@ -220,6 +220,42 @@ fn msbuild_message_keeps_brackets_but_loses_the_project_suffix() {
     assert_eq!(diag.message, "Variable ist vom Typ array [0..9]");
 }
 
+/// The standard MSBuild shape without a project suffix — dcc32 invoked
+/// directly, and MSBuild's own pass-through of the raw line. The message's
+/// bracket group is all there is, so a suffix pattern that takes anything
+/// in brackets eats it.
+#[test]
+fn msbuild_shape_without_a_project_suffix_keeps_its_bracket_group() {
+    let line = "Unit5.pas(4): warning W1054: Variable is of type array [0..9]";
+    let diag = CompilerLineDiagnostic::from_line(line, "dcc32".into()).unwrap();
+
+    assert_eq!(diag.message, "Variable is of type array [0..9]");
+    assert_eq!(diag.file, "Unit5.pas");
+}
+
+/// The wrapper shape, likewise without the suffix.
+#[test]
+fn wrapper_shape_without_a_project_suffix_keeps_its_bracket_group() {
+    let line = r"Borland.Delphi.Targets : warning : C:\P\Unit5.pas(4) Warnung: W1054 Variable ist vom Typ array [0..9]";
+    let diag = CompilerLineDiagnostic::from_line(line, "dcc32".into()).unwrap();
+
+    assert_eq!(diag.message, "Variable ist vom Typ array [0..9]");
+}
+
+/// A bracket group that is not a project file stays in the message even
+/// when a real suffix follows it.
+#[test]
+fn only_a_project_file_is_taken_for_the_suffix() {
+    let line = r"Unit5.pas(4): warning W1054: Variable is of type array [0..9] [C:\P\Project5.dproj]";
+    let diag = CompilerLineDiagnostic::from_line(line, "dcc32".into()).unwrap();
+    assert_eq!(diag.message, "Variable is of type array [0..9]");
+
+    // A trailing group that names no project is the message's own.
+    let line = "Unit5.pas(4): warning W1054: Variable is of type array [0..9] [see docs]";
+    let diag = CompilerLineDiagnostic::from_line(line, "dcc32".into()).unwrap();
+    assert_eq!(diag.message, "Variable is of type array [0..9] [see docs]");
+}
+
 #[test]
 fn delphi2007_duplicate_output_shares_the_dedup_key() {
     // Delphi 2007 prints each diagnostic twice with identical text – once through
